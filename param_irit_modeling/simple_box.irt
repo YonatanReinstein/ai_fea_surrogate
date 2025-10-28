@@ -1,0 +1,10 @@
+include("dims.irt");
+TV = GBOX(
+    point(Length,0,0), point(Length,0,Height),
+    point(Length,Width,0), point(Length,Width,Height),
+    point(0,0,0), point(0,0,Height),
+    point(0,Width,0), point(0,Width,Height)
+);
+save( "simple_box.inp", list(TV));
+free(TV);
+exit();

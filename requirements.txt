@@ -1,0 +1,22 @@
+# === PyTorch 2.4.0 + CUDA 12.1 ===
+numpy<2
+torch==2.4.0+cu121
+torchvision==0.19.0+cu121
+torchaudio==2.4.0+cu121
+
+# === PyTorch Geometric CUDA 12.1 extensions (from https://data.pyg.org) ===
+pyg-lib==0.4.0+pt24cu121
+torch-scatter==2.1.2+pt24cu121
+torch-sparse==0.6.18+pt24cu121
+torch-cluster==1.6.3+pt24cu121
+torch-spline-conv==1.2.2+pt24cu121
+
+# === Main PyG package (pure Python, from PyPI) ===
+torch-geometric==2.6.1
+
+ansys-mapdl-core
+ansys-tools-visualization_interface
+
+
+
+
