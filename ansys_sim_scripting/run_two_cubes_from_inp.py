@@ -1,8 +1,3 @@
-# run_two_cubes_from_inp.py
-# Requires: pip install ansys-mapdl-core
-# Launches MAPDL, parses an Abaqus .inp with *NODE/*ELEMENT,TYPE=C3D8,
-# creates SOLID185 mesh, and applies anchors/forces per cube & face.
-
 import argparse
 from ansys.mapdl.core import launch_mapdl
 
@@ -108,9 +103,7 @@ nodes_xyz, elems = read_abaqus_inp(args.inp)
 
 # Launch MAPDL
 mapdl = launch_mapdl(mode="grpc", override=True, cleanup_on_exit=True)
-
 mapdl.clear()
-
 mapdl.prep7()
 mapdl.et(1, 185)                 # SOLID185
 mapdl.keyopt(1, 9, 0)            # (default integration)
@@ -127,8 +120,6 @@ mapdl.mat(1)
 for eid, nn in elems.items():
     mapdl.en(eid, *nn)
 
-
-
 # Convenience “cube = element id”
 cube_elems = {1: [1], 2: [2]}
 
@@ -141,21 +132,15 @@ for cid, elist in cube_elems.items():
     nodes = mapdl.mesh.nnum
     cube_nodes[cid] = set(nodes)
 
-print(args.anchor)
 # Apply anchors
 if args.anchor:
     for a in args.anchor:
-        #print(f"Applying anchor: {a}")
         spec = parse_kv_list(a)
-        #print(spec)
         cube = int(spec["cube"])
         face = spec["face"].upper()
         axis, sign = face[-1], face[0]  # e.g., "+Z"
-        # get the element id for this cube
         eid = cube_elems[cube][0]
         face_n = face_nodes_by_axis(nodes_xyz, elems[eid], axis, sign)
-        # print(f"  Face nodes: {face_n}")
-        # Select just those nodes and fix UX, UY, UZ
         mapdl.allsel("ALL")
         mapdl.nsel("NONE")
         mapdl.nsel("S", "NODE", vmin=face_n[0], vmax=face_n[0])
@@ -164,7 +149,6 @@ if args.anchor:
         mapdl.d("ALL", "UX", 0)
         mapdl.d("ALL", "UY", 0)
         mapdl.d("ALL", "UZ", 0)
-        #print(mapdl.dlist())
 
 
 # Apply forces
@@ -177,23 +161,17 @@ if args.force:
         face = spec["face"].upper()
         ftype = str(spec.get("type", "pressure")).lower()
         value = float(spec["value"])
-        #print("hey")
-        #print(f"  On cube {cube}, face {face}, type {ftype}, value {value}")
         dir_code = str(spec.get("dir", face)).upper()  # default same normal
         print("Direction code:", dir_code)
         print(dir_code)
         axis, sign = face[-1], face[0]
         eid = cube_elems[cube][0]
-        #print(f"  Element ID: {eid}")
         face_n = face_nodes_by_axis(nodes_xyz, elems[eid], axis, sign)
-        #print(f"  Face nodes: {face_n}")
         mapdl.allsel("ALL")
         mapdl.nsel("NONE")
-        # select exactly the face nodes
         mapdl.nsel("S", "NODE", vmin=face_n[0], vmax=face_n[0])
-        #for nid in face_n[1:]:
-        #    #print(f"  Selecting node {nid}")
-        #    mapdl.nsel("A", "NODE", vmin=nid, vmax=nid)
+        for nid in face_n[1:]:
+            mapdl.nsel("A", "NODE", vmin=nid, vmax=nid)
 
         if ftype == "nodal":
             ux, uy, uz = unit_vector(dir_code)
