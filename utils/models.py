@@ -1,6 +1,8 @@
 from typing import List
 from utils.arg_processing import face_nodes_by_axis, unit_vector
 from ansys.mapdl.core import launch_mapdl
+import torch
+from torch_geometric.data import Data
 
 
 class Node:
@@ -12,7 +14,7 @@ class Node:
         self.anchored = False
         self.forces = [0.0, 0.0, 0.0]   
         self.elements = []   # elements that reference this node
-
+    
     def get_elements(self) -> List["Element"]:
         return self.elements
     
@@ -42,6 +44,7 @@ class Mesh:
         self.nodes = nodes
         self.elements = elements
         self.mapdl = None
+        self.max_stress = None
 
     @classmethod
     def from_inp(cls, path: str) -> "Mesh":
@@ -104,7 +107,6 @@ class Mesh:
         self.mapdl.post1()
         self.mapdl.set("last")
 
-
         # von Mises stress
         stress = self.mapdl.post_processing.nodal_eqv_stress()
 
@@ -113,22 +115,14 @@ class Mesh:
         uy = self.mapdl.post_processing.nodal_displacement("Y")
         uz = self.mapdl.post_processing.nodal_displacement("Z")
 
-
         # Update nodes_xyz with displacement and stress
         for node_id, node in self.nodes.items():
             node.displacement = [ux[node_id-1], uy[node_id-1], uz[node_id-1]]
             node.stress = stress[node_id-1]
 
-        vmax = stress.max()
-        print(f"Maximum von Mises stress: {vmax:.3e} Pa")
-
-        print(self.nodes)
-
-        self.mapdl.post_processing.plot_nodal_eqv_stress()
-
+        self.max_stress = stress.max()
+        #self.mapdl.post_processing.plot_nodal_eqv_stress()
         self.mapdl.exit()
-
-
 
     def add_anchor(self, element_id: int, face: str):
         element = self.get_element(element_id)
@@ -152,8 +146,6 @@ class Mesh:
         for node in face_n: 
             node.forces += value * unit_vector
 
-
-
     def add_force(self, element_id: int, face: str, value: float, dir_code: str):
         element = self.get_element(element_id)
         axis, sign = face[-1], face[0]  # e.g. "+Z"
@@ -176,5 +168,36 @@ class Mesh:
 
     def all_elements(self) -> List[Element]:
         return list(self.elements.values())
+    
+    def to_graph(self, include_features=True):
+        # Convert the mesh into a PyTorch Geometric Data graph.
+        node_features = []
+        for node in self.nodes.values():
+            feats = []
+            if include_features:
+                feats.extend(node.coords)                      
+                feats.extend(node.displacement or [0, 0, 0])   
+                feats.extend(node.stress or [0, 0, 0])   
+                feats.extend(node.forces or [0, 0, 0])     
+                feats.append(float(node.anchored))             
+            node_features.append(feats)
+
+        x = torch.tensor(node_features, dtype=torch.float)
+
+        edges = set()
+        for elem in self.elements.values():
+            nids = [n.id - 1 for n in elem.nodes]  # zero-based indexing
+            for i in range(len(nids)):
+                for j in range(i + 1, len(nids)):
+                    edges.add((nids[i], nids[j]))
+                    edges.add((nids[j], nids[i]))  # make bidirectional
+
+        if edges:
+            edge_index = torch.tensor(list(zip(*edges)), dtype=torch.long)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+
+        data = Data(x=x, edge_index=edge_index)
+        return data
 
     

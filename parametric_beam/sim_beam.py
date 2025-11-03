@@ -156,6 +156,13 @@ for f in args.force:
     dir_code = str(spec.get("dir", face)).upper()
     mesh.add_force(eid, face, value, dir_code)
 
-if args.solve:
-    mesh.solve(args.young, args.poisson)
+#if args.solve:
+#    mesh.solve(args.young, args.poisson)
+
+    x = mesh.to_graph(include_features=True)
+
+    print(x)
+
+
+
 
