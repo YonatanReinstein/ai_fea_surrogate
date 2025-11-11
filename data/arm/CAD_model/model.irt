@@ -1,0 +1,82 @@
+include("dims.irt");
+
+save_mat = view_mat;
+view_mat = save_mat * scale( vector( 5, 5, 5 ) );
+
+Profile1Top = cbspline( 4,
+			list( ctlpt( E2, 0.0, 0.5 ),
+			      ctlpt( E2, 0.15, 0.5 ),
+			      ctlpt( E2, 0.6, 0.5 ),
+			      ctlpt( E2, 1.0, 0.5 ) ),
+			list( kv_open ) );
+
+Profile1bottom = cbspline( 4,
+			list( ctlpt( E2, 0.0, 0.5 ),
+			      ctlpt( E2, 0.15, 0.5 ),
+			      ctlpt( E2, 0.6, 0.5 ),
+			      ctlpt( E2, 1.0, 0.5 ) ),
+			list( kv_open ) );
+
+Profile2Top = cbspline( 4,
+			list( ctlpt( E2, 0.0 * d18, d10 ),
+			      ctlpt( E2, 0.15 * d18, d11 ),
+			      ctlpt( E2, 0.6 * d18, d12 ),
+			      ctlpt( E2, 1.0 * d18, d13 ) ),
+			list( kv_open ) );
+
+Profile2bottom = cbspline( 4,
+			list( ctlpt( E2, 0.0 * d18, d14 ),
+			      ctlpt( E2, 0.15 * d18, d15 ),
+			      ctlpt( E2, 0.6 * d18, d16 ),
+			      ctlpt( E2, 1.0 * d18, d17 ) ),
+			list( kv_open ) );
+
+Profile3Top = cbspline( 4,
+			list( ctlpt( E2, 0.0 * d27, d19 ),
+			      ctlpt( E2, 0.15 * d27, d20 ),
+			      ctlpt( E2, 0.6 * d27, d21 ),
+			      ctlpt( E2, 1.0 * d27, d22 ) ),
+			list( kv_open ) );
+
+Profile3bottom = cbspline( 4,
+			list( ctlpt( E2, 0.0 * d27, d23 ),
+			      ctlpt( E2, 0.15 * d27, d24 ),
+			      ctlpt( E2, 0.6 * d27, d25 ),
+			      ctlpt( E2, 1.0 * d27, d26 ) ),
+			list( kv_open ) );
+
+Profile4Top = cbspline( 4,
+			list( ctlpt( E2, 0.0 * d36, d28 ),
+			      ctlpt( E2, 0.15 * d36, d29 ),
+			      ctlpt( E2, 0.6 * d36, d30 ),
+			      ctlpt( E2, 1.0 * d36, d31 ) ),
+			list( kv_open ) );
+
+Profile4bottom = cbspline( 4,
+			list( ctlpt( E2, 0.0 * d36, d32 ),
+			      ctlpt( E2, 0.15 * d36, d33 ),
+			      ctlpt( E2, 0.6 * d36, d34 ),
+			      ctlpt( E2, 1.0 * d36, d35 ) ),
+			list( kv_open ) );
+
+Profile1 = ruledSrf( Profile1Top, Profile1bottom * sy( -1 ) );
+Profile2 = ruledSrf( Profile2Top, Profile2bottom * sy( -1 ) );
+Profile3 = ruledSrf( Profile3Top, Profile3bottom * sy( -1 ) );
+Profile4 = ruledSrf( Profile4Top, Profile4bottom * sy( -1 ) );
+
+section1 = Profile1 * txyz( 0, 0, 0 );
+section2 = Profile2 * txyz( 0, 0, 3 );
+section3 = Profile3 * txyz( 0, 0, 6 );
+section4 = Profile4 * txyz( 0, 0, 9 );
+
+Srfs = list(section1,
+            section2,
+            section3,
+            section4);
+
+ts = TFROMSRFS( Srfs, 3, kv_open );
+save( "model.itd", ts );
+V = TVolume(ts, 1);
+OUT_FILE = FPrintFile( "props.txt" );
+fprintf(OUT_FILE, "volume %lf\\n", list(V));
+exit();

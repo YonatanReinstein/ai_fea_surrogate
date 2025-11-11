@@ -1,4 +1,5 @@
-from utils.models import Node, Element
+from core.node import Node
+from core.element import Element
 
 def detect_encoding(path):
     with open(path, "rb") as f:
@@ -17,11 +18,6 @@ def detect_encoding(path):
             return "utf-8"
 
 def read_inp(path):
-    """
-    Parse an IRIT2INP-generated .inp file and return:
-        nodes: {nid: (x, y, z)}
-        elems: {eid: [n1..n8]}   for TYPE=C3D8 elements
-    """
     nodes = {}
     elems = {}
 
@@ -62,19 +58,15 @@ def read_inp(path):
                     elems[eid] = nn
                 i += 1
             continue
-
         i += 1
-
     if not nodes:
         raise ValueError("No *NODE section found in file.")
     if not elems:
         raise ValueError("No *ELEMENT,TYPE=C3D8 section found in file.")
-
     return nodes, elems
 
 
 def build_mesh_from_inp(path):
-    """Read .inp and return linked Node and Element objects."""
     nodes_xyz, elems_raw = read_inp(path)
 
     # Create Node objects
@@ -85,7 +77,6 @@ def build_mesh_from_inp(path):
         eid: Element(eid, [nodes[nid] for nid in nlist])
         for eid, nlist in elems_raw.items()
     }
-
     return nodes, elements
 
 

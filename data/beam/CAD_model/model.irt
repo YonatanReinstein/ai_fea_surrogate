@@ -1,0 +1,17 @@
+include("dims.irt");
+TV = GBOX(
+    point(0,0,0),
+    point(0,0,Width),
+    point(0,Height,0), 
+    point(0,Height,Width),
+    point(Length,0,0),
+    point(Length,0,Width),
+    point(Length,Height,0),
+    point(Length,Height,Width)
+);
+save("model.itd", list(TV));
+V = TVolume(TV, 1);
+OUT_FILE = FPrintFile( "props.txt" );
+fprintf(OUT_FILE, "volume %lf\\n", list(V));
+free(TV);
+exit();

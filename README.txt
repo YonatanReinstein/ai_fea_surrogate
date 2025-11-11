@@ -16,3 +16,7 @@ to run ansys sim run:
 
 to kill any ansys Process
     Get-Process | Where-Object { $_.ProcessName -like "ansys*" -or $_.ProcessName -like "MAPDL*" -or $_.ProcessName -like "fluent*" -or $_.ProcessName -like "launcher*" } | Stop-Process -Force
+
+
+conclustions:
+    the base and length or the arm should be fixed dims
