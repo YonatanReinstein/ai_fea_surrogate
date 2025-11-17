@@ -4,10 +4,10 @@ TV = GBOX(
     point(0,0,Width),
     point(0,Height,0), 
     point(0,Height,Width),
-    point(Length,0,0),
-    point(Length,0,Width),
-    point(Length,Height,0),
-    point(Length,Height,Width)
+    point(9,0,0),
+    point(9,0,Width),
+    point(9,Height,0),
+    point(9,Height,Width)
 );
 save("model.itd", list(TV));
 V = TVolume(TV, 1);

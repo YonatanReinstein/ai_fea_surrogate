@@ -1,5 +1,5 @@
 from typing import List
-from .element import Element
+
 
 class Node:
     def __init__(self, nid: int, coords: List[float]):
@@ -9,10 +9,6 @@ class Node:
         self.stress = 0.0
         self.anchored = False
         self.forces = [0.0, 0.0, 0.0]   
-        self.elements = []   # elements that reference this node
-    
-    def get_elements(self) -> List["Element"]:
-        return self.elements
     
     def __repr__(self):
         return (

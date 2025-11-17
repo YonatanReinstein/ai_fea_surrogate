@@ -1,50 +1,28 @@
-from typing import List
+from typing import List, Callable
 from .node import Node
 from .element import Element
-from utils.data_processing import face_nodes_by_axis, unit_vector
 from ansys.mapdl.core import launch_mapdl
-import torch
-from torch_geometric.data import Data
-import subprocess
-import os
-import shutil
-
-
 
 class Mesh:
     def __init__(self, nodes, elements, tolerance=1e-9):
         self.nodes = nodes
         self.elements = elements
         self.mapdl = None
-        self.max_stress = None
-        self.max_displacement = None
         self.tolerance = tolerance
-
-    @classmethod
-    def from_inp(cls, path: str) -> "Mesh":
-        from utils.read_inp import build_mesh_from_inp  # lazy import (avoids circular)
-        nodes, elements = build_mesh_from_inp(path)
-        return cls(nodes, elements)
-
+        self.solution_valid = False
 
     def solve(self, young: float, poisson: float):
-
         self.mapdl = launch_mapdl(mode="grpc", override=True, cleanup_on_exit=True)
-        #self.mapdl.print_commands = True
-
         self.mapdl.clear()
         self.mapdl.prep7()
         self.mapdl.et(1, 185)                 # SOLID185
         self.mapdl.keyopt(1, 9, 0)            # (default integration)
         self.mapdl.mp("EX", 1, young)
         self.mapdl.mp("PRXY", 1, poisson)
-
         for node in self.all_nodes():
             self.mapdl.n(node.id, *node.coords)
-
         self.mapdl.type(1)
         self.mapdl.mat(1)
-
         for elem in self.all_elements():
             self.mapdl.en(elem.id, *[n.id for n in elem.nodes])
         
@@ -96,35 +74,45 @@ class Mesh:
             node.displacement = [ux[node_id-1], uy[node_id-1], uz[node_id-1]]
             node.stress = stress[node_id-1]
 
-        self.max_stress = stress.max()
-        displacements = [node.displacement for node in self.nodes.values()]
-        displacements_magnitudes = [(disp[0]**2 + disp[1]**2 + disp[2]**2)**0.5 for disp in displacements]
-        self.max_displacement = max(displacements_magnitudes) if displacements_magnitudes else 0.0
-        self.mapdl.post_processing.plot_nodal_eqv_stress()
+        #self.mapdl.post_processing.plot_nodal_eqv_stress()
         self.mapdl.exit()
+        self.solution_valid = True
 
-    def add_anchor(self, element_id: int, face: str):
-        element = self.get_element(element_id)
-        axis, sign = face[-1], face[0]  # e.g. "+Z"
-        face_n = face_nodes_by_axis(element.nodes, axis, sign, tol=self.tolerance)
-        for node in face_n:
-            node.anchored = True
+    def anchor_node(self, node_id: int):
+        node = self.get_node(node_id)
+        node.anchored = True
+
+    def anchor_nodes_by_condition(self, condition: Callable[[Node], bool]):
+        for node in self.all_nodes():
+            if condition(node, self.tolerance):
+                node.anchored = True
 
     def clear_anchors(self):    
         for node in self.all_nodes():
             node.anchored = False
 
-    def add_force(self, element_id: int, face: str, value: float, dir_code: str):
-        element = self.get_element(element_id)
-        axis, sign = face[-1], face[0]  # e.g. "+Z"
-        face_n = face_nodes_by_axis(element.nodes, axis, sign, tol=self.tolerance)
-        dir_vector = unit_vector(dir_code)
-        for node in face_n:
-            fx, fy, fz = node.forces
-            node.forces = (fx + value * dir_vector[0],
-                           fy + value * dir_vector[1],
-                           fz + value * dir_vector[2])
+    def get_max_stress(self):
+        if not self.solution_valid:
+            raise ValueError("Solution is not valid. Please run the simulation first.")
+        return max(node.stress for node in self.all_nodes() if node.stress is not None)
     
+    def get_max_displacement(self):
+        if not self.solution_valid:
+            raise ValueError("Solution is not valid. Please run the simulation first.")
+        return max(
+            (node.displacement[0]**2 + node.displacement[1]**2 + node.displacement[2]**2)**0.5
+            for node in self.all_nodes()
+        )
+
+    def apply_force_on_node(self, node_id: int, force: List[float]):
+        node = self.get_node(node_id)
+        node.forces = force
+
+    def apply_force_by_pattern(self, force_pattern: Callable[[Node, float], List]):
+        for node in self.all_nodes():
+            force = force_pattern(node, self.tolerance)
+            self.apply_force_on_node(node.id, force)
+
     def clear_forces(self):
         for node in self.all_nodes():
             node.forces = [0.0, 0.0, 0.0]
@@ -141,52 +129,29 @@ class Mesh:
     def all_elements(self) -> List[Element]:
         return list(self.elements.values())
     
-    def to_graph_with_labels(self):
-        node_feats = []
-        y_node = []
+    import pyvista as pv
+    import numpy as np
 
-        for node in self.nodes.values():
-            # --- Inputs ---
-            feats = []
-            feats.extend(node.coords)           # (x,y,z)
-            feats.extend(node.forces or [0,0,0])# (Fx,Fy,Fz)
-            feats.append(float(node.anchored))  # 1
-            node_feats.append(feats)
+    def plot_mesh(nodes, elements):
+        # Build array of points (N, 3)
+        points = np.array([n.coords for n in nodes.values()], dtype=float)
 
-            # --- Targets ---
-            ux, uy, uz = node.displacement
-            sigma_vm = node.stress
-            y_node.append([ux, uy, uz, sigma_vm])
+        # Build cells
+        # Flatten into: [num_points_in_elem, n1, n2, n3, n4, ...]
+        cells = []
+        cell_types = []
 
-        x = torch.tensor(node_feats, dtype=torch.float)
-        y_node = torch.tensor(y_node, dtype=torch.float)
-        
-        # edges (bidirectional)
-        edges = set()
-        for elem in self.elements.values():
-            ids0 = [n.id - 1 for n in elem.nodes]
-            L = len(ids0)
-            for i in range(L):
-                for j in range(i+1, L):
-                    edges.add((ids0[i], ids0[j]))
-                    edges.add((ids0[j], ids0[i]))
-        edge_index = torch.tensor(list(zip(*edges)), dtype=torch.long) if edges else torch.empty((2,0), dtype=torch.long)
+        for elem in elements.values():
+            node_ids = [n.id - 1 for n in elem.nodes]  # zero-based indexing
+            cells.append(len(node_ids))
+            cells.extend(node_ids)
+            cell_types.append(12)  # VTK_HEXAHEDRON = 12 (for solid185/c3d8 cubes)
 
-        data = Data(x=x, edge_index=edge_index, y_node=y_node)
-        return data
-    def get_max_stress(self) -> float:
-        if self.max_stress is None:
-            raise ValueError("Mesh has not been solved yet.")
-        return self.max_stress
+        cells = np.array(cells)
 
-    def get_max_displacement(self) -> float:
-        if self.max_displacement is None:
-            raise ValueError("Mesh has not been solved yet.")
-        return self.max_displacement
+        mesh = pv.UnstructuredGrid(cells, cell_types, points)
 
-    
+        mesh.plot(show_edges=True)
 
 
- 
 
-    

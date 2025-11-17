@@ -1,6 +1,6 @@
 import torch
 import json
-from utils.mlp_surrogate import MLPSurrogate
+from utils.mlp_surrogate import MLP
 from .base_evaluator import BaseEvaluator
 
 class MLPEvaluator(BaseEvaluator):
@@ -10,7 +10,7 @@ class MLPEvaluator(BaseEvaluator):
         with open (dims_path, "r") as f:
             dims_data = json.load(f)
         in_dim = len(dims_data)
-        self.model = MLPSurrogate(in_dim=in_dim)
+        self.model = MLP(in_dim=in_dim)
         model_state_path = f"data/{geometry_name}/surrogates/mlp_surrogate.pt"
         self.model.load_state_dict(torch.load(model_state_path, map_location="cpu", weights_only=True))
         self.model.eval()

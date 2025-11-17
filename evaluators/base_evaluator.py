@@ -1,4 +1,3 @@
-# evaluators/base_evaluator.py
 from abc import ABC, abstractmethod
 
 class BaseEvaluator(ABC):
@@ -6,5 +5,5 @@ class BaseEvaluator(ABC):
         self.geometry_name = geometry_name
 
     @abstractmethod
-    def evaluate(self, x):
+    def evaluate(self, dims: dict):
         pass

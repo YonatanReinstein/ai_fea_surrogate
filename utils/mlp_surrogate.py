@@ -1,15 +1,14 @@
 import torch.nn as nn
-import torch.nn.functional as F
 
-class MLPSurrogate(nn.Module):
-    def __init__(self, in_dim, hidden=64, out_dim=2):
+class MLP(nn.Module):
+    def __init__(self, in_features, out_features, hidden=64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
+            nn.Linear(in_features, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, out_dim)
+            nn.Linear(hidden, out_features)
         )
 
     def forward(self, x):

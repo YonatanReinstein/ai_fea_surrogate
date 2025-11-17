@@ -1,6 +1,3 @@
-from core.node import Node
-from core.element import Element
-
 def detect_encoding(path):
     with open(path, "rb") as f:
         start = f.read(4)
@@ -66,17 +63,6 @@ def read_inp(path):
     return nodes, elems
 
 
-def build_mesh_from_inp(path):
-    nodes_xyz, elems_raw = read_inp(path)
 
-    # Create Node objects
-    nodes = {nid: Node(nid, xyz) for nid, xyz in nodes_xyz.items()}
-
-    # Create Element objects with pointers to Node objects
-    elements = {
-        eid: Element(eid, [nodes[nid] for nid in nlist])
-        for eid, nlist in elems_raw.items()
-    }
-    return nodes, elements
 
 

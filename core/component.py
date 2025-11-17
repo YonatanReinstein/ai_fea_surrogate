@@ -1,103 +1,116 @@
-import argparse
-from .mesh import Mesh  
-from utils.data_processing import json_irt_dims_convert, execute_irit_script, get_inp_from_itd
-import os
-import shutil
+from torch_geometric.data import Data
+import torch
+from .IritModel import IIritModel
+from .node import Node
+from .element import Element
+from .mesh import Mesh
 
 
 class Component:
-    def __init__(self, irt_script_path: str, dims_path: str, young: float = 2.1e11, poisson: float = 0.3):
-        self.model_path = irt_script_path
-        self.dims_path = dims_path
-        self.dims = None
-        self.mesh = None
+    def __init__(self, CAD_model: IIritModel, young: float = 2.1e11, poisson: float = 0.3):
+        self.CAD_model = CAD_model
         self.young = young
         self.poisson = poisson
+        self.mesh = None
 
     def clear_boundaries(self):
         if self.mesh is not None:
             self.mesh.clear_anchors()
             self.mesh.clear_forces()
 
-    def generate_mesh(self, dims_path: str = None):
-        tmp_dir = "tmp/mesh_generation"
-        if dims_path is None:
-            dims_path = self.dims_path
-        os.makedirs(tmp_dir, exist_ok=True)
-        shutil.copy(self.model_path, f"{tmp_dir}/model.irt")
-        dims_irt_path = f"{tmp_dir}/dims.irt"
-        json_irt_dims_convert(dims_path, dims_irt_path)
-        execute_irit_script(model_irt_path=f"{tmp_dir}/model.irt", dims_irt_path=dims_irt_path, output_itd_path=f"{tmp_dir}/model.itd")
-        inp_path = f"{tmp_dir}/model.inp"
-        get_inp_from_itd(itd_path=f"{tmp_dir}/model.itd", output_inp_path=inp_path)
-        self.mesh = Mesh.from_inp(inp_path)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    
+    def generate_mesh(self, U: int =10, V: int =10, W: int =10):
+        nodes_dict, elements_dict = self.CAD_model.create_mesh(U=U, V=V, W=W)
+        nodes = {nid: Node(nid, xyz) for nid, xyz in nodes_dict.items()}    # Create Node objects
+        elements = {
+            eid: Element(eid, [nodes[nid] for nid in nlist])                # Create Element objects
+            for eid, nlist in elements_dict.items()
+        }
+        self.mesh = Mesh(nodes, elements)
+        
     def ansys_sim(self):
         if self.mesh is None:
             raise ValueError("Mesh has not been generated yet.")
         self.mesh.solve(self.young, self.poisson) 
-        return self.mesh.get_max_stress(), self.mesh.get_max_displacement()
 
     def get_volume(self):
-        props = execute_irit_script(
-            model_irt_path=self.model_path,
-            dims_irt_path=self.dims_path,
-            output_itd_path=None,
-            collect_props=True
-        )
-        return props["volume"]
+        return self.CAD_model.get_volume()
 
+    def to_graph_with_labels(self):
+        if self.mesh is None:
+            raise ValueError("Mesh has not been generated yet.")
+        
+        node_feats = []
+        node_disp = []
+        node_stress = []
+
+        # --- Node-wise features and labels ---
+        for node in self.mesh.nodes.values():
+            # === Input features ===
+            feats = []
+            feats.extend(node.coords)             # (x, y, z)
+            feats.extend(node.forces or [0, 0, 0])# (Fx, Fy, Fz)
+            feats.append(float(node.anchored))    # anchored flag
+            node_feats.append(feats)
+
+            # === Targets ===
+            ux, uy, uz = node.displacement        # displacement vector
+            sigma_vm = node.stress                # scalar von Mises stress
+            node_disp.append([ux, uy, uz])
+            node_stress.append([sigma_vm])
+
+        x = torch.tensor(node_feats, dtype=torch.float)           # [N, F_in]
+        node_disp = torch.tensor(node_disp, dtype=torch.float)    # [N, 3]
+        node_stress = torch.tensor(node_stress, dtype=torch.float)# [N, 1]
+
+        # --- Build edges (bidirectional) ---
+        edges = set()
+        for elem in self.mesh.elements.values():
+            ids = [n.id - 1 for n in elem.nodes]
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    edges.add((ids[i], ids[j]))
+                    edges.add((ids[j], ids[i]))
+
+        if edges:
+            edge_index = torch.tensor(list(zip(*edges)), dtype=torch.long)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+
+        # --- Global labels ---
+        volume = torch.tensor([self.get_volume()], dtype=torch.float)
+        dims = torch.tensor(list(self.CAD_model.get_dim_list()), dtype=torch.float)      
+        max_stress=torch.tensor([self.mesh.get_max_stress()], dtype=torch.float)
+        max_displacement=torch.tensor([self.mesh.get_max_displacement()], dtype=torch.float) 
+        poisson = torch.tensor([self.poisson], dtype=torch.float)
+        young = torch.tensor([self.young], dtype=torch.float)
+
+        # --- Assemble Data object ---
+        data = Data(
+            x=x,
+            edge_index=edge_index,
+            node_disp=node_disp,     
+            node_stress=node_stress, 
+            volume=volume,              
+            dims = dims,      
+            max_stress=max_stress,
+            max_displacement=max_displacement,
+            poisson = poisson,
+            young = young
+        )
+        return data
 
 
 if __name__ == "__main__":
-
-    import argparse
-    from utils.data_processing import str_to_dict
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--young", type=float, default=2.1e11, help="Young's modulus [Pa]")
-    parser.add_argument("--poisson", type=float, default=0.3, help="Poisson ratio [-]")
-    # Repeatable flags:
-    parser.add_argument("--anchor", action="append",default=["cube=1,face=-X"])
-    parser.add_argument("--force", action="append",default=["cube=9,face=+X,type=nodal,value=1e6"])
-
-    args = parser.parse_args()
     model_path = "data/arm/CAD_model/model.irt"
     json_path = "data/arm/CAD_model/dims.json"
-    component = Component(model_path, json_path)
-    component.generate_mesh()
-    i = 0
-    j = 0
-    for node in component.mesh.nodes.values():
-        if abs(node.coords[2]) < 1e-6:
-            node.anchored = True
-            i += 1
-            print(f"Anchored node ID: {node.id}, Coords: {node.coords}")
-    print(f"Total anchored nodes: {i}")
-
-    for node in component.mesh.nodes.values():
-        if abs(node.coords[2] - 9) < 1e-6:
-            node.forces = [1e6, 0.0, 0.0]
-            j += 1
-            print(f"Applying force to node ID: {node.id}, Coords: {node.coords}")
-    print(f"Total force nodes: {j}")
-
-    #for a in args.anchor:
-    #    spec = str_to_dict(a)
-    #    eid = int(spec["cube"])  # element ID provided by user
-    #    face = spec["face"].upper()
-    #    component.mesh.add_anchor(eid, face)
-
-    #for f in args.force:
-    #    print(f"Applying force: {f}")
-    #    spec = str_to_dict(f)
-    #    eid = int(spec["cube"])
-    #    face = spec["face"].upper()
-    #    value = float(spec["value"])
-    #    dir_code = str(spec.get("dir", face)).upper()
-    #    component.mesh.add_force(eid, face, value, dir_code)
-
-    component.mesh.solve(args.young, args.poisson)
+    cad_model = IIritModel(model_path, json_path)
+    component = Component(cad_model, young=2.1e11, poisson=0.3)
+    component.generate_mesh(U=2, V=2, W=2)
+    
+    from .boundery_condition import anchor_condition, force_pattern_factory
+    component.mesh.anchor_nodes_by_condition(anchor_condition)
+    component.mesh.apply_force_by_pattern(force_pattern_factory())
+    component.ansys_sim()
+    data = component.to_graph_with_labels()
 
 
