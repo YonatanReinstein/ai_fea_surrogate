@@ -1,7 +1,7 @@
 import os
 import re
 
-folder = r"data/arm/dataset/screenshots"
+folder = r"data/beam/dataset/screenshots"
 
 # Regex to extract number from filenames like mesh_123.png
 pattern = re.compile(r"(.*?)(\d+)(\.\w+)$")
