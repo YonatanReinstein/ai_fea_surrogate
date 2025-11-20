@@ -12,11 +12,12 @@ def mlp_input_fn(data):
 def mlp_target_fn(data):
     return torch.cat([data.volume, data.max_stress, data.max_displacement], dim=-1)
 
-def gnn_input_fn(data): 
-    return data.x, data.edge_index, data.batch 
+def gnn_input_fn(data):
+    x = data.x[:, :3] 
+    return x, data.edge_index, data.batch
 
 def gnn_target_fn(data): 
-    return torch.cat([data.volume, data.max_stress, data.max_displacement], dim=-1) 
+    return torch.cat([data.max_stress], dim=-1) 
 
 def compute_dataset_stats(dataset):
     all_inputs = []
@@ -181,15 +182,12 @@ def train_gnn_model(
     # Build GNN model
     # ---------------------------
     sample = dataset[0]
-    in_features = sample.x.shape[1]
+    node_in_dim = sample.x[:, :3].shape[1]
     out_features_global = gnn_target_fn(sample).shape[1]  # = 3
-    print("GNN in_features:", in_features)
+    print("GNN in_features:", node_in_dim)
     print("GNN out_features_global:", out_features_global)
 
-    model = GNN(
-        in_features=in_features,
-        out_features_global=out_features_global
-    )
+    model = GNN(node_in_dim=node_in_dim)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = torch.nn.MSELoss()
@@ -207,7 +205,7 @@ def train_gnn_model(
             optimizer.zero_grad()
 
             x, edge_index, batch = gnn_input_fn(data)
-            pred = model(x, edge_index, batch)  # contains both heads
+            pred = model(x[:, :3] , edge_index, batch)  # contains both heads
             print(pred * glob_std + glob_mean)
 
             targ = gnn_target_fn(data)
@@ -232,7 +230,7 @@ def train_gnn_model(
             "model_state": model.state_dict(),
             "glob_mean": glob_mean,
             "glob_std": glob_std,
-            "in_features": in_features,
+            "node_in_dim": node_in_dim,
             "out_global": out_features_global,
         },
         save_path
