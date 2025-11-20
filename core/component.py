@@ -7,7 +7,7 @@ from .mesh import Mesh
 
 
 class Component:
-    def __init__(self, CAD_model: IIritModel, young: float = 2.1e11, poisson: float = 0.3):
+    def __init__(self, CAD_model: IIritModel, young: float, poisson: float):
         self.CAD_model = CAD_model
         self.young = young
         self.poisson = poisson
@@ -35,9 +35,9 @@ class Component:
     def get_volume(self):
         return self.CAD_model.get_volume()
 
-    def to_graph_with_labels(self):
-        if self.mesh is None:
-            raise ValueError("Mesh has not been generated yet.")
+    def to_graph_with_labels(self, with_labels: bool = True) -> Data:
+#        if self.mesh is None:
+#            raise ValueError("Mesh has not been generated yet.")
         
         node_feats = []
         node_disp = []
@@ -58,9 +58,9 @@ class Component:
             node_disp.append([ux, uy, uz])
             node_stress.append([sigma_vm])
 
-        x = torch.tensor(node_feats, dtype=torch.float)           # [N, F_in]
-        node_disp = torch.tensor(node_disp, dtype=torch.float)    # [N, 3]
-        node_stress = torch.tensor(node_stress, dtype=torch.float)# [N, 1]
+        x = torch.tensor(node_feats, dtype=torch.float)           
+        node_disp = torch.tensor(node_disp, dtype=torch.float).unsqueeze(0)   
+        node_stress = torch.tensor(node_stress, dtype=torch.float).unsqueeze(0)
 
         # --- Build edges (bidirectional) ---
         edges = set()
@@ -77,12 +77,16 @@ class Component:
             edge_index = torch.empty((2, 0), dtype=torch.long)
 
         # --- Global labels ---
-        volume = torch.tensor([self.get_volume()], dtype=torch.float)
-        dims = torch.tensor(list(self.CAD_model.get_dim_list()), dtype=torch.float)      
-        max_stress=torch.tensor([self.mesh.get_max_stress()], dtype=torch.float)
-        max_displacement=torch.tensor([self.mesh.get_max_displacement()], dtype=torch.float) 
-        poisson = torch.tensor([self.poisson], dtype=torch.float)
-        young = torch.tensor([self.young], dtype=torch.float)
+        volume = torch.tensor([self.get_volume()], dtype=torch.float).unsqueeze(0)
+        dims = torch.tensor(list(self.CAD_model.get_dim_list()), dtype=torch.float).unsqueeze(0)      
+        poisson = torch.tensor([self.poisson], dtype=torch.float).unsqueeze(0)
+        young = torch.tensor([self.young], dtype=torch.float).unsqueeze(0)
+        if with_labels:
+            max_stress=torch.tensor([self.mesh.get_max_stress()], dtype=torch.float).unsqueeze(0)
+            max_displacement=torch.tensor([self.mesh.get_max_displacement()], dtype=torch.float).unsqueeze(0)
+        else:
+            max_stress=torch.tensor([0.0], dtype=torch.float).unsqueeze(0)
+            max_displacement=torch.tensor([0.0], dtype=torch.float).unsqueeze(0)
 
         # --- Assemble Data object ---
         data = Data(
@@ -101,16 +105,25 @@ class Component:
 
 
 if __name__ == "__main__":
+
     model_path = "data/arm/CAD_model/model.irt"
     json_path = "data/arm/CAD_model/dims.json"
     cad_model = IIritModel(model_path, json_path)
     component = Component(cad_model, young=2.1e11, poisson=0.3)
-    component.generate_mesh(U=2, V=2, W=2)
-    
-    from .boundery_condition import anchor_condition, force_pattern_factory
+    geometry = "arm"
+
+    import importlib
+    module = importlib.import_module(f"data.{geometry}.boundary_conditions")
+    anchor_condition = module.anchor_condition
+    force_pattern = module.force_pattern
+    mesh_resolution = module.mesh_resolution
+    U, V, W = mesh_resolution()
+    component.generate_mesh(U=U, V=V, W=W)
     component.mesh.anchor_nodes_by_condition(anchor_condition)
-    component.mesh.apply_force_by_pattern(force_pattern_factory())
-    component.ansys_sim()
-    data = component.to_graph_with_labels()
+    component.mesh.apply_force_by_pattern(force_pattern)
+    component.mesh.solve(young=2e11, poisson=0.3)
+    component.mesh.plot_mesh()
+    print("Max stress:", component.mesh.get_max_stress())
+
 
 

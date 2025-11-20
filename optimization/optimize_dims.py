@@ -5,7 +5,6 @@ from .genetic_algorithm import GeneticAlgorithm
 from .fitness_functions import make_fitness
 
 def load_dims_config(geometry_name):
-    """Loads the dims.json file and returns ordered names and bounds."""
     dims_path = f"data/{geometry_name}/CAD_model/dims.json"
     with open(dims_path, "r") as f:
         dims_data = json.load(f)
@@ -20,12 +19,14 @@ def load_dims_config(geometry_name):
 
 
 def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40):
-    names, bounds, _ = load_dims_config(geometry_name)
-    in_dim = len(names)
+    material_props_path = f"data/{geometry_name}/CAD_model/material_properties.json"
+    with open(material_props_path, "r") as f:
+        material_properties = json.load(f)
+
+
 
     evaluator = get_evaluator(geometry_name, arch=arch)
-    fitness_func = make_fitness(evaluator)
-
+    fitness_func = make_fitness(evaluator, material_properties["yield_strength"])
     with open(f"data/{geometry_name}/CAD_model/dims.json", "r") as f:
         dims_dict = json.load(f)
 
@@ -41,6 +42,7 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40):
 
     best_dims = ga.run()
 
+    names = list(dims_dict.keys())
     print("Optimized Dimensions:")
     for name in names:
         print(f"  {name}: {best_dims[name]:.4f}")   
@@ -49,4 +51,4 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40):
 
 if __name__ == "__main__":
     geometry = "beam"
-    run_optimization(geometry, arch="mapdl", pop_size=10, generations=30)
+    run_optimization(geometry, arch="gnn", pop_size=10, generations=30)

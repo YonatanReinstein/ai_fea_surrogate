@@ -2,6 +2,7 @@ from typing import List, Callable
 from .node import Node
 from .element import Element
 from ansys.mapdl.core import launch_mapdl
+from ansys.mapdl.core.errors import MapdlRuntimeError
 
 class Mesh:
     def __init__(self, nodes, elements, tolerance=1e-9):
@@ -12,71 +13,77 @@ class Mesh:
         self.solution_valid = False
 
     def solve(self, young: float, poisson: float):
-        self.mapdl = launch_mapdl(mode="grpc", override=True, cleanup_on_exit=True)
-        self.mapdl.clear()
-        self.mapdl.prep7()
-        self.mapdl.et(1, 185)                 # SOLID185
-        self.mapdl.keyopt(1, 9, 0)            # (default integration)
-        self.mapdl.mp("EX", 1, young)
-        self.mapdl.mp("PRXY", 1, poisson)
-        for node in self.all_nodes():
-            self.mapdl.n(node.id, *node.coords)
-        self.mapdl.type(1)
-        self.mapdl.mat(1)
-        for elem in self.all_elements():
-            self.mapdl.en(elem.id, *[n.id for n in elem.nodes])
-        
-        # Apply anchors
-        self.mapdl.allsel("ALL")
-        self.mapdl.nsel("NONE")
-
-        for node in self.all_nodes():
-            if node.anchored:
-                self.mapdl.nsel("A", "NODE", vmin=node.id, vmax=node.id)
+        try:
+            self.mapdl = launch_mapdl(mode="grpc", override=True, cleanup_on_exit=True)
+            self.mapdl.clear()
+            self.mapdl.prep7()
+            self.mapdl.et(1, 185)                 # SOLID185
+            self.mapdl.keyopt(1, 9, 0)            # (default integration)
+            self.mapdl.mp("EX", 1, young)
+            self.mapdl.mp("PRXY", 1, poisson)
+            for node in self.all_nodes():
+                self.mapdl.n(node.id, *node.coords)
+            self.mapdl.type(1)
+            self.mapdl.mat(1)
+            for elem in self.all_elements():
+                self.mapdl.en(elem.id, *[n.id for n in elem.nodes])
             
-        self.mapdl.d("ALL", "UX", 0)
-        self.mapdl.d("ALL", "UY", 0)    
-        self.mapdl.d("ALL", "UZ", 0)
-
-        # Apply forces
-        for node in self.all_nodes():
+            # Apply anchors
             self.mapdl.allsel("ALL")
             self.mapdl.nsel("NONE")
-            fx, fy, fz = node.forces
-            if any([fx, fy, fz]):
-                self.mapdl.nsel("A", "NODE", vmin=node.id, vmax=node.id)
-                if fx != 0.0:
-                    self.mapdl.f("ALL", "FX", fx)
-                if fy != 0.0:
-                    self.mapdl.f("ALL", "FY", fy)
-                if fz != 0.0:
-                    self.mapdl.f("ALL", "FZ", fz)
 
-        
-        self.mapdl.allsel("ALL")     
-        self.mapdl.run("/SOLU")
-        self.mapdl.antype("STATIC")
-        self.mapdl.outres("ALL","ALL")
-        self.mapdl.solve()
-        self.mapdl.post1()
-        self.mapdl.set("last")
+            for node in self.all_nodes():
+                if node.anchored:
+                    self.mapdl.nsel("A", "NODE", vmin=node.id, vmax=node.id)
+                
+            self.mapdl.d("ALL", "UX", 0)
+            self.mapdl.d("ALL", "UY", 0)    
+            self.mapdl.d("ALL", "UZ", 0)
 
-        # von Mises stress
-        stress = self.mapdl.post_processing.nodal_eqv_stress()
+            # Apply forces
+            for node in self.all_nodes():
+                self.mapdl.allsel("ALL")
+                self.mapdl.nsel("NONE")
+                fx, fy, fz = node.forces
+                if any([fx, fy, fz]):
+                    self.mapdl.nsel("A", "NODE", vmin=node.id, vmax=node.id)
+                    if fx != 0.0:
+                        self.mapdl.f("ALL", "FX", fx)
+                    if fy != 0.0:
+                        self.mapdl.f("ALL", "FY", fy)
+                    if fz != 0.0:
+                        self.mapdl.f("ALL", "FZ", fz)
 
-        # Displacements
-        ux = self.mapdl.post_processing.nodal_displacement("X")
-        uy = self.mapdl.post_processing.nodal_displacement("Y")
-        uz = self.mapdl.post_processing.nodal_displacement("Z")
+            
+            self.mapdl.allsel("ALL")     
+            self.mapdl.run("/SOLU")
+            self.mapdl.antype("STATIC")
+            self.mapdl.outres("ALL","ALL")
+            self.mapdl.solve()
+            self.mapdl.post1()
+            self.mapdl.set("last")
 
-        # Update nodes_xyz with displacement and stress
-        for node_id, node in self.nodes.items():
-            node.displacement = [ux[node_id-1], uy[node_id-1], uz[node_id-1]]
-            node.stress = stress[node_id-1]
+            # von Mises stress
+            stress = self.mapdl.post_processing.nodal_eqv_stress()
 
-        #self.mapdl.post_processing.plot_nodal_eqv_stress()
-        self.mapdl.exit()
-        self.solution_valid = True
+            # Displacements
+            ux = self.mapdl.post_processing.nodal_displacement("X")
+            uy = self.mapdl.post_processing.nodal_displacement("Y")
+            uz = self.mapdl.post_processing.nodal_displacement("Z")
+
+            # Update nodes_xyz with displacement and stress
+            for node_id, node in self.nodes.items():
+                node.displacement = [ux[node_id-1], uy[node_id-1], uz[node_id-1]]
+                node.stress = stress[node_id-1]
+
+            #self.mapdl.post_processing.plot_nodal_eqv_stress()
+            self.mapdl.exit()
+            self.solution_valid = True
+        except MapdlRuntimeError as e:
+            print(f"MapdlRuntimeError: {e}")
+            self.mapdl.exit()
+            raise e
+            
 
     def anchor_node(self, node_id: int):
         node = self.get_node(node_id)
@@ -128,30 +135,86 @@ class Mesh:
 
     def all_elements(self) -> List[Element]:
         return list(self.elements.values())
-    
-    import pyvista as pv
-    import numpy as np
+  
+    def plot_mesh(self, save_path=None, resolution=(3840, 2160), aa_type="msaa"):
+        """
+        save_path: screenshot path (if None -> opens window)
+        resolution: high resolution for screenshot
+        aa_type: "fxaa", "ssaa", or "msaa"
+        """
+        import numpy as np
+        import pyvista as pv
+        from pyvista import CellType
 
-    def plot_mesh(nodes, elements):
-        # Build array of points (N, 3)
-        points = np.array([n.coords for n in nodes.values()], dtype=float)
+        node_items = sorted(self.nodes.items())
+        id_map = {nid: i for i, (nid, _) in enumerate(node_items)}
+        points = np.array([node.coords for _, node in node_items], dtype=float)
 
-        # Build cells
-        # Flatten into: [num_points_in_elem, n1, n2, n3, n4, ...]
         cells = []
         cell_types = []
+        for elem in self.elements.values():
+            local_ids = [id_map[n.id] for n in elem.nodes]
+            cells.append(len(local_ids))
+            cells.extend(local_ids)
+            cell_types.append(CellType.HEXAHEDRON)
 
-        for elem in elements.values():
-            node_ids = [n.id - 1 for n in elem.nodes]  # zero-based indexing
-            cells.append(len(node_ids))
-            cells.extend(node_ids)
-            cell_types.append(12)  # VTK_HEXAHEDRON = 12 (for solid185/c3d8 cubes)
+        grid = pv.UnstructuredGrid(np.array(cells), np.array(cell_types), points)
 
-        cells = np.array(cells)
+        # high-res off-screen plotter
+        off_screen = save_path is not None
+        plotter = pv.Plotter(
+            off_screen=off_screen,
+            window_size=resolution,
+        )
 
-        mesh = pv.UnstructuredGrid(cells, cell_types, points)
+        # ✔ correct anti-aliasing options
+        plotter.enable_anti_aliasing(aa_type)
 
-        mesh.plot(show_edges=True)
+        plotter.add_mesh(grid, show_edges=True, opacity=0.6, color="lightgray")
+
+        # Forces
+        for _, node in node_items:
+            force = np.array(node.forces, dtype=float)
+            if np.linalg.norm(force) > 1e-9:
+                arrow = pv.Arrow(start=node.coords, direction=force, scale=0.1)
+                plotter.add_mesh(arrow, color="red")
+
+        # Anchors
+        anchored = [node.coords for _, node in node_items if getattr(node, "anchored", False)]
+        if anchored:
+            plotter.add_points(np.array(anchored), point_size=18, color="blue")
+
+        # Save or show
+        if save_path is not None:
+            plotter.show(auto_close=False)
+            plotter.screenshot(save_path)
+            plotter.close()
+            print(f"Saved high-quality screenshot: {save_path}")
+        else:
+            plotter.show()
+
+
+
+if __name__ == "__main__":
+    # Example usage
+    # Define some nodes and elements
+    nodes = {
+        1: Node(1, [0.0, 0.0, 0.0]),
+        2: Node(2, [1.0, 0.0, 0.0]),
+        3: Node(3, [1.0, 1.0, 0.0]),
+        4: Node(4, [0.0, 1.0, 0.0]),
+        5: Node(5, [0.0, 0.0, 1.0]),
+        6: Node(6, [1.0, 0.0, 1.0]),
+        7: Node(7, [1.0, 1.0, 1.0]),
+        8: Node(8, [0.0, 1.0, 1.0]),
+    }
+    elements = {
+        1: Element(1, [nodes[1], nodes[2], nodes[3], nodes[4], nodes[5], nodes[6], nodes[7], nodes[8]]),
+    }
+    mesh = Mesh(nodes, elements)
+    mesh.plot_mesh()
+
+    
 
 
 

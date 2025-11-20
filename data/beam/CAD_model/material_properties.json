@@ -1,0 +1,5 @@
+{
+    "young_modulus": 2e11,
+    "poisson_ratio": 0.3,
+    "yield_strength": 1e8
+}

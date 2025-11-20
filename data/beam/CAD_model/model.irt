@@ -1,13 +1,13 @@
 include("dims.irt");
 TV = GBOX(
     point(0,0,0),
-    point(0,0,Width),
-    point(0,Height,0), 
-    point(0,Height,Width),
+    point(0,0,Height),
+    point(0,Width,0), 
+    point(0,Width,Height),
     point(9,0,0),
-    point(9,0,Width),
-    point(9,Height,0),
-    point(9,Height,Width)
+    point(9,0,Height),
+    point(9,Width,0),
+    point(9,Width,Height)
 );
 save("model.itd", list(TV));
 V = TVolume(TV, 1);
