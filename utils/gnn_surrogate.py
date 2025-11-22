@@ -7,7 +7,7 @@ import torch
 
 
 class GNN(nn.Module):
-    def __init__(self, node_in_dim, hidden_dim=64, num_layers=6):
+    def __init__(self, node_in_dim, hidden_dim=128, num_layers=4):
         super().__init__()
         self.encoder = MLP([node_in_dim, hidden_dim, hidden_dim],norm=None)
         self.convs = nn.ModuleList()
@@ -18,7 +18,7 @@ class GNN(nn.Module):
     def forward(self, x, edge_index, batch):
         h = self.encoder(x)
         for conv in self.convs:
-            h = conv(h, edge_index)
+            h = h + conv(h, edge_index)
         node_pred = self.head(h)
         graph_pred = global_max_pool(node_pred, batch)
         return graph_pred
