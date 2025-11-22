@@ -48,7 +48,7 @@ def build_dataset(
                 #comp.mesh.plot_mesh()       
                 comp.mesh.solve(young=young, poisson=poisson)
                 data = comp.to_graph_with_labels()
-                comp.mesh.plot_mesh(save_path=f"{screenshots_dir}/mesh_{i+1}.png")
+                #comp.mesh.plot_mesh(save_path=f"{screenshots_dir}/mesh_{i+1}.png")
                 dataset.append(data)
                 metadata.append({
                     "id": i,
