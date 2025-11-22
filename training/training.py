@@ -13,7 +13,7 @@ def mlp_target_fn(data):
     return torch.cat([data.volume, data.max_stress, data.max_displacement], dim=-1)
 
 def gnn_input_fn(data):
-    x = data.x[:, :3] 
+    x = data.x[:, :2] 
     return x, data.edge_index, data.batch
 
 def gnn_target_fn(data): 
@@ -150,7 +150,7 @@ def train_gnn_model(
     geometry: str,
     num_samples: int,
     epochs: int = 100,
-    lr: float = 1e-3,
+    lr: float = 1e-5,
     batch_size: int = 4
 ):
     torch.manual_seed(42)
@@ -185,7 +185,7 @@ def train_gnn_model(
     # Build GNN model
     # ---------------------------
     sample = dataset[0]
-    node_in_dim = sample.x[:, :3].shape[1]
+    node_in_dim = gnn_input_fn(sample)[0].shape[1]
     out_features_global = gnn_target_fn(sample).shape[1]  # = 3
     print("GNN in_features:", node_in_dim)
     print("GNN out_features_global:", out_features_global)
@@ -208,14 +208,19 @@ def train_gnn_model(
             optimizer.zero_grad()
 
             x, edge_index, batch = gnn_input_fn(data)
-            pred = model(x[:, :3] , edge_index, batch)  # contains both heads
-            print(pred * glob_std + glob_mean)
+            #print("Targ shape:", targ.shape)
+            pred = model(x , edge_index, batch)  
+
+ 
 
             targ = gnn_target_fn(data)
+
+            #print("Pred shape:", pred.shape)
+
             glob_t = (targ - glob_mean) / glob_std  # normalized
-            glob_t = targ
             loss = loss_fn(pred, glob_t)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             total_loss += loss.item()
