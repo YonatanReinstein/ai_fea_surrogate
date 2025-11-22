@@ -298,7 +298,7 @@ if __name__ == "__main__":
         geometry = "arm",
         num_samples = 1000,
         epochs=50,
-        lr=3e-5,
+        lr=3e-6,
         batch_size=20
     )
 
