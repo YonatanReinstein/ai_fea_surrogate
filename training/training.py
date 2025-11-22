@@ -160,6 +160,8 @@ def train_gnn_model(
     # ---------------------------
     dataset_path = f"data/{geometry}/dataset/dataset_1000.pt"
     save_path = f"data/{geometry}/surrogates/gnn_surrogate_{num_samples}.pt"
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("Using device:", device)
     dataset = torch.load(dataset_path, weights_only=False)
     dataset = dataset[:num_samples]
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -175,8 +177,8 @@ def train_gnn_model(
 
     global_mat = torch.stack(all_global).float()
 
-    glob_mean = global_mat.mean(dim=0)
-    glob_std  = global_mat.std(dim=0) + 1e-8
+    glob_mean = global_mat.mean(dim=0).to(device)
+    glob_std  = global_mat.std(dim=0).to(device) + 1e-8
 
     print("Global mean:", glob_mean)
     print("Global std :", glob_std)
@@ -190,7 +192,7 @@ def train_gnn_model(
     print("GNN in_features:", node_in_dim)
     print("GNN out_features_global:", out_features_global)
 
-    model = GNN(node_in_dim=node_in_dim)
+    model = GNN(node_in_dim=node_in_dim).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = torch.nn.MSELoss()
@@ -206,19 +208,21 @@ def train_gnn_model(
 
         for data in loader:
             optimizer.zero_grad()
-
             x, edge_index, batch = gnn_input_fn(data)
-            #print("Targ shape:", targ.shape)
+            x = x.to(device)
+            edge_index = edge_index.to(device)
+            batch = batch.to(device)
             pred = model(x , edge_index, batch)  
 
  
 
-            targ = gnn_target_fn(data)
+            targ = gnn_target_fn(data).float().to(device)
 
             #print("Pred shape:", pred.shape)
 
             glob_t = (targ - glob_mean) / glob_std  # normalized
-            loss = loss_fn(pred, targ)
+            glob_t = glob_t.to(device)
+            loss = loss_fn(glob_t, pred)
             #print("glob_t:", glob_t )
             #print("Pred:", pred)
             loss.backward()
@@ -275,7 +279,7 @@ if __name__ == "__main__":
         geometry = "arm",
         num_samples = 1000,
         epochs=300,
-        lr=1e-5,
+        lr=1e-4,
         batch_size=20
     )
 

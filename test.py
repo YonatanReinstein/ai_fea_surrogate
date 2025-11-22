@@ -50,7 +50,7 @@ print("cuda available:", torch.cuda.is_available())
 print("gpu count:", torch.cuda.device_count())
 
 torch.manual_seed(42)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Using device:", device)
 
 

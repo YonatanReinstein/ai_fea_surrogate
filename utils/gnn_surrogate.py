@@ -7,7 +7,7 @@ import torch
 
 
 class GNN(nn.Module):
-    def __init__(self, node_in_dim, hidden_dim=128, num_layers=4):
+    def __init__(self, node_in_dim, hidden_dim=256, num_layers=4):
         super().__init__()
         self.encoder = MLP([node_in_dim, hidden_dim, hidden_dim],norm=None)
         self.convs = nn.ModuleList()
