@@ -46,10 +46,12 @@ num_samples = 4
 lr= 1e-3
 batch_size = 2
 
-
+print("cuda available:", torch.cuda.is_available())
+print("gpu count:", torch.cuda.device_count())
 
 torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
 
 
 loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)

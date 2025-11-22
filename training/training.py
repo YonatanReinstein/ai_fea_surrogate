@@ -218,7 +218,9 @@ def train_gnn_model(
             #print("Pred shape:", pred.shape)
 
             glob_t = (targ - glob_mean) / glob_std  # normalized
-            loss = loss_fn(pred, glob_t)
+            loss = loss_fn(pred, targ)
+            #print("glob_t:", glob_t )
+            #print("Pred:", pred)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
