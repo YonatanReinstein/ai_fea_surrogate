@@ -183,6 +183,7 @@ def train_gnn_model(
     print("Global mean:", glob_mean)
     print("Global std :", glob_std)
 
+
     # ---------------------------
     # Build GNN model
     # ---------------------------
@@ -192,15 +193,33 @@ def train_gnn_model(
     print("GNN in_features:", node_in_dim)
     print("GNN out_features_global:", out_features_global)
 
-    model = GNN(node_in_dim=node_in_dim).to(device)
+
+    if os.path.exists(save_path):
+
+        # Load checkpoint
+        checkpoint = torch.load(save_path, weights_only=False)
+
+        node_in_dim = checkpoint["node_in_dim"]
+        glob_mean = checkpoint["glob_mean"]
+        glob_std  = checkpoint["glob_std"]
+
+        # Rebuild model
+        model = GNN(node_in_dim=node_in_dim).to(device)
+        model.load_state_dict(checkpoint["model_state"])   # <-- restore weights
+    else:
+        model = GNN(node_in_dim=node_in_dim).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = torch.nn.MSELoss()
+    model.train()
+
+
+
 
     # ---------------------------
     # Training loop
     # ---------------------------
-    model.train()
+
     epoch_losses = []
 
     for epoch in range(1, epochs + 1):
@@ -278,8 +297,8 @@ if __name__ == "__main__":
     train_gnn_model(
         geometry = "arm",
         num_samples = 1000,
-        epochs=300,
-        lr=1e-4,
+        epochs=50,
+        lr=3e-5,
         batch_size=20
     )
 
