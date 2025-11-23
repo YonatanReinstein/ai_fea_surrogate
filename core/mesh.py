@@ -3,6 +3,8 @@ from .node import Node
 from .element import Element
 from ansys.mapdl.core import launch_mapdl
 from ansys.mapdl.core.errors import MapdlRuntimeError
+import pyvista as pv
+pv.OFF_SCREEN = True 
 
 class Mesh:
     def __init__(self, nodes, elements, tolerance=1e-9):
@@ -12,9 +14,13 @@ class Mesh:
         self.tolerance = tolerance
         self.solution_valid = False
 
-    def solve(self, young: float, poisson: float):
+    def solve(self, young: float, poisson: float, mapdl=None, screenshot_path: str = None):
+        self.mapdl = mapdl
+        created_mapdl = False
         try:
-            self.mapdl = launch_mapdl(mode="grpc", override=True, cleanup_on_exit=True)
+            if self.mapdl is None:
+                created_mapdl = True
+                self.mapdl = launch_mapdl(mode="grpc", override=True, cleanup_on_exit=True)
             self.mapdl.clear()
             self.mapdl.prep7()
             self.mapdl.et(1, 185)                 # SOLID185
@@ -76,12 +82,33 @@ class Mesh:
                 node.displacement = [ux[node_id-1], uy[node_id-1], uz[node_id-1]]
                 node.stress = stress[node_id-1]
 
-            #self.mapdl.post_processing.plot_nodal_eqv_stress()
-            self.mapdl.exit()
+            # Create the plot but DO NOT display it
+            plotter = self.mapdl.post_processing.plot_nodal_eqv_stress(
+                show=False,
+ #               vtk=True,
+                return_plotter=True,
+ #               background="white"
+            )
+
+            print(type(plotter.scene))
+            print(dir(plotter.scene))
+
+
+
+            #plotter.scene.camera.elevation = 270
+            if screenshot_path is not None:
+                plotter.scene.screenshot(screenshot_path)
+
+
+
+            if created_mapdl:
+                self.mapdl.exit()
+            self.mapdl = None
             self.solution_valid = True
         except MapdlRuntimeError as e:
             print(f"MapdlRuntimeError: {e}")
-            self.mapdl.exit()
+            if created_mapdl:
+                self.mapdl.exit()
             raise e
             
 
@@ -137,11 +164,6 @@ class Mesh:
         return list(self.elements.values())
   
     def plot_mesh(self, save_path=None, resolution=(3840, 2160), aa_type="msaa"):
-        """
-        save_path: screenshot path (if None -> opens window)
-        resolution: high resolution for screenshot
-        aa_type: "fxaa", "ssaa", or "msaa"
-        """
         import numpy as np
         import pyvista as pv
         from pyvista import CellType

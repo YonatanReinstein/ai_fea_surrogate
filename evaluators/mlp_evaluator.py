@@ -1,7 +1,7 @@
 import torch
 from utils.mlp_surrogate import MLP
 from .base_evaluator import BaseEvaluator
-from training.training import mlp_input_fn, mlp_target_fn
+from training.gnn_training import mlp_input_fn, mlp_target_fn
 
 class MLPEvaluator(BaseEvaluator):
     def __init__(self, geometry_name: str):
