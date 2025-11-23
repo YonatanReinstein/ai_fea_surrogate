@@ -23,8 +23,6 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40):
     with open(material_props_path, "r") as f:
         material_properties = json.load(f)
 
-
-
     evaluator = get_evaluator(geometry_name, arch=arch)
     fitness_func = make_fitness(evaluator, material_properties["yield_strength"])
     with open(f"data/{geometry_name}/CAD_model/dims.json", "r") as f:
@@ -35,8 +33,8 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40):
         dims_dict=dims_dict,
         pop_size=pop_size,
         generations=generations,
-        crossover_rate=0.5,
-        mutation_rate=0.2,
+        crossover_rate=0.85,
+        mutation_rate=0.05,
         seed=0,
     )
 
@@ -50,5 +48,12 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40):
 
 
 if __name__ == "__main__":
-    geometry = "beam"
-    run_optimization(geometry, arch="gnn", pop_size=10, generations=30)
+    import argparse
+    parser = argparse.ArgumentParser(description="Optimize dimensions for a given geometry.")
+    parser.add_argument("--geometry", type=str, default="arm", help="Geometry name")
+    parser.add_argument("--arch", type=str, default="gnn", help="Architecture type")
+    parser.add_argument("--pop_size", type=int, default=150, help="Population size")
+    parser.add_argument("--generations", type=int, default=100, help="Number of generations")
+    args = parser.parse_args()
+
+    run_optimization(args.geometry, arch=args.arch, pop_size=args.pop_size, generations=args.generations)
