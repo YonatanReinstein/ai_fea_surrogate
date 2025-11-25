@@ -84,15 +84,19 @@ class GeneticAlgorithm:
             normalized = np.zeros_like(mean_distances)
 
         return normalized
-
-
+    
     def run(self):
         population = self._initialize_population()
+
         with open("ga_log.txt", "w") as log_file:
             best = None
+
             for gen in range(self.generations):
+
+                # ----- evaluate individuals -----
                 raw_volume = []
                 raw_stress = []
+
                 for ind in population:
                     res = self.fitness_func(self.vector_to_dict(ind))
                     raw_volume.append(res["volume"])
@@ -100,67 +104,66 @@ class GeneticAlgorithm:
 
                 raw_volume = np.array(raw_volume)
                 raw_stress = np.array(raw_stress)
-                #raw_stress = raw_stress + np.maximum(100 * (raw_stress - res["yield_strength"]), 0)
+
+                # penalize yield violation
                 raw_stress = np.maximum(100 * (raw_stress - res["yield_strength"]), 0)
 
-    
-
-                # Compute diversity for current generation
+                # diversity
                 raw_diversity = self._diversity_scores(population)
 
-                V_min = raw_volume.min()
-                V_max = raw_volume.max()
-                V_norm = (raw_volume - V_min) / (V_max - V_min + 1e-8)
+                # ----- normalize -----
+                V_norm = (raw_volume - raw_volume.min()) / (raw_volume.ptp() + 1e-8)
+                S_norm = (raw_stress - raw_stress.min()) / (raw_stress.ptp() + 1e-8)
+                D_norm = (raw_diversity - raw_diversity.min()) / (raw_diversity.ptp() + 1e-8)
 
-
-                S_min = raw_stress.min()
-                S_max = raw_stress.max()
-                S_norm = (raw_stress - S_min) / (S_max - S_min + 1e-8)
-
-                D_min = raw_diversity.min()
-                D_max = raw_diversity.max()
-                D_norm = (raw_diversity - D_min) / (D_max - D_min + 1e-8)
-
+                # weights
                 w_v = 0.35
                 w_s = 0.55
                 w_d = 0.1
 
-                fitnesses = w_v * V_norm + w_s * S_norm + w_d * D_norm
+                fitnesses = w_v * V_norm + w_s * S_norm + w_d * D_norm  # lower is better
 
-                log_file.write(f"generation{gen+1}, best fitness: {fitnesses.min()}\n")  
-                #for i, (ind, fit) in enumerate(zip(population, fitnesses)):
-                #    log_file.write(f", fitness: {fit/fitnesses.sum()} stress: {S_norm[i]/S_norm.sum()} volume: {V_norm[i]/V_norm.sum()}\n")
-                #    log_file.flush()
+                # logging
+                log_file.write(f"generation {gen+1}, best fitness: {fitnesses.min()}\n")
+
+                # find global best (optional)
                 ranked = sorted(zip(fitnesses, population), key=lambda x: x[0])
                 best_fit, best_vec = ranked[0]
                 best = (best_fit, best_vec)
 
                 print(f"Gen {gen+1}/{self.generations} | Best fitness: {best_fit:.4e}")
 
-                # elitism: keep top 50%
-                survivors = [x[1] for x in ranked[:self.pop_size // 2]]
+                # ----- select ALL parents proportional to fitness -----
+                parents = self._select_parents_proportional(fitnesses, population,
+                                                            count=self.pop_size)
 
-                # offspring generation
-                offspring = []
-                while len(offspring) < self.pop_size:
-                    p1, p2 = random.sample(survivors, 2)
+                # ----- create new generation -----
+                new_population = []
+                while len(new_population) < self.pop_size:
+                    p1, p2 = random.sample(parents, 2)
                     child = self._crossover(p1, p2)
-
                     if random.random() < self.mutation_rate:
                         child = self._mutate(child)
+                    new_population.append(child)
 
-                    offspring.append(child)
-                log_file.flush()
+                population = np.array(new_population)
 
-                population = np.array(offspring)
-                # Save checkpoint every 50 generations
+                # Save checkpoint every 2 generations
                 if (gen + 1) % 2 == 0:
                     np.save(self.checkpoint_file, population)
-                    #log_file.write(f"[Checkpoint] Saved population at generation {gen+1}\n")
-                    #log_file.flush()
-                    #print(f"[GA] Saved checkpoint at generation {gen+1}")
-
 
         # return vector AND dict form
-        best_fit, best_vec = best
         return self.vector_to_dict(best_vec)
+
+    def _select_parents_proportional(self, fitnesses, population, count):
+        fitnesses = np.array(fitnesses)
+
+        # convert to scores where high = good
+        max_f = fitnesses.max()
+        scores = max_f - fitnesses + 1e-8
+
+        prob = scores / scores.sum()
+
+        idxs = np.random.choice(len(population), size=count, p=prob, replace=True)
+        return [population[i] for i in idxs]
+
