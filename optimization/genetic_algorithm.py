@@ -100,7 +100,9 @@ class GeneticAlgorithm:
 
                 raw_volume = np.array(raw_volume)
                 raw_stress = np.array(raw_stress)
-                raw_stress = raw_stress + np.maximum(100 * (raw_stress - res["yield_strength"]), 0)
+                #raw_stress = raw_stress + np.maximum(100 * (raw_stress - res["yield_strength"]), 0)
+                raw_stress = np.maximum(100 * (raw_stress - res["yield_strength"]), 0)
+
     
 
                 # Compute diversity for current generation

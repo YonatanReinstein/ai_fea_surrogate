@@ -12,13 +12,13 @@ class GNNEvaluator(BaseEvaluator):
 
     def __init__(self, geometry_name: str):
         super().__init__(geometry_name)
-        checkpoint_path = f"data/{self.geometry_name}/surrogates/gnn_surrogate_1000.pt"
+        checkpoint_path = f"data/{self.geometry_name}/gnn_surrogate.pt"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(checkpoint_path, map_location=self.device)
 
         # Normalization
-        self.glob_mean = ckpt["glob_mean"].float()
-        self.glob_std  = ckpt["glob_std"].float()
+        self.glob_mean = ckpt["targets_mean"].float()
+        self.glob_std  = ckpt["targets_std"].float()
         self.i = 0
 
         # Architecture info
@@ -28,8 +28,8 @@ class GNNEvaluator(BaseEvaluator):
         # Build GNN
         self.model = GNN(
             node_in_dim=self.node_in_dim,
-            hidden_dim=256,
-            num_layers=4
+            hidden_dim=128,
+            num_layers=6
         ).to(self.device)
         self.model.load_state_dict(ckpt["model_state"])
         self.model.eval()

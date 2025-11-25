@@ -52,8 +52,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optimize dimensions for a given geometry.")
     parser.add_argument("--geometry", type=str, default="arm", help="Geometry name")
     parser.add_argument("--arch", type=str, default="gnn", help="Architecture type")
-    parser.add_argument("--pop_size", type=int, default=150, help="Population size")
-    parser.add_argument("--generations", type=int, default=100, help="Number of generations")
+    parser.add_argument("--pop_size", type=int, default=200, help="Population size")
+    parser.add_argument("--generations", type=int, default=200, help="Number of generations")
     args = parser.parse_args()
 
     run_optimization(args.geometry, arch=args.arch, pop_size=args.pop_size, generations=args.generations)

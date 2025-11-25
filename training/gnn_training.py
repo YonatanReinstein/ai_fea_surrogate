@@ -14,7 +14,7 @@ def mlp_target_fn(data):
     return torch.cat([data.volume, data.max_stress, data.max_displacement], dim=-1)
 
 def gnn_input_fn(data):
-    x = data.x[:, :2] 
+    x = data.x[:, :3] 
     return x, data.edge_index, data.batch
 
 def gnn_target_fn(data): 
@@ -96,7 +96,7 @@ def train_gnn_model(
     node_in_dim = gnn_input_fn(sample)[0].shape[1]
     out_features_global = gnn_target_fn(sample).shape[1]
 
-    model = GNN(node_in_dim=node_in_dim, hidden_dim=hidden_dim, conv_layers=conv_layers).to(device)
+    model = GNN(node_in_dim=node_in_dim, hidden_dim=hidden_dim, num_layers=conv_layers).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     loss_fn = torch.nn.MSELoss()
