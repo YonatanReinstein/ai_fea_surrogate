@@ -9,9 +9,7 @@ from ansys.mapdl.core.errors import MapdlRuntimeError
 def build_dataset(
     geometry: str,
     num_samples: int = 10,
-    young: float = 2e11,
-    poisson: float = 0.3,
-    seed: int = 42
+    seed: int = 44
 ):
     random.seed(seed)
 
@@ -20,9 +18,15 @@ def build_dataset(
     dims_json_path = f"{base_path}/CAD_model/dims.json"
     dataset_dir = f"{base_path}/dataset"
     screenshots_dir = f"{base_path}/dataset/screenshots"
+    material_props_path = f"{base_path}/CAD_model/material_properties.json"
 
     os.makedirs(dataset_dir, exist_ok=True)
     os.makedirs(screenshots_dir, exist_ok=True)
+
+    with open(material_props_path, "r") as f:
+        material_props = json.load(f)
+        young = material_props["young_modulus"]
+        poisson = material_props["poisson_ratio"]
 
     with open(dims_json_path, "r") as f:
         dims_template = json.load(f)

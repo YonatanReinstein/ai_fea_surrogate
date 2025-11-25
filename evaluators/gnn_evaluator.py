@@ -13,8 +13,8 @@ class GNNEvaluator(BaseEvaluator):
     def __init__(self, geometry_name: str):
         super().__init__(geometry_name)
         checkpoint_path = f"data/{self.geometry_name}/surrogates/gnn_surrogate_1000.pt"
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        ckpt = torch.load(checkpoint_path, map_location=device)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
 
         # Normalization
         self.glob_mean = ckpt["glob_mean"].float()
@@ -30,7 +30,7 @@ class GNNEvaluator(BaseEvaluator):
             node_in_dim=self.node_in_dim,
             hidden_dim=256,
             num_layers=4
-        )
+        ).to(self.device)
         self.model.load_state_dict(ckpt["model_state"])
         self.model.eval()
 
@@ -60,6 +60,12 @@ class GNNEvaluator(BaseEvaluator):
         self.i += 1
         # Prepare GNN inputs
         x, edge_index, batch = gnn_input_fn(data)
+        if batch is None:
+             batch = torch.zeros(x.size(0), dtype=torch.long)
+
+        x = x.to(self.device)
+        edge_index = edge_index.to(self.device)
+        batch = batch.to(self.device)
         # Forward pass
         with torch.no_grad():
             pred_norm = self.model(x, edge_index, batch)   # [1,3]

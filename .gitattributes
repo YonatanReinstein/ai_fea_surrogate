@@ -1,4 +1,4 @@
-*data/arm/dataset/dataset_1000.pt filter=lfs diff=lfs merge=lfs -text
+*data/arm/dataset/*.pt filter=lfs diff=lfs merge=lfs -text
 data/arm/dataset/screenshots/*.png filter=lfs diff=lfs merge=lfs -text
-data/beam/dataset/dataset_1000.pt filter=lfs diff=lfs merge=lfs -text
+data/beam/dataset/*.pt filter=lfs diff=lfs merge=lfs -text
 data/beam/dataset/screenshots/*png filter=lfs diff=lfs merge=lfs -text

@@ -46,106 +46,6 @@ def normalize(x, mean, std):
 def denormalize(x, mean, std):
     return x * std + mean
 
-
-def train_mlp_model(
-    dataset_path: str,
-    save_path: str,
-    epochs: int = 100,
-    lr: float = 1e-3,
-    batch_size: int = 20
-):
-    torch.manual_seed(42)
-    
-
-    # ---------------------------
-    # load dataset
-    # ---------------------------
-    dataset = torch.load(dataset_path, weights_only=False)
-
-    # ---------------------------
-    # compute normalization stats
-    # ---------------------------
-    stats = compute_dataset_stats(dataset)
-    in_mean, in_std = stats["input_mean"], stats["input_std"]
-    print( "Input Mean:", in_mean )
-    print( "Input Std: ", in_std )
-    out_mean, out_std = stats["target_mean"], stats["target_std"]
-    print( "Output Mean:", out_mean )
-    print( "Output Std: ", out_std )
-
-    # ---------------------------
-    # build model
-    # ---------------------------
-    sample = dataset[0]
-    in_features  = mlp_input_fn(sample).numel()
-    out_features = mlp_target_fn(sample).numel()
-    model = MLP(in_features, out_features)
-
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = torch.nn.MSELoss()
-
-    epoch_losses = []
-
-    # ---------------------------
-    # training loop
-    # ---------------------------
-    for epoch in range(epochs):
-        total_loss = 0.0
-
-        for data in loader:
-
-            optimizer.zero_grad()
-
-            # raw input + target
-            raw_x = mlp_input_fn(data).float()
-            raw_y = mlp_target_fn(data).float()
-
-            # normalize
-            x = normalize(raw_x, in_mean, in_std)
-            y = normalize(raw_y, out_mean, out_std)
-
-            preds = model(x)
-            loss = criterion(preds, y)
-
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-
-        epoch_losses.append(total_loss)
-
-        print(f"Epoch {epoch+1:03d}/{epochs}  Loss={total_loss:.6f}")
-
-    # ---------------------------
-    # save model + normalization
-    # ---------------------------
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "input_mean": in_mean,
-            "input_std": in_std,
-            "target_mean": out_mean,
-            "target_std": out_std,
-        },
-        save_path
-    )
-
-    print(f"\nModel + normalization saved to: {save_path}")
-
-    # ---------------------------
-    # plot loss
-    # ---------------------------
-    import matplotlib.pyplot as plt
-    plt.plot(epoch_losses)
-    plt.title("MLP Training Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.grid(True)
-    plt.show()
-
-
 def train_gnn_model(
     geometry: str,
     num_samples: int,
@@ -153,152 +53,180 @@ def train_gnn_model(
     lr: float = 1e-5,
     batch_size: int = 4
 ):
+    import os
+    import json
+    import torch
+    from torch_geometric.loader import DataLoader
+    import matplotlib.pyplot as plt
+
     torch.manual_seed(42)
 
-    # ---------------------------
-    # Load dataset
-    # ---------------------------
-    dataset_path = f"data/{geometry}/dataset/dataset_1000.pt"
-    save_path = f"data/{geometry}/surrogates/gnn_surrogate_{num_samples}.pt"
+    dataset_path = f"data/{geometry}/dataset/dataset.pt"
+    save_dir = f"data/{geometry}/checkpoints/"
+    os.makedirs(save_dir, exist_ok=True)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Using device:", device)
+
+    # ---- Load dataset ----
     dataset = torch.load(dataset_path, weights_only=False)
-    dataset = dataset[:num_samples]
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    # ---------------------------
-    # Compute GLOBAL normalization stats only
-    # ---------------------------
-    all_global = []
+    # Split sets
+    n_train = int(num_samples * 0.8)
+    train_set = dataset[:n_train]
+    val_set = dataset[n_train:num_samples]
 
-    for data in dataset:
-        targ = gnn_target_fn(data)
-        all_global.append(targ) 
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 
-    global_mat = torch.stack(all_global).float()
+    # ---- Compute global normalization stats ----
+    all_targets = torch.stack([gnn_target_fn(d) for d in dataset]).float()
+    targets_mean = all_targets.mean(dim=0).to(device)
+    targets_std = all_targets.std(dim=0).to(device) + 1e-8
 
-    glob_mean = global_mat.mean(dim=0).to(device)
-    glob_std  = global_mat.std(dim=0).to(device) + 1e-8
-
-    print("Global mean:", glob_mean)
-    print("Global std :", glob_std)
-
-
-    # ---------------------------
-    # Build GNN model
-    # ---------------------------
-    sample = dataset[0]
+    # ---- Model dims ----
+    sample = train_set[0]
     node_in_dim = gnn_input_fn(sample)[0].shape[1]
-    out_features_global = gnn_target_fn(sample).shape[1]  # = 3
-    print("GNN in_features:", node_in_dim)
-    print("GNN out_features_global:", out_features_global)
+    out_features_global = gnn_target_fn(sample).shape[1]
 
-
-    if os.path.exists(save_path):
-
-        # Load checkpoint
-        checkpoint = torch.load(save_path, weights_only=False)
-
-        node_in_dim = checkpoint["node_in_dim"]
-        glob_mean = checkpoint["glob_mean"]
-        glob_std  = checkpoint["glob_std"]
-
-        # Rebuild model
-        model = GNN(node_in_dim=node_in_dim).to(device)
-        model.load_state_dict(checkpoint["model_state"])   # <-- restore weights
-    else:
-        model = GNN(node_in_dim=node_in_dim).to(device)
+    model = GNN(node_in_dim=node_in_dim).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = torch.nn.MSELoss()
-    model.train()
 
+    # DECAY LR every 20 epochs by 0.9
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=20,
+        gamma=0.9
+    )
 
+    train_losses = []
+    val_losses = []
 
-
-    # ---------------------------
-    # Training loop
-    # ---------------------------
-
-    epoch_losses = []
-
+    # ---- Training Loop ----
     for epoch in range(1, epochs + 1):
-        total_loss = 0.0
 
-        for data in loader:
+        # ---------------- TRAIN ----------------
+        model.train()
+        total_train_loss = 0.0
+        num_train_batches = 0
+
+        for batch_data in train_loader:
             optimizer.zero_grad()
-            x, edge_index, batch = gnn_input_fn(data)
+
+            x, edge_index, batch_inds = gnn_input_fn(batch_data)
             x = x.to(device)
             edge_index = edge_index.to(device)
-            batch = batch.to(device)
-            pred = model(x , edge_index, batch)  
+            batch_inds = batch_inds.to(device)
 
- 
+            pred = model(x, edge_index, batch_inds)
 
-            targ = gnn_target_fn(data).float().to(device)
+            targ = gnn_target_fn(batch_data).float().to(device)
+            norm_t = (targ - targets_mean) / targets_std
 
-            #print("Pred shape:", pred.shape)
-
-            glob_t = (targ - glob_mean) / glob_std  # normalized
-            glob_t = glob_t.to(device)
-            loss = loss_fn(glob_t, pred)
-            #print("glob_t:", glob_t )
-            #print("Pred:", pred)
+            loss = loss_fn(pred, norm_t)
             loss.backward()
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            total_loss += loss.item()
+            total_train_loss += loss.item()
+            num_train_batches += 1
 
-        epoch_losses.append(total_loss)
-        print(f"Epoch {epoch:03d}/{epochs} | Loss = {total_loss:.6f}")
+        avg_train_loss = total_train_loss / num_train_batches
+        train_losses.append(avg_train_loss)
 
-    # ---------------------------
-    # Save model + global normalization ONLY
-    # ---------------------------
-    print(glob_mean)
-    print(glob_std)
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "glob_mean": glob_mean,
-            "glob_std": glob_std,
-            "node_in_dim": node_in_dim,
-            "out_global": out_features_global,
-        },
-        save_path
-    )
+        # ---------------- VALIDATION ----------------
+        model.eval()
+        total_val_loss = 0.0
+        num_val_batches = 0
 
-    print(f"\nGNN (global-only) saved to: {save_path}")
+        with torch.no_grad():
+            for batch_data in val_loader:
+                x, edge_index, batch_inds = gnn_input_fn(batch_data)
+                x = x.to(device)
+                edge_index = edge_index.to(device)
+                batch_inds = batch_inds.to(device)
 
-    # ---------------------------
-    # Plot Loss
-    # ---------------------------
-    import matplotlib.pyplot as plt
-    plt.plot(epoch_losses)
-    plt.title("GNN Global Training Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.grid(True)
-    plt.show()
+                pred = model(x, edge_index, batch_inds)
+
+                targ = gnn_target_fn(batch_data).float().to(device)
+                norm_t = (targ - targets_mean) / targets_std
+
+                vloss = loss_fn(pred, norm_t)
+                total_val_loss += vloss.item()
+                num_val_batches += 1
+
+        avg_val_loss = total_val_loss / num_val_batches
+        val_losses.append(avg_val_loss)
+
+        # ---- Update LR *once per epoch* ----
+        scheduler.step()
+
+        # ---- Save checkpoint every 10 epochs ----
+        if epoch % 10 == 0:
+            save_dict = {
+                "model_state": model.state_dict(),
+                "targets_mean": targets_mean.cpu(),
+                "targets_std": targets_std.cpu(),
+                "node_in_dim": node_in_dim,
+                "out_global": out_features_global,
+            }
+            torch.save(save_dict, os.path.join(save_dir, f"{epoch}_epochs.pt"))
+
+            with open(os.path.join(save_dir, "losses.json"), "w") as f:
+                json.dump({
+                    "train_losses": train_losses,
+                    "val_losses": val_losses
+                }, f, indent=4)
+
+        print(
+            f"Epoch {epoch:03d}/{epochs} | "
+            f"Train Loss = {avg_train_loss:.6f} | "
+            f"Val Loss = {avg_val_loss:.6f} | "
+            f"LR = {optimizer.param_groups[0]['lr']:.2e}"
+        )
+
+    ## ---- Plot ----
+    #plt.figure(figsize=(8, 5))
+    #plt.plot(train_losses, label="Train Loss")
+    #plt.plot(val_losses, label="Validation Loss")
+    #plt.title("GNN Loss Curve")
+    #plt.xlabel("Epoch")
+    #plt.ylabel("Loss")
+    #plt.legend()
+    #plt.grid(True)
+    #plt.show()
 
 
 if __name__ == "__main__":
 
-
-    #train_mlp_model(
-    #    dataset_path="data/beam/dataset/dataset_100.pt",
-    #    save_path="data/beam/surrogates/mlp_surrogate_100.pt",
-    #    epochs=100,
-    #    lr=1e-3,
-    #    batch_size=20
-    #)
-
     train_gnn_model(
         geometry = "arm",
         num_samples = 1000,
-        epochs=50,
-        lr=3e-6,
-        batch_size=20
+        epochs=800,
+        lr=2e-4,
+        batch_size=40
     )
 
+    # ---- Load checkpoint if exists ----
+    #if os.path.exists(save_path):
+    #    checkpoint = torch.load(save_path, weights_only=False)
+    #    model.load_state_dict(checkpoint["model_state"])
+    #    targets_mean = checkpoint["targets_mean"].to(device)
+    #    targets_std  = checkpoint["targets_std"].to(device)
+#
+
+
+            #for data in val_loader:
+
+
+#scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+#    optimizer,
+#    mode="min",
+#    factor=0.5,
+#    patience=30,   # ~30 epochs without improvement
+#    min_lr=1e-6,
+#    verbose=True,
+#)

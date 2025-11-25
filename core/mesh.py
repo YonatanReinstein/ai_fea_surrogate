@@ -90,9 +90,7 @@ class Mesh:
  #               background="white"
             )
 
-            print(type(plotter.scene))
-            print(dir(plotter.scene))
-
+      
 
 
             #plotter.scene.camera.elevation = 270

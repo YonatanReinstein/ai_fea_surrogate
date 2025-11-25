@@ -125,10 +125,10 @@ class GeneticAlgorithm:
 
                 fitnesses = w_v * V_norm + w_s * S_norm + w_d * D_norm
 
-                log_file.write(f"generation{gen+1    }, best fitness: {fitnesses.min()}\n")  
-                for i, (ind, fit) in enumerate(zip(population, fitnesses)):
-                    log_file.write(f", fitness: {fit/fitnesses.sum()} stress: {S_norm[i]/S_norm.sum()} volume: {V_norm[i]/V_norm.sum()}\n")
-                    log_file.flush()
+                log_file.write(f"generation{gen+1}, best fitness: {fitnesses.min()}\n")  
+                #for i, (ind, fit) in enumerate(zip(population, fitnesses)):
+                #    log_file.write(f", fitness: {fit/fitnesses.sum()} stress: {S_norm[i]/S_norm.sum()} volume: {V_norm[i]/V_norm.sum()}\n")
+                #    log_file.flush()
                 ranked = sorted(zip(fitnesses, population), key=lambda x: x[0])
                 best_fit, best_vec = ranked[0]
                 best = (best_fit, best_vec)
@@ -148,14 +148,15 @@ class GeneticAlgorithm:
                         child = self._mutate(child)
 
                     offspring.append(child)
+                log_file.flush()
 
                 population = np.array(offspring)
                 # Save checkpoint every 50 generations
-                if (gen + 1) % 10 == 0:
+                if (gen + 1) % 2 == 0:
                     np.save(self.checkpoint_file, population)
-                    log_file.write(f"[Checkpoint] Saved population at generation {gen+1}\n")
-                    log_file.flush()
-                    print(f"[GA] Saved checkpoint at generation {gen+1}")
+                    #log_file.write(f"[Checkpoint] Saved population at generation {gen+1}\n")
+                    #log_file.flush()
+                    #print(f"[GA] Saved checkpoint at generation {gen+1}")
 
 
         # return vector AND dict form
