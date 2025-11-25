@@ -1,3 +1,4 @@
+from xml.parsers.expat import model
 import torch
 from torch_geometric.loader import DataLoader
 from utils.mlp_surrogate import MLP
@@ -51,7 +52,9 @@ def train_gnn_model(
     num_samples: int,
     epochs: int = 100,
     lr: float = 1e-5,
-    batch_size: int = 4
+    batch_size: int = 4,
+    hidden_dim: int = 128,
+    conv_layers: int = 6
 ):
     import os
     import json
@@ -89,9 +92,9 @@ def train_gnn_model(
     node_in_dim = gnn_input_fn(sample)[0].shape[1]
     out_features_global = gnn_target_fn(sample).shape[1]
 
-    model = GNN(node_in_dim=node_in_dim).to(device)
+    model = GNN(node_in_dim=node_in_dim, hidden_dim=hidden_dim, conv_layers=conv_layers).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     loss_fn = torch.nn.MSELoss()
 
     # DECAY LR every 20 epochs by 0.9
@@ -202,13 +205,19 @@ def train_gnn_model(
 
 if __name__ == "__main__":
 
+    with open("data/arm/checkpoints/hyper_parameters.json", "r") as f:
+        hyper_params = json.load(f)
+
     train_gnn_model(
         geometry = "arm",
-        num_samples = 1000,
+        num_samples = hyper_params["num_samples"],
         epochs=800,
-        lr=2e-4,
-        batch_size=40
+        lr=hyper_params["lr"],
+        batch_size=hyper_params["batch_size"],
+        hidden_dim=hyper_params["hidden_dim"],
+        conv_layers=hyper_params["conv_layers"]
     )
+
 
     # ---- Load checkpoint if exists ----
     #if os.path.exists(save_path):

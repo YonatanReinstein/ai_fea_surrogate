@@ -1,0 +1,8 @@
+{
+    "arch": "gnn",
+    "conv_layers": 6,
+    "hidden_dim": 128,  
+    "num_samples": 2000,
+    "lr": 2e-4,
+    "batch_size": 16
+}
