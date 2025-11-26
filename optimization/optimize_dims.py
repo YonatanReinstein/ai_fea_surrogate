@@ -27,13 +27,15 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
     dims_path = f"data/{geometry_name}/CAD_model/dims.json"
     dims_dict = json.loads(Path(dims_path).read_text())
 
+    #2400 / 16
+
     ga = GeneticAlgorithm(
         fitness_func=fitness_func,
         dims_dict=dims_dict,
         pop_size=pop_size,
         generations=generations,
         crossover_rate=0.85,
-        mutation_rate=0.4,
+        mutation_rate=0.6,
         seed=0,
     )
 

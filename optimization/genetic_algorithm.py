@@ -50,15 +50,16 @@ class GeneticAlgorithm:
         return np.random.uniform(low, high, (self.pop_size, self.dim))
 
     def _mutate(self, individual, rate=0.3):
+        # per-gene mutation mask
         mask = np.random.rand(self.dim) < rate
 
-        # Random mutation factors only for selected genes
-        factors = np.random.uniform(0.8, 1.2, size=self.dim)
+        # scale of mutation ~ 10% of range for each gene
+        ranges = self.bounds[:, 1] - self.bounds[:, 0]
+        sigma = 0.15 * ranges
 
-        # Apply mutation where mask == True
-        mutated = np.where(mask, individual * factors, individual)
+        noise = np.random.normal(0.0, sigma, size=self.dim)
 
-        # Enforce parameter bounds
+        mutated = np.where(mask, individual + noise, individual)
         return np.clip(mutated, self.bounds[:, 0], self.bounds[:, 1])
 
     def _crossover(self, p1, p2):
@@ -121,9 +122,11 @@ class GeneticAlgorithm:
                 D_norm = (raw_diversity - raw_diversity.min()) / (raw_diversity.ptp() + 1e-8)
 
                 # weights
-                w_v = 0.45
-                w_s = 0.45
-                w_d = 0.1
+                w_v = 0.4
+                w_s = 0.4
+                w_d = 0.2
+
+                # 3000 * 0.8 = 
 
                 fitnesses = w_v * V_norm + w_s * S_norm + w_d * D_norm  # lower is better
 
@@ -139,8 +142,12 @@ class GeneticAlgorithm:
                 print(f"Gen {gen+1}/{self.generations} | Best fitness: {best_fit:.4e}")
 
                 # ----- select ALL parents proportional to fitness -----
-                parents = self._select_parents_proportional(fitnesses, population,
-                                                            count=self.pop_size)
+                #parents = self._select_parents_proportional(fitnesses, population,
+                #                                            count=self.pop_size)
+                
+                parents = self._select_parents_tournament(fitnesses, population,
+                                          count=self.pop_size, k=2)
+
 
                 # ----- create new generation -----
                 new_population = []
@@ -171,4 +178,16 @@ class GeneticAlgorithm:
 
         idxs = np.random.choice(len(population), size=count, p=prob, replace=True)
         return [population[i] for i in idxs]
+    
+    def _select_parents_tournament(self, fitnesses, population, count, k=3):
+        fitnesses = np.array(fitnesses)
+        parents = []
+        for _ in range(count):
+            # randomly sample k candidates
+            idxs = np.random.choice(len(population), size=k, replace=False)
+            # pick the one with the lowest fitness (remember: lower is better)
+            best_idx = idxs[np.argmin(fitnesses[idxs])]
+            parents.append(population[best_idx])
+        return parents
+
 
