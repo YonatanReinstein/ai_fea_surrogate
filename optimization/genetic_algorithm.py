@@ -96,11 +96,15 @@ class GeneticAlgorithm:
                 # ----- evaluate individuals -----
                 raw_volume = []
                 raw_stress = []
+                dims_dicts = []
 
                 for ind in population:
-                    res = self.fitness_func(self.vector_to_dict(ind))
-                    raw_volume.append(res["volume"])
-                    raw_stress.append(res["stress"])
+                    dims_dicts.append(self.vector_to_dict(ind))
+
+                res = self.fitness_func(dims_dicts) 
+
+                raw_stress = res["stress"]
+                raw_volume = res["volume"]
 
                 raw_volume = np.array(raw_volume)
                 raw_stress = np.array(raw_stress)
@@ -117,14 +121,15 @@ class GeneticAlgorithm:
                 D_norm = (raw_diversity - raw_diversity.min()) / (raw_diversity.ptp() + 1e-8)
 
                 # weights
-                w_v = 0.35
-                w_s = 0.55
+                w_v = 0.45
+                w_s = 0.45
                 w_d = 0.1
 
                 fitnesses = w_v * V_norm + w_s * S_norm + w_d * D_norm  # lower is better
 
                 # logging
                 log_file.write(f"generation {gen+1}, best fitness: {fitnesses.min()}\n")
+                log_file.flush()
 
                 # find global best (optional)
                 ranked = sorted(zip(fitnesses, population), key=lambda x: x[0])

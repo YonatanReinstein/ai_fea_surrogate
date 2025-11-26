@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import numpy as np
 from evaluators.factory import get_evaluator
 from .genetic_algorithm import GeneticAlgorithm
@@ -18,15 +19,13 @@ def load_dims_config(geometry_name):
     return names, bounds, defaults
 
 
-def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40):
+def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, screenshots=False, processes=None):
     material_props_path = f"data/{geometry_name}/CAD_model/material_properties.json"
-    with open(material_props_path, "r") as f:
-        material_properties = json.load(f)
-
-    evaluator = get_evaluator(geometry_name, arch=arch)
+    material_properties = json.loads(Path(material_props_path).read_text())
+    evaluator = get_evaluator(geometry_name, arch=arch, screenshots=screenshots, processes=processes)
     fitness_func = make_fitness(evaluator, material_properties["yield_strength"])
-    with open(f"data/{geometry_name}/CAD_model/dims.json", "r") as f:
-        dims_dict = json.load(f)
+    dims_path = f"data/{geometry_name}/CAD_model/dims.json"
+    dims_dict = json.loads(Path(dims_path).read_text())
 
     ga = GeneticAlgorithm(
         fitness_func=fitness_func,
@@ -34,7 +33,7 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40):
         pop_size=pop_size,
         generations=generations,
         crossover_rate=0.85,
-        mutation_rate=0.05,
+        mutation_rate=0.4,
         seed=0,
     )
 
@@ -54,6 +53,8 @@ if __name__ == "__main__":
     parser.add_argument("--arch", type=str, default="gnn", help="Architecture type")
     parser.add_argument("--pop_size", type=int, default=200, help="Population size")
     parser.add_argument("--generations", type=int, default=200, help="Number of generations")
+    parser.add_argument("--screenshots", action="store_true", help="Enable screenshots")
+    parser.add_argument("--processes", type=int, default=None, help="Number of processes for evaluation")
     args = parser.parse_args()
 
-    run_optimization(args.geometry, arch=args.arch, pop_size=args.pop_size, generations=args.generations)
+    run_optimization(args.geometry, arch=args.arch, pop_size=args.pop_size, generations=args.generations, screenshots=args.screenshots, processes=args.processes)
