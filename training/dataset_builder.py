@@ -50,9 +50,9 @@ def build_dataset(
                 comp.mesh.anchor_nodes_by_condition(anchor_condition)
                 comp.mesh.apply_force_by_pattern(force_pattern) 
                 #comp.mesh.plot_mesh()       
-                comp.mesh.solve(young=young, poisson=poisson)
+                comp.ansys_sim(screenshot_path=screenshots_dir)
                 data = comp.to_graph_with_labels()
-                #comp.mesh.plot_mesh(save_path=f"{screenshots_dir}/mesh_{i+1}.png")
+                comp.mesh.plot_mesh(save_path=f"{screenshots_dir}/mesh_{i+1}.png")
                 dataset.append(data)
                 metadata.append({
                     "id": i,

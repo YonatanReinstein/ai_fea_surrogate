@@ -1,102 +1,67 @@
 import torch
-from torch_geometric.data import Data
+ 
 from torch_geometric.loader import DataLoader
 from utils.gnn_surrogate import GNN
 
-
-# Dummy node features
-x_1 = torch.randn(4, 2)
-x_2 = torch.randn(4, 2)
-x_3 = torch.randn(4, 2)
-x_4 = torch.randn(4, 2)
-
-# Base edge index (must be LongTensor)
-edge_index_base = torch.tensor([
-    [0, 1, 2, 3, 0, 2],
-    [1, 0, 3, 2, 2, 0],
-], dtype=torch.long)
-
-# Deep copies (tensors copy by value already)
-edge_index_1 = edge_index_base.clone()
-edge_index_2 = edge_index_base.clone()
-edge_index_3 = edge_index_base.clone()
-edge_index_4 = edge_index_base.clone()
-
-# Targets
-target_1 = torch.tensor([0.5], dtype=torch.float)
-target_2 = torch.tensor([1.0], dtype=torch.float)
-target_3 = torch.tensor([1.5], dtype=torch.float)
-target_4 = torch.tensor([2.0], dtype=torch.float)
-
-# Each single graph must have batch = zeros
-batch_vec = torch.zeros(4, dtype=torch.long)
-
-# Build Data objects
-data_1 = Data(x=x_1, edge_index=edge_index_1, max_stress=target_1, batch=batch_vec)
-data_2 = Data(x=x_2, edge_index=edge_index_2, max_stress=target_2, batch=batch_vec)
-data_3 = Data(x=x_3, edge_index=edge_index_3, max_stress=target_3, batch=batch_vec)
-data_4 = Data(x=x_4, edge_index=edge_index_4, max_stress=target_4, batch=batch_vec)
-
-dataset = [data_1, data_2, data_3, data_4]
+dataset_a_path = "data/arm/dataset/dataset_a.pt"
+dataset_b_path = "data/arm/dataset/dataset_b.pt"
+dataset_c_path = "data/arm/dataset/dataset_c.pt"
 
 
+dataset_a = torch.load(dataset_a_path, weights_only=False)
+dataset_b = torch.load(dataset_b_path, weights_only=False)
+dataset_c = torch.load(dataset_c_path, weights_only=False)
 
-epochs = 1
-num_samples = 4
-lr= 1e-3
-batch_size = 2
+dataset = dataset_a + dataset_b + dataset_c
 
-print("cuda available:", torch.cuda.is_available())
-print("gpu count:", torch.cuda.device_count())
+dataset_20_path = "data/arm/dataset/dataset_20.pt"
+dataset_20 = torch.load(dataset_20_path, weights_only=False)
+sample = dataset_c[0]
+#print("Sample data.x:", sample.dims)
 
-torch.manual_seed(42)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print("Using device:", device)
+#print(f"Total samples: {len(dataset)}")
+#
+x_a_mean = torch.mean(torch.cat([data.x[:, :3] for data in dataset_a], dim=0), dim=0)
+print(f"Dataset A - Mean of first 3 features: {x_a_mean}")
 
+x_b_mean = torch.mean(torch.cat([data.x[:, :3] for data in dataset_b], dim=0), dim=0)
+print(f"Dataset B - Mean of first 3 features: {x_b_mean}")
+x_c_mean = torch.mean(torch.cat([data.x[:, :3] for data in dataset_c], dim=0), dim=0)
+print(f"Dataset C - Mean of first 3 features: {x_c_mean}")
+x_20_mean = torch.mean(torch.cat([data.x[:, :3] for data in dataset_20], dim=0), dim=0)
+print(f"Dataset 20 - Mean of first 3 features: {x_20_mean}")
+x_mean = torch.mean(torch.cat([data.x[:, :3] for data in dataset], dim=0), dim=0)
+print(f"Combined Dataset - Mean of first 3 features: {x_mean}")
 
-loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+x_a_std = torch.std(torch.cat([data.x[:, :3] for data in dataset_a], dim=0), dim=0)
+print(f"Dataset A - Std of first 3 features: {x_a_std}")
+x_b_std = torch.std(torch.cat([data.x[:, :3] for data in dataset_b], dim=0), dim=0)
+print(f"Dataset B - Std of first 3 features: {x_b_std}")
+x_c_std = torch.std(torch.cat([data.x[:, :3] for data in dataset_c], dim=0), dim=0)
+print(f"Dataset C - Std of first 3 features: {x_c_std}")
+x_20_std = torch.std(torch.cat([data.x[:, :3] for data in dataset_20], dim=0), dim=0)
+print(f"Dataset 20 - Std of first 3 features: {x_20_std}")
+x_std = torch.std(torch.cat([data.x[:, :3] for data in dataset], dim=0), dim=0)
+print(f"Combined Dataset - Std of first 3 features: {x_std}")
 
-    
-targets = []
+target_a_mean = torch.mean(torch.cat([data.max_stress for data in dataset_a], dim=0), dim=0)
+print(f"Dataset A - Mean of target max_stress: {target_a_mean}")
+target_b_mean = torch.mean(torch.cat([data.max_stress for data in dataset_b], dim=0), dim=0)
+print(f"Dataset B - Mean of target max_stress: {target_b_mean}")
+target_c_mean = torch.mean(torch.cat([data.max_stress for data in dataset_c], dim=0), dim=0)
+print(f"Dataset C - Mean of target max_stress: {target_c_mean}")
+target_20_mean = torch.mean(torch.cat([data.max_stress for data in dataset_20], dim=0), dim=0)
+print(f"Dataset 20 - Mean of target max_stress: {target_20_mean}")
+target_mean = torch.mean(torch.cat([data.max_stress for data in dataset], dim=0), dim=0)
+print(f"Combined Dataset - Mean of target max_stress: {target_mean}")
 
-for data in dataset:
-    targ = data.max_stress.float()
-    targets.append(targ)
-
-target_mat = torch.stack(targets)
-glob_mean = target_mat.mean(dim=0)
-glob_std  = target_mat.std(dim=0)
-sample = dataset[0]
-model = GNN(node_in_dim=2, num_layers=6).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-loss_fn = torch.nn.MSELoss()
-
-model.train()
-epoch_losses = []
-
-for epoch in range(1, epochs + 1):
-    total_loss = 0.0
-
-    for data in loader:
-        optimizer.zero_grad()
-        x, edge_index, batch = data.x.float().to(device), data.edge_index.to(device), data.batch.to(device)
-        pred = model(x, edge_index, batch)
-        targ = torch.cat([data.max_stress], dim=-1).to(device)
-        targ.unsqueeze_(1)
-        targ_norm = (targ - glob_mean.to(device)) / glob_std.to(device)
-        loss = loss_fn(pred, targ_norm)
-        loss.backward()
-        for name, p in model.named_parameters():
-            if p.grad is not None and torch.isnan(p.grad).any():
-                print("NaN in grad:", name)
-                exit()
-        optimizer.step()
-
-        total_loss += loss.item()
-
-    epoch_losses.append(total_loss)
-
-
-
-
-
+target_a_std = torch.std(torch.cat([data.max_stress for data in dataset_a], dim=0), dim=0)
+print(f"Dataset A - Std of target max_stress: {target_a_std}")
+target_b_std = torch.std(torch.cat([data.max_stress for data in dataset_b], dim=0), dim=0)
+print(f"Dataset B - Std of target max_stress: {target_b_std}")
+target_c_std = torch.std(torch.cat([data.max_stress for data in dataset_c], dim=0), dim=0)
+print(f"Dataset C - Std of target max_stress: {target_c_std}")
+target_20_std = torch.std(torch.cat([data.max_stress for data in dataset_20], dim=0), dim=0)
+print(f"Dataset 20 - Std of target max_stress: {target_20_std}")
+target_std = torch.std(torch.cat([data.max_stress for data in dataset], dim=0), dim=0)
+print(f"Combined Dataset - Std of target max_stress: {target_std}")
