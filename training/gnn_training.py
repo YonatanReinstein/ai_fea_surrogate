@@ -1,44 +1,16 @@
-from xml.parsers.expat import model
 import torch
 from torch_geometric.loader import DataLoader
-from utils.mlp_surrogate import MLP
 from utils.gnn_surrogate import GNN
 import json
 import os
 
 
-def mlp_input_fn(data):
-    return torch.cat([data.dims], dim=-1)
-
-def mlp_target_fn(data):
-    return torch.cat([data.volume, data.max_stress, data.max_displacement], dim=-1)
-
 def gnn_input_fn(data):
     x = data.x[:, :3] 
-    return x, data.edge_index, data.batch
+    return data.x, data.edge_index, data.batch
 
 def gnn_target_fn(data): 
     return torch.cat([data.max_stress], dim=-1) 
-
-def compute_dataset_stats(dataset):
-    all_inputs = []
-    all_targets = []
-
-    for data in dataset:
-        x = mlp_input_fn(data).float()
-        y = mlp_target_fn(data).float()
-        all_inputs.append(x)
-        all_targets.append(y)
-
-    X = torch.stack(all_inputs)
-    Y = torch.stack(all_targets)
-
-    return {
-        "input_mean":  X.mean(dim=0),
-        "input_std":   X.std(dim=0) + 1e-8,
-        "target_mean": Y.mean(dim=0),
-        "target_std":  Y.std(dim=0) + 1e-8,
-    }
 
 
 def normalize(x, mean, std):
@@ -56,16 +28,13 @@ def train_gnn_model(
     hidden_dim: int = 128,
     conv_layers: int = 6
 ):
-    import os
-    import json
-    import torch
-    from torch_geometric.loader import DataLoader
-    import matplotlib.pyplot as plt
 
     torch.manual_seed(42)
+    
 
     dataset_a_path = f"data/{geometry}/dataset/dataset_a.pt"
     dataset_b_path = f"data/{geometry}/dataset/dataset_b.pt"
+    dataset_c_path = f"data/{geometry}/dataset/dataset_c.pt"
 
     save_dir = f"data/{geometry}/checkpoints/"
     os.makedirs(save_dir, exist_ok=True)
@@ -76,18 +45,24 @@ def train_gnn_model(
     # ---- Load dataset ----
     dataset_a = torch.load(dataset_a_path, weights_only=False)
     dataset_b = torch.load(dataset_b_path, weights_only=False)
-    dataset = dataset_a + dataset_b
-    
-    # Split sets
+    dataset_c = torch.load(dataset_c_path, weights_only=False)
+    dataset = dataset_a + dataset_b# + dataset_c
+    num_samples = len(dataset)
+    import random
+
+    random.shuffle(dataset)
+
     n_train = int(num_samples * 0.8)
     train_set = dataset[:n_train]
     val_set = dataset[n_train:num_samples]
+
+
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 
     # ---- Compute global normalization stats ----
-    all_targets = torch.stack([gnn_target_fn(d) for d in dataset]).float()
+    all_targets = torch.stack([gnn_target_fn(d) for d in train_set]).float()
     targets_mean = all_targets.mean(dim=0).to(device)
     targets_std = all_targets.std(dim=0).to(device) + 1e-8
 
@@ -195,22 +170,11 @@ def train_gnn_model(
             f"LR = {optimizer.param_groups[0]['lr']:.2e}"
         )
 
-    ## ---- Plot ----
-    #plt.figure(figsize=(8, 5))
-    #plt.plot(train_losses, label="Train Loss")
-    #plt.plot(val_losses, label="Validation Loss")
-    #plt.title("GNN Loss Curve")
-    #plt.xlabel("Epoch")
-    #plt.ylabel("Loss")
-    #plt.legend()
-    #plt.grid(True)
-    #plt.show()
-
 
 if __name__ == "__main__":
 
-    with open("data/arm/checkpoints/hyper_parameters.json", "r") as f:
-        hyper_params = json.load(f)
+    hyper_params_path = "data/arm/checkpoints/hyper_parameters.json"
+    hyper_params = json.load(open(hyper_params_path, "r"))
 
     train_gnn_model(
         geometry = "arm",
@@ -222,24 +186,3 @@ if __name__ == "__main__":
         conv_layers=hyper_params["conv_layers"]
     )
 
-
-    # ---- Load checkpoint if exists ----
-    #if os.path.exists(save_path):
-    #    checkpoint = torch.load(save_path, weights_only=False)
-    #    model.load_state_dict(checkpoint["model_state"])
-    #    targets_mean = checkpoint["targets_mean"].to(device)
-    #    targets_std  = checkpoint["targets_std"].to(device)
-#
-
-
-            #for data in val_loader:
-
-
-#scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-#    optimizer,
-#    mode="min",
-#    factor=0.5,
-#    patience=30,   # ~30 epochs without improvement
-#    min_lr=1e-6,
-#    verbose=True,
-#)
