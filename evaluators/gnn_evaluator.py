@@ -8,53 +8,49 @@ from training.gnn_training import gnn_input_fn, gnn_target_fn
 import json
 from multiprocessing import Pool
 from torch_geometric.loader import DataLoader
+import importlib
+#from optimization.mid_process_stop import listener, STOP
+import threading
+from time import sleep
+import random 
+
+import socket
+
+STOP = False   
+
+def listener():
+    global STOP
+    s = socket.socket()
+    s.bind(("127.0.0.1", 5001))
+    s.listen(1)
+    conn, addr = s.accept()
+    msg = conn.recv(16)
+    if msg == b"STOP":
+        STOP = True
+    conn.close()
+    s.close()
 
 
 
-def _run_sample_worker(args):
-    (
-        geometry_name,
-        model_path,
-        dims,
-        young,
-        poisson,
-        sample_index
-    ) = args
-    cad_model = IIritModel(model_path, dims_dict=dims)
-    component = Component(cad_model, young, poisson)
-    import importlib
-    module = importlib.import_module(f"data.{geometry_name}.boundary_conditions")
-    anchor_condition = module.anchor_condition
-    force_pattern = module.force_pattern
-    mesh_resolution = module.mesh_resolution
-    U, V, W = mesh_resolution()
-    component.generate_mesh(U=U, V=V, W=W)
-    component.mesh.anchor_nodes_by_condition(anchor_condition)
-    component.mesh.apply_force_by_pattern(force_pattern)
-    data = component.to_graph_with_labels(with_labels=False)  # No labels during evaluation
-    save_path=f"screenshots/mesh_{sample_index+1}.png"
-    component.mesh.plot_mesh(save_path=save_path)
-    return data
 
 
 def _run_sample_worker(args):
     (
-        geometry_name,
         model_path,
         dims,
         young,
         poisson,
         sample_index,
-        screenshot
+        screenshot,
+        anchor_condition,
+        force_pattern,
+        U,
+        V,
+        W
     ) = args
+    #sleep(random.uniform(0.1, 0.5))  # Simulate variable computation time
     cad_model = IIritModel(model_path, dims_dict=dims)
     component = Component(cad_model, young, poisson)
-    import importlib
-    module = importlib.import_module(f"data.{geometry_name}.boundary_conditions")
-    anchor_condition = module.anchor_condition
-    force_pattern = module.force_pattern
-    mesh_resolution = module.mesh_resolution
-    U, V, W = mesh_resolution()
     component.generate_mesh(U=U, V=V, W=W)
     component.mesh.anchor_nodes_by_condition(anchor_condition)
     component.mesh.apply_force_by_pattern(force_pattern)
@@ -92,15 +88,24 @@ class GNNEvaluator(BaseEvaluator):
 
         self.sample_counter = 0
 
+        material_properties_path = f"data/{self.geometry_name}/CAD_model/material_properties.json"
+        material_properties = json.loads(open(material_properties_path, "r").read())
+        self.young = material_properties["young_modulus"]
+        self.poisson = material_properties["poisson_ratio"]
+        self.model_path = f"data/{self.geometry_name}/CAD_model/model.irt"
+
+        module = importlib.import_module(f"data.{geometry_name}.boundary_conditions")
+        self.anchor_condition = module.anchor_condition
+        self.force_pattern = module.force_pattern
+        self.mesh_resolution = module.mesh_resolution
+        self.U, self.V, self.W = self.mesh_resolution()
+        self.listener_thread = threading.Thread(target=listener, daemon=True).start()
+
+
 
     def evaluate(self, dims_list: list[dict]):
         batch_size = len(dims_list)
 
-        model_path = f"data/{self.geometry_name}/CAD_model/model.irt"
-        props = json.load(open(f"data/{self.geometry_name}/CAD_model/material_properties.json"))
-
-        young = props["young_modulus"]
-        poisson = props["poisson_ratio"]
 
         # Unique screenshot indexes
         indexes = list(range(self.sample_counter, self.sample_counter + batch_size))
@@ -108,19 +113,51 @@ class GNNEvaluator(BaseEvaluator):
 
         # Build args
         all_args = [
-            (self.geometry_name, model_path, dims, young, poisson, idx , self.screenshots)
+            (
+             self.model_path,
+             dims, 
+             self.young,
+             self.poisson,
+             idx , 
+             self.screenshots,
+             self.anchor_condition,
+             self.force_pattern,
+             self.U,
+             self.V,
+             self.W)
             for dims, idx in zip(dims_list, indexes)
         ]
+        results = []
 
-        # Run workers
         if self.processes is None:
-            with Pool(processes=1) as pool:
-                results = pool.map(_run_sample_worker, all_args)
+            pool = Pool()
         else:
-            with Pool(processes=self.processes) as pool:
-                results = pool.map(_run_sample_worker, all_args)
+            pool = Pool(processes=self.processes)
+        it = pool.imap(_run_sample_worker, all_args, chunksize=1)
+        try:
+            for result in it:
+                if STOP:
+                    print("Graceful stop requested.")
 
-        # Unpack
+                    # -------- KEY PART --------
+                    pool.close()  
+                    sleep(30)      # do not accept new tasks
+                    pool.terminate()    # kill worker process
+                    # -------------------------
+                    print("Stopped during evaluation.")
+                    pool.join() 
+
+                    break
+
+                results.append(result)
+        finally:
+    # now join NEVER hangs
+            print("Done.")
+
+
+
+
+
         graph_list, volume_list = zip(*results)
 
         # Build DataLoader

@@ -34,16 +34,17 @@ class GNNEvaluator(BaseEvaluator):
         self.model.load_state_dict(ckpt["model_state"])
         self.model.eval()
 
+        material_properties_path = f"data/{self.geometry_name}/CAD_model/material_properties.json"
+        material_properties = json.loads(open(material_properties_path, "r").read())
+        self.young = material_properties["young_modulus"]
+        self.poisson = material_properties["poisson_ratio"]
 
     def evaluate(self, dims: dict):
 
         model_path = f"data/{self.geometry_name}/CAD_model/model.irt"
         cad_model = IIritModel(model_path, dims_dict=dims)
 
-        material_props_path = f"data/{self.geometry_name}/CAD_model/material_properties.json"
-        with open(material_props_path, "r") as f:
-            material_properties = json.load(f)
-        component = Component(cad_model, young=material_properties["young_modulus"], poisson=material_properties["poisson_ratio"])
+        component = Component(cad_model, young=self.young, poisson=self.poisson)
 
         import importlib
         module = importlib.import_module(f"data.{self.geometry_name}.boundary_conditions")

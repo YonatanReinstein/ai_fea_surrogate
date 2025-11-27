@@ -3,7 +3,7 @@ from .gnn_evaluator import GNNEvaluator
 from .mapdl_evaluator import MAPDLEvaluator
 import json
 
-def get_evaluator(geometry_name, arch="mlp", screenshots: bool = False, processes: int =None):
+def get_evaluator(geometry_name, arch="mlp", screenshots: bool = False, processes: int = None):
     if arch == "mlp":
         return MLPEvaluator(geometry_name)
     elif arch == "gnn":

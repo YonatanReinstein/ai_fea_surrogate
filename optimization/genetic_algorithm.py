@@ -89,82 +89,81 @@ class GeneticAlgorithm:
     def run(self):
         population = self._initialize_population()
 
-        with open("ga_log.txt", "w") as log_file:
-            best = None
+        best_vec = None
+        best_fit = float("inf")
 
-            for gen in range(self.generations):
+        for gen in range(self.generations):
 
-                # ----- evaluate individuals -----
-                raw_volume = []
-                raw_stress = []
-                dims_dicts = []
+            # ----- evaluate individuals -----
+            dims_dicts = [self.vector_to_dict(ind) for ind in population]
+            res = self.fitness_func(dims_dicts)
 
-                for ind in population:
-                    dims_dicts.append(self.vector_to_dict(ind))
+            raw_volume = np.array(res["volume"])
+            raw_stress = np.array(res["stress"])
 
-                res = self.fitness_func(dims_dicts) 
+            # penalize yield violation
+            raw_stress = np.maximum(100 * (raw_stress - res["yield_strength"]), 0)
 
-                raw_stress = res["stress"]
-                raw_volume = res["volume"]
+            # diversity
+            raw_diversity = self._diversity_scores(population)
 
-                raw_volume = np.array(raw_volume)
-                raw_stress = np.array(raw_stress)
+            # ----- normalize -----
+            V_norm = (raw_volume - raw_volume.min()) / (raw_volume.ptp() + 1e-8)
+            S_norm = (raw_stress - raw_stress.min()) / (raw_stress.ptp() + 1e-8)
+            D_norm = (raw_diversity - raw_diversity.min()) / (raw_diversity.ptp() + 1e-8)
 
-                # penalize yield violation
-                raw_stress = np.maximum(100 * (raw_stress - res["yield_strength"]), 0)
+            # weights
+            w_v = 0.4
+            w_s = 0.4
+            w_d = 0.2
 
-                # diversity
-                raw_diversity = self._diversity_scores(population)
+            # fitness (lower = better)
+            fitnesses = w_v * V_norm + w_s * S_norm + w_d * D_norm
 
-                # ----- normalize -----
-                V_norm = (raw_volume - raw_volume.min()) / (raw_volume.ptp() + 1e-8)
-                S_norm = (raw_stress - raw_stress.min()) / (raw_stress.ptp() + 1e-8)
-                D_norm = (raw_diversity - raw_diversity.min()) / (raw_diversity.ptp() + 1e-8)
+            # ----- update global best -----
+            gen_best_idx = np.argmin(fitnesses)
+            if fitnesses[gen_best_idx] < best_fit:
+                best_fit = fitnesses[gen_best_idx]
+                best_vec = population[gen_best_idx].copy()
 
-                # weights
-                w_v = 0.4
-                w_s = 0.4
-                w_d = 0.2
+            # log
+            print(f"Gen {gen+1}/{self.generations} | Best fitness: {fitnesses.min():.4e}")
 
-                # 3000 * 0.8 = 
+            # ----- rank individuals -----
+            ranked = sorted(zip(fitnesses, population), key=lambda x: x[0])
+            _, sorted_pop = zip(*ranked)
+            sorted_pop = np.array(sorted_pop)
 
-                fitnesses = w_v * V_norm + w_s * S_norm + w_d * D_norm  # lower is better
+            half = self.pop_size // 2
 
-                # logging
-                log_file.write(f"generation {gen+1}, best fitness: {fitnesses.min()}\n")
-                log_file.flush()
+            # ---- TOP HALF survive but may mutate ----
+            survivors = []
+            for indiv in sorted_pop[:half]:
+                if random.random() < self.mutation_rate:
+                    survivors.append(self._mutate(indiv))
+                else:
+                    survivors.append(indiv)
+            survivors = np.array(survivors)
 
-                # find global best (optional)
-                ranked = sorted(zip(fitnesses, population), key=lambda x: x[0])
-                best_fit, best_vec = ranked[0]
-                best = (best_fit, best_vec)
+            # ---- Parents for crossover come only from TOP HALF ----
+            parents_pool = survivors
 
-                print(f"Gen {gen+1}/{self.generations} | Best fitness: {best_fit:.4e}")
+            # ---- BOTTOM HALF replaced by children ----
+            children = []
+            while len(children) < (self.pop_size - half):
+                p1, p2 = random.sample(list(parents_pool), 2)
+                child = self._crossover(p1, p2)
+                if random.random() < self.mutation_rate:
+                    child = self._mutate(child)
+                children.append(child)
 
-                # ----- select ALL parents proportional to fitness -----
-                #parents = self._select_parents_proportional(fitnesses, population,
-                #                                            count=self.pop_size)
-                
-                parents = self._select_parents_tournament(fitnesses, population,
-                                          count=self.pop_size, k=2)
+            # ---- New generation ----
+            population = np.vstack([survivors, children])
 
+            # checkpoint
+            if (gen + 1) % 2 == 0:
+                np.save(self.checkpoint_file, population)
 
-                # ----- create new generation -----
-                new_population = []
-                while len(new_population) < self.pop_size:
-                    p1, p2 = random.sample(parents, 2)
-                    child = self._crossover(p1, p2)
-                    if random.random() < self.mutation_rate:
-                        child = self._mutate(child)
-                    new_population.append(child)
-
-                population = np.array(new_population)
-
-                # Save checkpoint every 2 generations
-                if (gen + 1) % 2 == 0:
-                    np.save(self.checkpoint_file, population)
-
-        # return vector AND dict form
         return self.vector_to_dict(best_vec)
 
     def _select_parents_proportional(self, fitnesses, population, count):

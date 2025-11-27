@@ -49,6 +49,11 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
 
 
 if __name__ == "__main__":
+
+    import os
+
+    print("My PID is:", os.getpid())
+    #exit(0)
     import argparse
     parser = argparse.ArgumentParser(description="Optimize dimensions for a given geometry.")
     parser.add_argument("--geometry", type=str, default="arm", help="Geometry name")

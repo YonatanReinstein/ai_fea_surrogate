@@ -1,5 +1,0 @@
-generation 1, best fitness: 0.07568496184723505
-generation 2, best fitness: 0.17542739917948208
-generation 3, best fitness: 0.27295247906829195
-generation 4, best fitness: 0.16902844029094397
-generation 5, best fitness: 0.1210067509674761
