@@ -6,18 +6,11 @@ import os
 
 
 def gnn_input_fn(data):
-    x = data.x[:, :3] 
     return data.x, data.edge_index, data.batch
 
 def gnn_target_fn(data): 
     return torch.cat([data.max_stress], dim=-1) 
 
-
-def normalize(x, mean, std):
-    return (x - mean) / std
-
-def denormalize(x, mean, std):
-    return x * std + mean
 
 def train_gnn_model(
     geometry: str,
@@ -31,7 +24,9 @@ def train_gnn_model(
 
     torch.manual_seed(42)
     
-
+    # ------------------------------------------------------------
+    # Load datasets
+    # ------------------------------------------------------------
     dataset_a_path = f"data/{geometry}/dataset/dataset_a.pt"
     dataset_b_path = f"data/{geometry}/dataset/dataset_b.pt"
     dataset_c_path = f"data/{geometry}/dataset/dataset_c.pt"
@@ -42,41 +37,61 @@ def train_gnn_model(
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Using device:", device)
 
-    # ---- Load dataset ----
     dataset_a = torch.load(dataset_a_path, weights_only=False)
     dataset_b = torch.load(dataset_b_path, weights_only=False)
     dataset_c = torch.load(dataset_c_path, weights_only=False)
-    dataset = dataset_a + dataset_b# + dataset_c
-    num_samples = len(dataset)
-    import random
 
-    random.shuffle(dataset)
+    dataset = dataset_a + dataset_b  # + dataset_c   # if you want
+
+
+    num_samples = len(dataset)
 
     n_train = int(num_samples * 0.8)
     train_set = dataset[:n_train]
     val_set = dataset[n_train:num_samples]
 
-
-
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 
-    # ---- Compute global normalization stats ----
+    # ------------------------------------------------------------
+    # Compute NORMALIZATION of node features
+    # ------------------------------------------------------------
+    print("Computing node feature normalization...")
+
+    # gather all features
+    all_x = torch.cat([d.x for d in train_set], dim=0).float()  # [total_nodes, F]
+    x_mean = all_x.mean(dim=0)         # shape [F]
+    x_std  = all_x.std(dim=0) + 1e-8    # shape [F]
+
+    x_mean = x_mean.to(device)
+    x_std  = x_std.to(device)
+
+    print("x_mean:", x_mean)
+    print("x_std:", x_std)
+
+    # ------------------------------------------------------------
+    # Compute output normalization (stress)
+    # ------------------------------------------------------------
     all_targets = torch.stack([gnn_target_fn(d) for d in train_set]).float()
     targets_mean = all_targets.mean(dim=0).to(device)
     targets_std = all_targets.std(dim=0).to(device) + 1e-8
 
-    # ---- Model dims ----
+    # ------------------------------------------------------------
+    # Model setup
+    # ------------------------------------------------------------
     sample = train_set[0]
-    node_in_dim = gnn_input_fn(sample)[0].shape[1]
+    node_in_dim = sample.x.size(1)
     out_features_global = gnn_target_fn(sample).shape[1]
 
-    model = GNN(node_in_dim=node_in_dim, hidden_dim=hidden_dim, num_layers=conv_layers).to(device)
+    model = GNN(
+        node_in_dim=node_in_dim,
+        hidden_dim=hidden_dim,
+        num_layers=conv_layers
+    ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     loss_fn = torch.nn.MSELoss()
 
-    # DECAY LR every 20 epochs by 0.9
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
         step_size=20,
@@ -86,21 +101,27 @@ def train_gnn_model(
     train_losses = []
     val_losses = []
 
-    # ---- Training Loop ----
+    # ------------------------------------------------------------
+    # TRAINING LOOP
+    # ------------------------------------------------------------
     for epoch in range(1, epochs + 1):
 
-        # ---------------- TRAIN ----------------
+        # ============================
+        # TRAIN
+        # ============================
         model.train()
         total_train_loss = 0.0
-        num_train_batches = 0
 
         for batch_data in train_loader:
             optimizer.zero_grad()
 
             x, edge_index, batch_inds = gnn_input_fn(batch_data)
-            x = x.to(device)
+            x = x.float().to(device)
             edge_index = edge_index.to(device)
             batch_inds = batch_inds.to(device)
+
+            # ---- normalize input FEATURES ----
+            x = (x - x_mean) / x_std
 
             pred = model(x, edge_index, batch_inds)
 
@@ -114,44 +135,50 @@ def train_gnn_model(
             optimizer.step()
 
             total_train_loss += loss.item()
-            num_train_batches += 1
 
-        avg_train_loss = total_train_loss / num_train_batches
+        avg_train_loss = total_train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
 
-        # ---------------- VALIDATION ----------------
+        # ============================
+        # VALIDATION
+        # ============================
         model.eval()
         total_val_loss = 0.0
-        num_val_batches = 0
 
         with torch.no_grad():
             for batch_data in val_loader:
                 x, edge_index, batch_inds = gnn_input_fn(batch_data)
-                x = x.to(device)
+                x = x.float().to(device)
                 edge_index = edge_index.to(device)
                 batch_inds = batch_inds.to(device)
+
+                # same normalization
+                x = (x - x_mean) / x_std
 
                 pred = model(x, edge_index, batch_inds)
 
                 targ = gnn_target_fn(batch_data).float().to(device)
                 norm_t = (targ - targets_mean) / targets_std
 
-                vloss = loss_fn(pred, norm_t)
-                total_val_loss += vloss.item()
-                num_val_batches += 1
+                loss = loss_fn(pred, norm_t)
+                total_val_loss += loss.item()
 
-        avg_val_loss = total_val_loss / num_val_batches
+        avg_val_loss = total_val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
 
-        # ---- Update LR *once per epoch* ----
+        # LR STEP
         scheduler.step()
 
-        # ---- Save checkpoint every 10 epochs ----
+        # ------------------------------------------------------------
+        # SAVE CHECKPOINT EVERY 10 EPOCHS
+        # ------------------------------------------------------------
         if epoch % 10 == 0:
             save_dict = {
                 "model_state": model.state_dict(),
                 "targets_mean": targets_mean.cpu(),
                 "targets_std": targets_std.cpu(),
+                "x_mean": x_mean.cpu(),
+                "x_std": x_std.cpu(),
                 "node_in_dim": node_in_dim,
                 "out_global": out_features_global,
             }
@@ -170,19 +197,24 @@ def train_gnn_model(
             f"LR = {optimizer.param_groups[0]['lr']:.2e}"
         )
 
-
 if __name__ == "__main__":
-
-    hyper_params_path = "data/arm/checkpoints/hyper_parameters.json"
-    hyper_params = json.load(open(hyper_params_path, "r"))
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--geometry", default="arm", type=str)
+    parser.add_argument("--num_samples", default=2000, type=int)
+    parser.add_argument("--epochs", default=100, type=int)
+    parser.add_argument("--lr", default=1e-5, type=float)
+    parser.add_argument("--batch_size", default=20, type=int)
+    parser.add_argument("--hidden_dim", default=128, type=int)
+    parser.add_argument("--conv_layers", default=6, type=int)
+    args = parser.parse_args()
 
     train_gnn_model(
-        geometry = "arm",
-        num_samples = hyper_params["num_samples"],
-        epochs=800,
-        lr=hyper_params["lr"],
-        batch_size=hyper_params["batch_size"],
-        hidden_dim=hyper_params["hidden_dim"],
-        conv_layers=hyper_params["conv_layers"]
+        geometry=args.geometry,
+        num_samples=args.num_samples,
+        epochs=args.epochs,
+        lr=args.lr,
+        batch_size=args.batch_size,
+        hidden_dim=args.hidden_dim,
+        conv_layers=args.conv_layers
     )
-

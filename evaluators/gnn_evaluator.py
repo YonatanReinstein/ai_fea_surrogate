@@ -9,11 +9,8 @@ import json
 from multiprocessing import Pool
 from torch_geometric.loader import DataLoader
 import importlib
-#from optimization.mid_process_stop import listener, STOP
 import threading
 from time import sleep
-import random 
-
 import socket
 
 STOP = False   
@@ -48,7 +45,9 @@ def _run_sample_worker(args):
         V,
         W
     ) = args
-    #sleep(random.uniform(0.1, 0.5))  # Simulate variable computation time
+    import random
+    sleep(random.uniform(0.1, 0.2))  # Simulate variable computation time
+    #print (f"Worker started for sample index: {sample_index%200}")
     cad_model = IIritModel(model_path, dims_dict=dims)
     component = Component(cad_model, young, poisson)
     component.generate_mesh(U=U, V=V, W=W)
@@ -92,6 +91,7 @@ class GNNEvaluator(BaseEvaluator):
         material_properties = json.loads(open(material_properties_path, "r").read())
         self.young = material_properties["young_modulus"]
         self.poisson = material_properties["poisson_ratio"]
+        self.yield_strength = material_properties["yield_strength"]
         self.model_path = f"data/{self.geometry_name}/CAD_model/model.irt"
 
         module = importlib.import_module(f"data.{geometry_name}.boundary_conditions")
@@ -104,6 +104,7 @@ class GNNEvaluator(BaseEvaluator):
 
 
     def evaluate(self, dims_list: list[dict]):
+        #print("start evaluation of batch size:", len(dims_list))
         batch_size = len(dims_list)
 
 
@@ -129,11 +130,12 @@ class GNNEvaluator(BaseEvaluator):
         ]
         results = []
 
+
         if self.processes is None:
             pool = Pool()
         else:
             pool = Pool(processes=self.processes)
-        it = pool.imap(_run_sample_worker, all_args, chunksize=1)
+        it = pool.imap(_run_sample_worker, all_args)
         try:
             for result in it:
                 if STOP:
@@ -153,6 +155,10 @@ class GNNEvaluator(BaseEvaluator):
         except KeyboardInterrupt:
             print("KeyboardInterrupt detected. Terminating pool.")
             pool.terminate()
+
+        #print("pool completed.")
+
+        #print("Preparing GNN inputs...")
 
 
 
@@ -179,10 +185,12 @@ class GNNEvaluator(BaseEvaluator):
         # Denormalize
         stress = pred_norm * self.glob_std + self.glob_mean
         stress = stress.squeeze()
+        #print("Evaluation completed.")
 
         return {
             "stress": stress,        # shape [batch_size]
-            "volume": volume_list    # list of floats
+            "volume": volume_list,    # list of floats
+            "yield_strength": self.yield_strength
         }
 
 

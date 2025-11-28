@@ -4,7 +4,7 @@ import importlib
 from pathlib import Path
 import json
 
-def screenshot(geometry: str, dims: dict, save_path: str):
+def screenshot(geometry: str, dims: dict, save_path: str, banner: str = None):
     material_props_path = f"data/{geometry}/CAD_model/material_properties.json"
     material_properties = json.loads(Path(material_props_path).read_text())
     young = material_properties["young_modulus"]
@@ -19,7 +19,7 @@ def screenshot(geometry: str, dims: dict, save_path: str):
     component.generate_mesh(U=U, V=V, W=W)
     component.mesh.anchor_nodes_by_condition(anchor_condition)
     component.mesh.apply_force_by_pattern(force_pattern)
-    component.mesh.plot_mesh(save_path=save_path)
+    component.mesh.plot_mesh(save_path=save_path , banner=banner)
 
 import numpy as np
 

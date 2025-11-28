@@ -27,8 +27,7 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
     dims_path = f"data/{geometry_name}/CAD_model/dims.json"
     dims_dict = json.loads(Path(dims_path).read_text())
 
-    #2400 / 16
-
+    
     ga = GeneticAlgorithm(
         fitness_func=fitness_func,
         dims_dict=dims_dict,
@@ -50,10 +49,7 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
 
 if __name__ == "__main__":
 
-    import os
 
-    print("My PID is:", os.getpid())
-    #exit(0)
     import argparse
     parser = argparse.ArgumentParser(description="Optimize dimensions for a given geometry.")
     parser.add_argument("--geometry", type=str, default="arm", help="Geometry name")

@@ -1,67 +1,93 @@
+
+import json
+from core.IritModel import IIritModel
+from core.component import Component
 import torch
- 
-from torch_geometric.loader import DataLoader
+
+torch.use_deterministic_algorithms(True)  # make PyTorch forbid nondeterministic ops
+torch.set_num_threads(1)                  # single-threaded CPU
+torch.set_num_interop_threads(1)
+
+
+import importlib
+module = importlib.import_module(f"data.arm.boundary_conditions")
+anchor_condition = module.anchor_condition
+force_pattern = module.force_pattern
+mesh_resolution = module.mesh_resolution
+U, V, W = mesh_resolution()
+
+
+dims_path = "data/arm/CAD_model/dims.json"
+model_path = "data/arm/CAD_model/model.irt"
+with open("data/arm/CAD_model/material_properties.json", "r") as f:
+    material_properties = json.load(f)
+young = material_properties["young_modulus"]
+poisson = material_properties["poisson_ratio"]
+with open(dims_path, "r") as f:
+    dims_dict = json.load(f)
+
+dims = {key: value["default"] for key, value in dims_dict.items()}
+cad_model = IIritModel(model_path, dims_dict=dims)
+component = Component(cad_model, young, poisson)
+component.generate_mesh(U=U, V=V, W=W)
+component.mesh.anchor_nodes_by_condition(anchor_condition)
+component.mesh.apply_force_by_pattern(force_pattern)
+data = component.to_graph_with_labels(with_labels=False)  
+
+
+x = data.x
+edge_index = data.edge_index
+batch = torch.zeros(x.size(0), dtype=torch.long)  # Single graph, all nodes in batch 0
+
+
+model_path = "data/arm/gnn_surrogate.pt"
+ckpt = torch.load(model_path, map_location="cpu")
+
+node_in_dim = ckpt["node_in_dim"]
 from utils.gnn_surrogate import GNN
+model = GNN(
+            node_in_dim=node_in_dim,
+            hidden_dim=128,
+            num_layers=6
+        )
 
-dataset_a_path = "data/arm/dataset/dataset_a.pt"
-dataset_b_path = "data/arm/dataset/dataset_b.pt"
-dataset_c_path = "data/arm/dataset/dataset_c.pt"
+model.load_state_dict(ckpt["model_state"])
+model.eval()  
 
 
-dataset_a = torch.load(dataset_a_path, weights_only=False)
-dataset_b = torch.load(dataset_b_path, weights_only=False)
-dataset_c = torch.load(dataset_c_path, weights_only=False)
+with torch.no_grad():
+    pred_norm = model(x, edge_index, batch)
 
-dataset = dataset_a + dataset_b + dataset_c
 
-dataset_20_path = "data/arm/dataset/dataset_20.pt"
-dataset_20 = torch.load(dataset_20_path, weights_only=False)
-sample = dataset_c[0]
-#print("Sample data.x:", sample.dims)
-
-#print(f"Total samples: {len(dataset)}")
+#print("Predicted stress:", pred_norm)
 #
-x_a_mean = torch.mean(torch.cat([data.x[:, :3] for data in dataset_a], dim=0), dim=0)
-print(f"Dataset A - Mean of first 3 features: {x_a_mean}")
+#with torch.no_grad():
+#    pred_norm = model(x, edge_index, batch)
+#
+#print("Predicted stress:", pred_norm)
+#
+import torch
 
-x_b_mean = torch.mean(torch.cat([data.x[:, :3] for data in dataset_b], dim=0), dim=0)
-print(f"Dataset B - Mean of first 3 features: {x_b_mean}")
-x_c_mean = torch.mean(torch.cat([data.x[:, :3] for data in dataset_c], dim=0), dim=0)
-print(f"Dataset C - Mean of first 3 features: {x_c_mean}")
-x_20_mean = torch.mean(torch.cat([data.x[:, :3] for data in dataset_20], dim=0), dim=0)
-print(f"Dataset 20 - Mean of first 3 features: {x_20_mean}")
-x_mean = torch.mean(torch.cat([data.x[:, :3] for data in dataset], dim=0), dim=0)
-print(f"Combined Dataset - Mean of first 3 features: {x_mean}")
+print("x shape:", x.shape)
+print("edge_index shape:", edge_index.shape)
+print("batch shape:", batch.shape)
+print("x sum:", float(x.sum()))
+print("edge_index sum:", float(edge_index.sum()))
+print("batch sum:", float(batch.sum()))
 
-x_a_std = torch.std(torch.cat([data.x[:, :3] for data in dataset_a], dim=0), dim=0)
-print(f"Dataset A - Std of first 3 features: {x_a_std}")
-x_b_std = torch.std(torch.cat([data.x[:, :3] for data in dataset_b], dim=0), dim=0)
-print(f"Dataset B - Std of first 3 features: {x_b_std}")
-x_c_std = torch.std(torch.cat([data.x[:, :3] for data in dataset_c], dim=0), dim=0)
-print(f"Dataset C - Std of first 3 features: {x_c_std}")
-x_20_std = torch.std(torch.cat([data.x[:, :3] for data in dataset_20], dim=0), dim=0)
-print(f"Dataset 20 - Std of first 3 features: {x_20_std}")
-x_std = torch.std(torch.cat([data.x[:, :3] for data in dataset], dim=0), dim=0)
-print(f"Combined Dataset - Std of first 3 features: {x_std}")
+# Make sure nothing will be modified in-place:
+x = x.clone()
+edge_index = edge_index.clone()
+batch = batch.clone()
 
-target_a_mean = torch.mean(torch.cat([data.max_stress for data in dataset_a], dim=0), dim=0)
-print(f"Dataset A - Mean of target max_stress: {target_a_mean}")
-target_b_mean = torch.mean(torch.cat([data.max_stress for data in dataset_b], dim=0), dim=0)
-print(f"Dataset B - Mean of target max_stress: {target_b_mean}")
-target_c_mean = torch.mean(torch.cat([data.max_stress for data in dataset_c], dim=0), dim=0)
-print(f"Dataset C - Mean of target max_stress: {target_c_mean}")
-target_20_mean = torch.mean(torch.cat([data.max_stress for data in dataset_20], dim=0), dim=0)
-print(f"Dataset 20 - Mean of target max_stress: {target_20_mean}")
-target_mean = torch.mean(torch.cat([data.max_stress for data in dataset], dim=0), dim=0)
-print(f"Combined Dataset - Mean of target max_stress: {target_mean}")
+# Sanity: check param stability in a stronger way
+state_before = {k: v.clone() for k, v in model.state_dict().items()}
 
-target_a_std = torch.std(torch.cat([data.max_stress for data in dataset_a], dim=0), dim=0)
-print(f"Dataset A - Std of target max_stress: {target_a_std}")
-target_b_std = torch.std(torch.cat([data.max_stress for data in dataset_b], dim=0), dim=0)
-print(f"Dataset B - Std of target max_stress: {target_b_std}")
-target_c_std = torch.std(torch.cat([data.max_stress for data in dataset_c], dim=0), dim=0)
-print(f"Dataset C - Std of target max_stress: {target_c_std}")
-target_20_std = torch.std(torch.cat([data.max_stress for data in dataset_20], dim=0), dim=0)
-print(f"Dataset 20 - Std of target max_stress: {target_20_std}")
-target_std = torch.std(torch.cat([data.max_stress for data in dataset], dim=0), dim=0)
-print(f"Combined Dataset - Std of target max_stress: {target_std}")
+with torch.no_grad():
+    pred1 = model(x, edge_index, batch)
+    pred2 = model(x, edge_index, batch)
+
+print("pred1:", pred1)
+print("pred2:", pred2)
+
+

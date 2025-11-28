@@ -161,7 +161,7 @@ class Mesh:
     def all_elements(self) -> List[Element]:
         return list(self.elements.values())
   
-    def plot_mesh(self, save_path=None, resolution=(3840, 2160), aa_type="msaa"):
+    def plot_mesh(self, save_path=None, resolution=(3840, 2160), aa_type="msaa", banner: str = None):
         import numpy as np
         import pyvista as pv
         from pyvista import CellType
@@ -191,6 +191,8 @@ class Mesh:
         plotter.enable_anti_aliasing(aa_type)
 
         plotter.add_mesh(grid, show_edges=True, opacity=0.6, color="lightgray")
+        if banner is not None:
+            plotter.add_text(banner, position="upper_left", font_size=14, color="black", shadow=True)
 
         # Forces
         for _, node in node_items:
