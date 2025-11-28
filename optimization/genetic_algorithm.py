@@ -102,7 +102,7 @@ class GeneticAlgorithm:
             raw_stress = np.array(res["stress"])
 
             # penalize yield violation
-            raw_stress = np.maximum(100 * (raw_stress - res["yield_strength"]), 0)
+            raw_stress = np.maximum(1000 * (raw_stress - res["yield_strength"]), 0)
 
             # diversity
             raw_diversity = self._diversity_scores(population)
@@ -112,35 +112,37 @@ class GeneticAlgorithm:
             S_norm = (raw_stress - raw_stress.min()) / (raw_stress.ptp() + 1e-8)
             D_norm = (raw_diversity - raw_diversity.min()) / (raw_diversity.ptp() + 1e-8)
 
-            # weights
             w_v = 0.4
-            w_s = 0.4
-            w_d = 0.2
+            w_s = 0.6
+            w_d = 0.0
 
-            # fitness (lower = better)
             fitnesses = w_v * V_norm + w_s * S_norm + w_d * D_norm
 
-            # ----- update global best -----
             gen_best_idx = np.argmin(fitnesses)
             if fitnesses[gen_best_idx] < best_fit:
                 best_fit = fitnesses[gen_best_idx]
                 best_vec = population[gen_best_idx].copy()
 
-            # log
             print(f"Gen {gen+1}/{self.generations} | Best fitness: {fitnesses.min():.4e}")
 
             # ----- rank individuals -----
             ranked = sorted(zip(fitnesses, population), key=lambda x: x[0])
             _, sorted_pop = zip(*ranked)
             sorted_pop = np.array(sorted_pop)
+       
+            current_best_vec = sorted_pop[0]
 
-            half = self.pop_size // 2
+            best_vec = current_best_vec.copy()
+
+            half = int(self.pop_size * 0.6)
 
             # ---- TOP HALF survive but may mutate ----
             survivors = []
             for indiv in sorted_pop[:half]:
                 if random.random() < self.mutation_rate:
-                    survivors.append(self._mutate(indiv))
+                    #survivors.append(self._mutate(indiv))
+                    survivors.append(indiv)
+
                 else:
                     survivors.append(indiv)
             survivors = np.array(survivors)
@@ -162,7 +164,7 @@ class GeneticAlgorithm:
 
             # checkpoint
             if (gen + 1) % 2 == 0:
-                np.save(self.checkpoint_file, population)
+                np.save(f"ga_population_gen_{gen+1}.npy", population)
 
         return self.vector_to_dict(best_vec)
 

@@ -198,7 +198,6 @@ class Mesh:
             if np.linalg.norm(force) > 1e-9:
                 arrow = pv.Arrow(start=node.coords, direction=force, scale=0.1)
                 plotter.add_mesh(arrow, color="red")
-
         # Anchors
         anchored = [node.coords for _, node in node_items if getattr(node, "anchored", False)]
         if anchored:
@@ -209,7 +208,6 @@ class Mesh:
             plotter.show(auto_close=False)
             plotter.screenshot(save_path)
             plotter.close()
-            print(f"Saved high-quality screenshot: {save_path}")
         else:
             plotter.show()
 

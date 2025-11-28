@@ -150,10 +150,9 @@ class GNNEvaluator(BaseEvaluator):
                     break
 
                 results.append(result)
-        finally:
-    # now join NEVER hangs
-            print("Done.")
-
+        except KeyboardInterrupt:
+            print("KeyboardInterrupt detected. Terminating pool.")
+            pool.terminate()
 
 
 
