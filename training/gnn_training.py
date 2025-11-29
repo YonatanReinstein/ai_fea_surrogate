@@ -34,6 +34,7 @@ def train_gnn_model(
     # ----------------------------------------------------
     # Paths
     # ----------------------------------------------------
+    dataset_path = f"data/{geometry}/dataset/dataset.pt"
     dataset_a_path = f"data/{geometry}/dataset/dataset_a.pt"
     dataset_b_path = f"data/{geometry}/dataset/dataset_b.pt"
     dataset_c_path = f"data/{geometry}/dataset/dataset_c.pt"
@@ -49,11 +50,12 @@ def train_gnn_model(
     # ----------------------------------------------------
     # Load datasets
     # ----------------------------------------------------
-    dataset_a = torch.load(dataset_a_path, weights_only=False)
-    dataset_b = torch.load(dataset_b_path, weights_only=False)
-    dataset_c = torch.load(dataset_c_path, weights_only=False)
-
-    dataset = dataset_a + dataset_b  # + dataset_c if you want
+    #dataset_a = torch.load(dataset_a_path, weights_only=False)
+    #dataset_b = torch.load(dataset_b_path, weights_only=False)
+    #dataset_c = torch.load(dataset_c_path, weights_only=False)
+#
+    #dataset = dataset_a + dataset_b  # + dataset_c if you want
+    dataset = torch.load(dataset_path, weights_only=False)
     num_total = len(dataset)
 
     # ----------------------------------------------------
