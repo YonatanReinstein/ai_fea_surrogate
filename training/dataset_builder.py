@@ -12,6 +12,8 @@ def build_dataset(
     seed: int = 42
 ):
     random.seed(seed)
+    torch.manual_seed(seed)
+
 
     base_path = f"data/{geometry}"
     model_path = f"{base_path}/CAD_model/model.irt"
@@ -23,6 +25,19 @@ def build_dataset(
     os.makedirs(dataset_dir, exist_ok=True)
     os.makedirs(screenshots_dir, exist_ok=True)
 
+    dataset, metadata = [], []
+
+    # if dataset exists, load and continue
+    if os.path.exists(f"{dataset_dir}/dataset.pt"):
+        print(f"Loading existing dataset from {dataset_dir}/dataset.pt")
+        dataset = torch.load(f"{dataset_dir}/dataset.pt", weights_only=False)
+        with open(f"{dataset_dir}/metadata.json", "r") as f:
+            metadata = json.load(f)
+        start_idx = len(dataset) + 1
+        print(f"Continuing from sample {start_idx}...")
+    else:
+        start_idx = 0
+
     with open(material_props_path, "r") as f:
         material_props = json.load(f)
         young = material_props["young_modulus"]
@@ -31,15 +46,14 @@ def build_dataset(
     with open(dims_json_path, "r") as f:
         dims_template = json.load(f)
 
-    dataset, metadata = [], []
-
     for i in range(num_samples):
         while True:
             try:
-                with open(dims_json_path, "r") as f:
-                    dims_template = json.load(f)
                 dims = {k: random.uniform(v["min"], v["max"]) for k, v in dims_template.items()}
                 CAD_model = IIritModel(model_path, dims_dict=dims)
+                if i < start_idx:
+                    print(f"Skipping sample {i + 1} (already in dataset)")
+                    break
                 comp = Component(CAD_model, young=young, poisson=poisson)
                 module = importlib.import_module(f"data.{geometry}.boundary_conditions")
                 anchor_condition = module.anchor_condition
@@ -60,11 +74,11 @@ def build_dataset(
                     "max_stress": comp.mesh.get_max_stress(),
                 })
                 print(f"[{i+1:02d}/{num_samples}] {geometry}: σmax={comp.mesh.get_max_stress():.2e}")
-                if i % 50 == 0 and i > 0:
+                if i % 10 == 0 and i > 0:
                     torch.save(dataset, f"{dataset_dir}/dataset.pt")
-                    with open(f"{dataset_dir}/metadata_{num_samples}.json", "w") as f:
+                    with open(f"{dataset_dir}/metadata.json", "w") as f:
                         json.dump(metadata, f, indent=2)
-                    print(f"Dataset saved to {dataset_dir}/dataset_{num_samples}.pt")
+                    print(f"Dataset saved to {dataset_dir}/dataset.pt")
                 break
             except MapdlRuntimeError as e:
                 print(f"Sample {i+1} failed: {e}. Retrying...")

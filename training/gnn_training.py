@@ -56,7 +56,7 @@ def train_gnn_model(
 #
     #dataset = dataset_a + dataset_b  # + dataset_c if you want
     dataset = torch.load(dataset_path, weights_only=False)
-    num_total = len(dataset)
+    dataset = dataset[:num_samples]
 
     # ----------------------------------------------------
     # Pre-scale features
@@ -70,9 +70,9 @@ def train_gnn_model(
     # ----------------------------------------------------
     # Train/Val split
     # ----------------------------------------------------
-    n_train = int(num_total * 0.8)
+    n_train = int(num_samples * 0.8)
     train_set = dataset[:n_train]
-    val_set   = dataset[n_train:num_total]
+    val_set   = dataset[n_train:num_samples]
 
     # ----------------------------------------------------
     # Target (stress) normalization mean/std
@@ -210,10 +210,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--geometry", default="arm", type=str)
-    parser.add_argument("--num_samples", default=2000, type=int)
+    parser.add_argument("--num_samples", default=50, type=int)
     parser.add_argument("--epochs", default=100, type=int)
     parser.add_argument("--lr", default=1e-4, type=float)
-    parser.add_argument("--batch_size", default=20, type=int)
+    parser.add_argument("--batch_size", default=4, type=int)
     parser.add_argument("--hidden_dim", default=128, type=int)
     parser.add_argument("--conv_layers", default=6, type=int)
     args = parser.parse_args()
