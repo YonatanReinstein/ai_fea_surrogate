@@ -7,10 +7,11 @@ def anchor_condition(node: Node, tol: float = 1e-3) -> bool:
     return False
 
 def force_pattern(node: Node, tol: float) -> List[float]:
+    U, V, _ = mesh_resolution()
+    nodal_force = 1e+06 / (U * V) 
     if abs(node.coords[2] - 9) < tol:
-        return [1e6, 0.0, 0.0]
+        return [nodal_force, 0.0, 0.0]
     return [0.0, 0.0, 0.0]
-
 def mesh_resolution() -> tuple[int]:
-    return (5, 5, 15)
+    return (10, 10, 20)
            

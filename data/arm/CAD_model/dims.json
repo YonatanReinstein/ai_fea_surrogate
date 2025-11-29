@@ -7,7 +7,7 @@
     "d6": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d7": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d8": {"default": 1.5, "min": 0.001, "max": 1.5},
-    "d9": {"default": 3.0, "min": 0.001, "max": 3.0},
+    "d9": {"default": 2.0, "min": 0.001, "max": 3.0},
     "d10": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d11": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d12": {"default": 1.5, "min": 0.001, "max": 1.5},
@@ -16,7 +16,7 @@
     "d15": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d16": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d17": {"default": 1.5, "min": 0.001, "max": 1.5},
-    "d18": {"default": 3.0, "min": 0.001, "max": 3.0},
+    "d18": {"default": 2.0, "min": 0.001, "max": 3.0},
     "d19": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d20": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d21": {"default": 1.5, "min": 0.001, "max": 1.5},
@@ -25,7 +25,7 @@
     "d24": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d25": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d26": {"default": 1.5, "min": 0.001, "max": 1.5},
-    "d27": {"default": 3.0, "min": 0.001, "max": 3.0},
+    "d27": {"default": 2.0, "min": 0.001, "max": 3.0},
     "d28": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d29": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d30": {"default": 1.5, "min": 0.001, "max": 1.5},
@@ -34,5 +34,5 @@
     "d33": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d34": {"default": 1.5, "min": 0.001, "max": 1.5},
     "d35": {"default": 1.5, "min": 0.001, "max": 1.5},
-    "d36": {"default": 3.0, "min": 0.001, "max": 3.0}
+    "d36": {"default": 2.0, "min": 0.001, "max": 3.0}
 }

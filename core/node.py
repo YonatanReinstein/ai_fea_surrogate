@@ -8,7 +8,8 @@ class Node:
         self.displacement = [0.0, 0.0, 0.0]
         self.stress = 0.0
         self.anchored = False
-        self.forces = [0.0, 0.0, 0.0]   
+        self.forces = [0.0, 0.0, 0.0]  
+        neighbors: List[int] = [] 
     
     def __repr__(self):
         return (

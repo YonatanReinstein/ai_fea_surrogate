@@ -81,28 +81,28 @@ class Mesh:
             for node_id, node in self.nodes.items():
                 node.displacement = [ux[node_id-1], uy[node_id-1], uz[node_id-1]]
                 node.stress = stress[node_id-1]
-
             # Create the plot but DO NOT display it
             plotter = self.mapdl.post_processing.plot_nodal_eqv_stress(
                 show=False,
- #               vtk=True,
-                return_plotter=True,
- #               background="white"
-            )
-
-      
-
-
+                return_plotter=True)
             #plotter.scene.camera.elevation = 270
             if screenshot_path is not None:
                 plotter.scene.screenshot(screenshot_path)
-
-
-
             if created_mapdl:
                 self.mapdl.exit()
             self.mapdl = None
             self.solution_valid = True
+
+            #for element in self.elements.values():
+            #    ancher_element = False
+            #    for node in element.nodes:
+            #        if node.anchored:
+            #            ancher_element = True
+            #            break
+            #    if ancher_element:
+            #        for node in element.nodes:
+            #            node.stress = 0.0
+                
         except MapdlRuntimeError as e:
             print(f"MapdlRuntimeError: {e}")
             if created_mapdl:
@@ -126,7 +126,7 @@ class Mesh:
     def get_max_stress(self):
         if not self.solution_valid:
             raise ValueError("Solution is not valid. Please run the simulation first.")
-        return max(node.stress for node in self.all_nodes() if node.stress is not None)
+        return max(node.stress for node in self.all_nodes() )    #if node.anchored is False
     
     def get_max_displacement(self):
         if not self.solution_valid:

@@ -4,10 +4,16 @@ from core.IritModel import IIritModel
 from core.component import Component
 import torch
 
-torch.use_deterministic_algorithms(True)  # make PyTorch forbid nondeterministic ops
-torch.set_num_threads(1)                  # single-threaded CPU
-torch.set_num_interop_threads(1)
 
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import EdgeConv, global_max_pool
+from torch_geometric.nn.models import MLP
+
+import torch
+
+
+from utils.gnn_surrogate import GNN
 
 import importlib
 module = importlib.import_module(f"data.arm.boundary_conditions")
@@ -15,6 +21,7 @@ anchor_condition = module.anchor_condition
 force_pattern = module.force_pattern
 mesh_resolution = module.mesh_resolution
 U, V, W = mesh_resolution()
+
 
 
 dims_path = "data/arm/CAD_model/dims.json"
@@ -36,6 +43,11 @@ data = component.to_graph_with_labels(with_labels=False)
 
 
 x = data.x
+x[:, 3] = x[:, 3] / 1e+6
+data.max_stress = data.max_stress / 1e+6  # Scale max_stress to MPa
+print("x:", x.shape)
+
+
 edge_index = data.edge_index
 batch = torch.zeros(x.size(0), dtype=torch.long)  # Single graph, all nodes in batch 0
 
@@ -44,50 +56,28 @@ model_path = "data/arm/gnn_surrogate.pt"
 ckpt = torch.load(model_path, map_location="cpu")
 
 node_in_dim = ckpt["node_in_dim"]
-from utils.gnn_surrogate import GNN
 model = GNN(
             node_in_dim=node_in_dim,
             hidden_dim=128,
             num_layers=6
         )
+#x_mean = ckpt["x_mean"]
+#x_std = ckpt["x_std"]
+targets_mean = ckpt["target_mean"]
+targets_std = ckpt["target_std"]
 
 model.load_state_dict(ckpt["model_state"])
 model.eval()  
+#norm_x = (x - x_mean) / x_std  
 
 
-with torch.no_grad():
-    pred_norm = model(x, edge_index, batch)
-
-
-#print("Predicted stress:", pred_norm)
-#
-#with torch.no_grad():
-#    pred_norm = model(x, edge_index, batch)
-#
-#print("Predicted stress:", pred_norm)
-#
-import torch
-
-print("x shape:", x.shape)
-print("edge_index shape:", edge_index.shape)
-print("batch shape:", batch.shape)
-print("x sum:", float(x.sum()))
-print("edge_index sum:", float(edge_index.sum()))
-print("batch sum:", float(batch.sum()))
-
-# Make sure nothing will be modified in-place:
-x = x.clone()
-edge_index = edge_index.clone()
-batch = batch.clone()
-
-# Sanity: check param stability in a stronger way
-state_before = {k: v.clone() for k, v in model.state_dict().items()}
 
 with torch.no_grad():
     pred1 = model(x, edge_index, batch)
-    pred2 = model(x, edge_index, batch)
+
+pred1 = pred1 * targets_std + targets_mean
 
 print("pred1:", pred1)
-print("pred2:", pred2)
+
 
 

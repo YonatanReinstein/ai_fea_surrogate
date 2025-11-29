@@ -9,10 +9,11 @@ import torch
 class GNN(nn.Module):
     def __init__(self, node_in_dim, hidden_dim=128, num_layers=6):
         super().__init__()
+
         self.encoder = MLP([node_in_dim, hidden_dim, hidden_dim],norm=None)
         self.convs = nn.ModuleList()
         for _ in range(num_layers):
-            self.convs.append(EdgeConv(MLP([2*hidden_dim, hidden_dim, hidden_dim], norm=None), aggr="mean"))
+            self.convs.append(EdgeConv(MLP([2*hidden_dim, hidden_dim, hidden_dim], norm=None), aggr="max"))
         self.head = MLP([hidden_dim, hidden_dim, 1], norm=None)
 
     def forward(self, x, edge_index, batch):
