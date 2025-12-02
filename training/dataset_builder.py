@@ -3,13 +3,10 @@ from core.component import Component
 from core.IritModel import IIritModel
 from ansys.mapdl.core.errors import MapdlRuntimeError
 
-
-
-
 def build_dataset(
     geometry: str,
     num_samples: int = 10,
-    seed: int = 42
+    seed: int = 45
 ):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -33,7 +30,7 @@ def build_dataset(
         dataset = torch.load(f"{dataset_dir}/dataset.pt", weights_only=False)
         with open(f"{dataset_dir}/metadata.json", "r") as f:
             metadata = json.load(f)
-        start_idx = len(dataset) + 1
+        start_idx = len(dataset)
         print(f"Continuing from sample {start_idx}...")
     else:
         start_idx = 0
@@ -65,7 +62,7 @@ def build_dataset(
                 comp.mesh.apply_force_by_pattern(force_pattern) 
                 comp.ansys_sim(screenshot_path=screenshots_dir)
                 data = comp.to_graph_with_labels()
-                comp.mesh.plot_mesh(save_path=f"{screenshots_dir}/mesh_{i+1}.png")
+                #comp.mesh.plot_mesh(save_path=f"{screenshots_dir}/mesh_{i+1}.png")
                 dataset.append(data)
                 metadata.append({
                     "id": i,
@@ -74,7 +71,7 @@ def build_dataset(
                     "max_stress": comp.mesh.get_max_stress(),
                 })
                 print(f"[{i+1:02d}/{num_samples}] {geometry}: σmax={comp.mesh.get_max_stress():.2e}")
-                if i % 10 == 0 and i > 0:
+                if (i+1) % 10 == 0:
                     torch.save(dataset, f"{dataset_dir}/dataset.pt")
                     with open(f"{dataset_dir}/metadata.json", "w") as f:
                         json.dump(metadata, f, indent=2)

@@ -7,7 +7,6 @@ import torch
 
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import EdgeConv, global_max_pool
 from torch_geometric.nn.models import MLP
 
 import torch
@@ -41,12 +40,7 @@ component.mesh.anchor_nodes_by_condition(anchor_condition)
 component.mesh.apply_force_by_pattern(force_pattern)
 data = component.to_graph_with_labels(with_labels=False)  
 
-
 x = data.x
-x[:, 3] = x[:, 3] / 1e+6
-data.max_stress = data.max_stress / 1e+6  # Scale max_stress to MPa
-print("x:", x.shape)
-
 
 edge_index = data.edge_index
 batch = torch.zeros(x.size(0), dtype=torch.long)  # Single graph, all nodes in batch 0
@@ -61,23 +55,23 @@ model = GNN(
             hidden_dim=128,
             num_layers=6
         )
-#x_mean = ckpt["x_mean"]
-#x_std = ckpt["x_std"]
+x_mean = ckpt["x_mean"]
+x_std = ckpt["x_std"]
 targets_mean = ckpt["target_mean"]
 targets_std = ckpt["target_std"]
 
 model.load_state_dict(ckpt["model_state"])
 model.eval()  
-#norm_x = (x - x_mean) / x_std  
+norm_x = (x - x_mean) / x_std  
 
 
+for i in range(30):
+    with torch.no_grad():
+        pred1 = model(norm_x, edge_index, batch)
 
-with torch.no_grad():
-    pred1 = model(x, edge_index, batch)
+    pred1 = pred1 * targets_std + targets_mean
 
-pred1 = pred1 * targets_std + targets_mean
-
-print("pred1:", pred1)
+    print("pred1:", pred1)
 
 
 

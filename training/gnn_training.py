@@ -11,8 +11,9 @@ from utils.gnn_surrogate import GNN
 def gnn_input_fn(data):
     return data.x, data.edge_index, data.batch
 
+
 def gnn_target_fn(data):
-    # returns [batch_size, 1] tensor
+    # returns [batch_size, 1] tensor (graph-level)
     return torch.cat([data.max_stress], dim=-1)
 
 
@@ -28,16 +29,14 @@ def train_gnn_model(
     hidden_dim: int = 128,
     conv_layers: int = 6
 ):
-
     torch.manual_seed(42)
 
     # ----------------------------------------------------
     # Paths
     # ----------------------------------------------------
-    dataset_path = f"data/{geometry}/dataset/dataset.pt"
-    dataset_a_path = f"data/{geometry}/dataset/dataset_a.pt"
-    dataset_b_path = f"data/{geometry}/dataset/dataset_b.pt"
-    dataset_c_path = f"data/{geometry}/dataset/dataset_c.pt"
+    dataset_1_path = f"data/{geometry}/dataset/dataset_1.pt"
+    dataset_2_path = f"data/{geometry}/dataset/dataset_2.pt"
+    dataset_3_path = f"data/{geometry}/dataset/dataset_3.pt"
     save_dir       = f"data/{geometry}/checkpoints/"
     os.makedirs(save_dir, exist_ok=True)
 
@@ -48,41 +47,77 @@ def train_gnn_model(
     print(f"Using device: {device}")
 
     # ----------------------------------------------------
-    # Load datasets
+    # Load dataset
     # ----------------------------------------------------
-    #dataset_a = torch.load(dataset_a_path, weights_only=False)
-    #dataset_b = torch.load(dataset_b_path, weights_only=False)
-    #dataset_c = torch.load(dataset_c_path, weights_only=False)
-#
-    #dataset = dataset_a + dataset_b  # + dataset_c if you want
-    dataset = torch.load(dataset_path, weights_only=False)
-    dataset = dataset[:num_samples]
+    # If you want to use dataset_a + dataset_b instead:
+    dataset_1 = torch.load(dataset_1_path, weights_only=False)
+    dataset_2 = torch.load(dataset_2_path, weights_only=False)
+    dataset_3 = torch.load(dataset_3_path, weights_only=False)
 
-    # ----------------------------------------------------
-    # Pre-scale features
-    # ----------------------------------------------------
-    # Your x has 4 features: (x, y, z, force)  -> scale force
-    # Your max_stress is in Pascals -> convert to MPa
+    dataset = dataset_1 + dataset_2 + dataset_3
+
+
     for sample in dataset:
-        sample.x[:, 3] = sample.x[:, 3] / 1e6        # N -> MN
-        sample.max_stress = sample.max_stress / 1e6  # Pa -> MPa
+        #convert force to MN
+        sample.x[:, 3] = sample.x[:, 3] / 1e+6
+        #convert max_stress to MPa
+        sample.max_stress = sample.max_stress / 1e+6
+
+    cleaned_dataset = []
+    for data in dataset:
+        if data.max_stress < 700:
+            cleaned_dataset.append(data)
+    dataset = cleaned_dataset
+
+    num_samples = min(num_samples, len(dataset))
+    print(f"Dataset size after cleaning: {len(dataset)}")
+
+    total_samples = len(dataset)
+    if num_samples is None or num_samples > total_samples:
+        num_samples = total_samples
+
 
     # ----------------------------------------------------
-    # Train/Val split
+    # Random train/val split (instead of slicing in order)
     # ----------------------------------------------------
+    indices = torch.randperm(total_samples)[:num_samples]
     n_train = int(num_samples * 0.8)
-    train_set = dataset[:n_train]
-    val_set   = dataset[n_train:num_samples]
+
+    train_idx = indices[:n_train]
+    val_idx   = indices[n_train:]    
+
+    train_set = [dataset[i] for i in train_idx]
+    val_set   = [dataset[i] for i in val_idx]
+
+    print(f"Total samples used: {num_samples}")
+    print(f"Train: {len(train_set)}, Val: {len(val_set)}")
 
     # ----------------------------------------------------
-    # Target (stress) normalization mean/std
+    # Compute normalization stats on TRAIN ONLY
     # ----------------------------------------------------
-    all_targets = torch.cat([gnn_target_fn(d) for d in train_set], dim=0)
-    target_mean = all_targets.mean(dim=0)
-    target_std  = all_targets.std(dim=0) + 1e-8  # epsilon
+    # Target stats (e.g. max_stress)
+    for set in [val_set, train_set]:
+        all_targets = torch.cat([gnn_target_fn(d) for d in set], dim=0).float()
+        target_mean = all_targets.mean(dim=0)
+        target_std  = all_targets.std(dim=0) + 1e-8
 
-    print("Target mean:", target_mean)
-    print("Target std:", target_std)
+        # Feature stats (node features)
+        all_x = torch.cat([d.x for d in set], dim=0).float()
+        x_mean = all_x.mean(dim=0)
+        x_std  = all_x.std(dim=0) + 1e-8
+
+        # move stats to device once
+        target_mean = target_mean.to(device)
+        target_std  = target_std.to(device)
+        x_mean      = x_mean.to(device)
+        x_std       = x_std.to(device)
+
+        print("Target mean:", target_mean.detach().cpu().numpy())
+        print("Target std:", target_std.detach().cpu().numpy())
+        print("X mean:", x_mean.detach().cpu().numpy())
+        print("X std:", x_std.detach().cpu().numpy())
+
+    
 
     # ----------------------------------------------------
     # DataLoaders
@@ -95,7 +130,7 @@ def train_gnn_model(
     # ----------------------------------------------------
     example = train_set[0]
     node_in_dim = example.x.shape[1]
-    out_dim     = gnn_target_fn(example).shape[1]  # normally 1
+    out_dim     = gnn_target_fn(example).shape[1]
 
     model = GNN(
         node_in_dim=node_in_dim,
@@ -130,16 +165,19 @@ def train_gnn_model(
             optimizer.zero_grad()
 
             x, edge_index, batch_idx = gnn_input_fn(batch_data)
-            x         = x.float().to(device)
+            x = x.float().to(device)
             edge_index = edge_index.to(device)
             batch_idx  = batch_idx.to(device)
 
-            pred_norm = model(x, edge_index, batch_idx)
+            # normalize features
+            x_norm = (x - x_mean) / x_std
 
-            targ      = gnn_target_fn(batch_data).float().to(device)
-            targ_norm = (targ - target_mean.to(device)) / target_std.to(device)
+            pred = model(x_norm, edge_index, batch_idx)
 
-            loss = loss_fn(pred_norm, targ_norm)
+            targ = gnn_target_fn(batch_data).float().to(device)
+            targ_norm = (targ - target_mean) / target_std
+
+            loss = loss_fn(pred, targ_norm)
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -147,7 +185,7 @@ def train_gnn_model(
 
             total_train += loss.item()
 
-        avg_train = total_train / len(train_loader)
+        avg_train = total_train / max(len(train_loader), 1)
         train_losses.append(avg_train)
 
         # -----------------------------
@@ -159,18 +197,21 @@ def train_gnn_model(
         with torch.no_grad():
             for batch_data in val_loader:
                 x, edge_index, batch_idx = gnn_input_fn(batch_data)
-                x         = x.float().to(device)
+                x = x.float().to(device)
                 edge_index = edge_index.to(device)
                 batch_idx  = batch_idx.to(device)
 
-                pred_norm = model(x, edge_index, batch_idx)
+                x_norm = (x - x_mean) / x_std
 
-                targ    = gnn_target_fn(batch_data).float().to(device)
-                targ_norm = (targ - target_mean.to(device)) / target_std.to(device)
+                pred = model(x_norm, edge_index, batch_idx)
 
-                total_val += loss_fn(pred_norm, targ_norm).item()
+                targ = gnn_target_fn(batch_data).float().to(device)
+                targ_norm = (targ - target_mean) / target_std
 
-        avg_val = total_val / len(val_loader)
+                loss = loss_fn(pred, targ_norm)
+                total_val += loss.item()
+
+        avg_val = total_val / max(len(val_loader), 1)
         val_losses.append(avg_val)
 
         scheduler.step()
@@ -178,13 +219,15 @@ def train_gnn_model(
         # -----------------------------
         # Save checkpoint every 10 epochs
         # -----------------------------
-        if epoch % 10 == 0:
+        if epoch % 10 == 0 or epoch == epochs:
             ckpt = {
                 "model_state": model.state_dict(),
                 "node_in_dim": node_in_dim,
                 "out_dim": out_dim,
-                "target_mean": target_mean.cpu(),
-                "target_std": target_std.cpu(),
+                "target_mean": target_mean.detach().cpu(),
+                "target_std": target_std.detach().cpu(),
+                "x_mean": x_mean.detach().cpu(),
+                "x_std": x_std.detach().cpu(),
             }
             torch.save(ckpt, os.path.join(save_dir, f"{epoch}_epochs.pt"))
 
@@ -210,10 +253,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--geometry", default="arm", type=str)
-    parser.add_argument("--num_samples", default=50, type=int)
-    parser.add_argument("--epochs", default=100, type=int)
+    parser.add_argument("--num_samples", default=3000, type=int)
+    parser.add_argument("--epochs", default=300, type=int)
     parser.add_argument("--lr", default=1e-4, type=float)
-    parser.add_argument("--batch_size", default=4, type=int)
+    parser.add_argument("--batch_size", default=5, type=int)
     parser.add_argument("--hidden_dim", default=128, type=int)
     parser.add_argument("--conv_layers", default=6, type=int)
     args = parser.parse_args()

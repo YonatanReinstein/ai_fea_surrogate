@@ -39,12 +39,12 @@ class GeneticAlgorithm:
         return np.array([d[name] for name in self.dim_names], dtype=float)
 
     def _initialize_population(self):
-        #import os
+        import os
 
         # if checkpoint exists → load population instead of initializing
-        #if os.path.exists(self.checkpoint_file):
-        #    print(f"[GA] Loading checkpoint from {self.checkpoint_file}")
-        #    return np.load(self.checkpoint_file)
+        if os.path.exists("ga_population.npy"):
+            print(f"[GA] Loading checkpoint from ga_population.npy")
+            return np.load("ga_population.npy")
 
         # otherwise random init
         low, high = self.bounds[:, 0], self.bounds[:, 1]
@@ -90,9 +90,6 @@ class GeneticAlgorithm:
     
     def run(self):
         population = self._initialize_population()
-        print(type(population))
-        print(population.shape)
-        print(population)
 
         best_vec = None
         best_fit = float("inf")
@@ -107,35 +104,38 @@ class GeneticAlgorithm:
             raw_stress = np.array(res["stress"])
 
             # penalize yield violation
-            raw_stress = 1000 * np.maximum(raw_stress - res["yield_strength"], 0)
+            raw_stress_banner = raw_stress.copy()
+            raw_stress = 10000 * np.maximum(raw_stress - res["yield_strength"], 0)
+            raw_volume += raw_stress * 10000
 
             # diversity
-            #raw_diversity = self._diversity_scores(population)
+            raw_diversity = self._diversity_scores(population)
 
             # ----- normalize -----
             V_norm = (raw_volume - raw_volume.min()) / (raw_volume.ptp() + 1e-8)
             S_norm = (raw_stress - raw_stress.min()) / (raw_stress.ptp() + 1e-8)
-            #D_norm = (raw_diversity - raw_diversity.min()) / (raw_diversity.ptp() + 1e-8)
+            D_norm = (raw_diversity - raw_diversity.min()) / (raw_diversity.ptp() + 1e-8)
 
             w_v = 0.4
             w_s = 0.6
-            w_d = 0.0
+            w_d = 0
 
-            fitnesses = w_v * V_norm + w_s * S_norm# + w_d * D_norm
+            fitnesses = w_v * V_norm + w_s * S_norm + w_d * D_norm
 
             banners = []
             for i, fit in enumerate(fitnesses):
-                banner = f"rvol: {raw_volume[i]:.4e}, rstress: {raw_stress[i]:.4e} => fit: {fitnesses[i]:.4e}"
-                banners.append(banner)
-                print(banner)
+                if i  < 10:
+                    banner = f"rvol: {raw_volume[i]:.4e}, rstress: {raw_stress_banner[i]:.4e} => fit: {fitnesses[i]:.4e}"
+                    banners.append(banner)
+                    #print(banner)
 
-            from .screenshot import screenshot
-            for i, banner in enumerate(banners):
-                screenshot(
-                    geometry="arm",
-                    dims=self.vector_to_dict(population[i]),
-                    save_path=f"screenshots/gen_{gen}_ind_{i}.png",
-                    banner=banner)
+            #from .screenshot import screenshot
+            #for i, banner in enumerate(banners):
+            #    screenshot(
+            #        geometry="arm",
+            #        dims=self.vector_to_dict(population[i]),
+            #        save_path=f"screenshots/gen_{gen}_ind_{i}.png",
+            #        banner=banner)
 
             #gen_best_idx = np.argmin(fitnesses)
             #if fitnesses[gen_best_idx] < best_fit:
@@ -148,6 +148,8 @@ class GeneticAlgorithm:
             ranked = sorted(zip(fitnesses, population), key=lambda x: x[0])
             _, sorted_pop = zip(*ranked)
             sorted_pop = np.array(sorted_pop)
+
+
        
             half = int(self.pop_size * 0.6)
 
@@ -166,16 +168,23 @@ class GeneticAlgorithm:
             while len(children) < (self.pop_size - half):
                 p1, p2 = random.sample(list(parents_pool), 2)
                 child = self._crossover(p1, p2)
-                if random.random() < self.mutation_rate:
-                    child = self._mutate(child)
                 children.append(child)
 
             # ---- New generation ----
             population = np.vstack([survivors, children])
 
+            mutated_population = []
+            for i, ind in enumerate(population):
+                if i >= 10:
+                    if random.random() < self.mutation_rate:
+                        ind = self._mutate(ind)
+                    mutated_population.append(ind)
+            population = np.array(mutated_population)
+
+
             # checkpoint
-            #if (gen + 1) % 2 == 0:
-            #    np.save(f"ga_population_gen_{gen+1}.npy", population)
+            if (gen + 1) % 2 == 0:
+                np.save(f"ga_population_gen_{gen+1}.npy", population)
 
         return self.vector_to_dict(population[0])
 

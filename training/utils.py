@@ -11,13 +11,13 @@ def plot_losses(geometry: str = "arm", save_path: str = None):
     train_losses = data["train_losses"]
     val_losses = data["val_losses"]
 
-    train_losses = train_losses[20:len(train_losses)]
-    val_losses = val_losses[20:len(val_losses)]
+    train_losses = train_losses[:len(train_losses)]
+    val_losses = val_losses[:len(val_losses)]
 
-    #clean up spikes
-    for i in range(1, len(train_losses)-1):
-        if train_losses[i] > train_losses[i-1] * 1.5 and train_losses[i] > train_losses[i+1] * 1.5:
-            train_losses[i] = (train_losses[i-1] + train_losses[i+1]) / 2
+    ##clean up spikes
+    #for i in range(1, len(train_losses)-1):
+    #    if train_losses[i] > train_losses[i-1] * 1.5 and train_losses[i] > train_losses[i+1] * 1.5:
+    #        train_losses[i] = (train_losses[i-1] + train_losses[i+1]) / 2
 
     # ---- Create Plot ----
     plt.figure(figsize=(10, 5))

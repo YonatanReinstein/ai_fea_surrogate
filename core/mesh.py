@@ -160,7 +160,7 @@ class Mesh:
 
     def all_elements(self) -> List[Element]:
         return list(self.elements.values())
-  
+    
     def plot_mesh(self, save_path=None, resolution=(3840, 2160), aa_type="msaa", banner: str = None):
         import numpy as np
         import pyvista as pv
@@ -169,7 +169,9 @@ class Mesh:
         node_items = sorted(self.nodes.items())
         id_map = {nid: i for i, (nid, _) in enumerate(node_items)}
         points = np.array([node.coords for _, node in node_items], dtype=float)
+        
 
+        # Build unstructured grid
         cells = []
         cell_types = []
         for elem in self.elements.values():
@@ -178,36 +180,85 @@ class Mesh:
             cells.extend(local_ids)
             cell_types.append(CellType.HEXAHEDRON)
 
-        grid = pv.UnstructuredGrid(np.array(cells), np.array(cell_types), points)
-
-        # high-res off-screen plotter
-        off_screen = save_path is not None
-        plotter = pv.Plotter(
-            off_screen=off_screen,
-            window_size=resolution,
+        grid = pv.UnstructuredGrid(
+            np.array(cells),
+            np.array(cell_types),
+            points
         )
+        R = R = np.array([
+                [ 0,  1, 0],
+                [-1,  0, 0],
+                [ 0,  0, 1]
+            ])
+        center = grid.center
 
-        # ✔ correct anti-aliasing options
+        def apply_rot(p):
+            return (R @ (p - center)) + center
+
+        # ---------------------------------------------------------
+        # ROTATE THE MESH (your existing line)
+        # ---------------------------------------------------------
+        grid.rotate_z(270, point=grid.center, inplace=True)
+
+
+
+        # Rotated coordinates for force arrows & anchor points
+        rotated_node_coords = {
+            nid: apply_rot(np.array(node.coords, float))
+            for nid, node in node_items
+        }
+
+        # ---------------------------------------------------------
+        # PLOTTING
+        # ---------------------------------------------------------
+        off_screen = save_path is not None
+        plotter = pv.Plotter(off_screen=off_screen, window_size=resolution)
         plotter.enable_anti_aliasing(aa_type)
 
         plotter.add_mesh(grid, show_edges=True, opacity=0.6, color="lightgray")
+
+        # Optional banner text
         if banner is not None:
             plotter.add_text(banner, position="upper_left", font_size=14, color="black", shadow=True)
 
-        # Forces
-        for _, node in node_items:
+        # ---------------------------------------------------------
+        # FORCES — now rotated
+        # ---------------------------------------------------------
+        for nid, node in node_items:
             force = np.array(node.forces, dtype=float)
             if np.linalg.norm(force) > 1e-9:
-                arrow = pv.Arrow(start=node.coords, direction=force, scale=0.1)
+                start = rotated_node_coords[nid]
+                arrow = pv.Arrow(start=start, direction=apply_rot(force), scale=0.1)
                 plotter.add_mesh(arrow, color="red")
-        # Anchors
-        anchored = [node.coords for _, node in node_items if getattr(node, "anchored", False)]
-        if anchored:
-            plotter.add_points(np.array(anchored), point_size=18, color="blue")
 
-        # Save or show
+        # ---------------------------------------------------------
+        # ANCHORS — now rotated
+        # ---------------------------------------------------------
+        anchored = [
+            rotated_node_coords[nid]
+            for nid, node in node_items
+            if node.anchored is True
+        ]
+        if anchored:
+            plotter.add_points(
+                np.array(anchored),
+                point_size=8,
+                color="blue",
+                render_points_as_spheres=True
+            )
+       #     plotter.add_points(np.array(anchored), point_size=18, color="blue")
+
+        # ---------------------------------------------------------
+        # CAMERA RESET
+        # ---------------------------------------------------------
+        plotter.camera.roll = 0
+        plotter.camera.elevation = 0
+        plotter.camera.azimuth = 0
+
+        # ---------------------------------------------------------
+        # SAVE OR SHOW
+        # ---------------------------------------------------------
         if save_path is not None:
-            plotter.show(auto_close=False)
             plotter.screenshot(save_path)
             plotter.close()
         else:

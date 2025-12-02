@@ -34,7 +34,7 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
         pop_size=pop_size,
         generations=generations,
         crossover_rate=0.85,
-        mutation_rate=0.6,
+        mutation_rate=0.3,
         seed=0,
     )
 
@@ -48,8 +48,6 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
 
 
 if __name__ == "__main__":
-
-
     import argparse
     parser = argparse.ArgumentParser(description="Optimize dimensions for a given geometry.")
     parser.add_argument("--geometry", type=str, default="arm", help="Geometry name")

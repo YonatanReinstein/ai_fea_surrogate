@@ -21,6 +21,7 @@ def screenshot(geometry: str, dims: dict, save_path: str, banner: str = None):
     component.mesh.apply_force_by_pattern(force_pattern)
     component.mesh.plot_mesh(save_path=save_path , banner=banner)
 
+
 import numpy as np
 
 def vector_to_dict(vec, dim_names):
@@ -33,7 +34,7 @@ def show_gen(geometry: str, gen: int):
     dims_path = f"ga_population_gen_{gen}.npy"
     population = np.load(dims_path)
     for i, vec in enumerate(population):
-        if i<=5:
+        if i<10:
             dims = vector_to_dict(vec,dim_names)
             save_path = f"screenshots/gen_{gen}_ind_{i}.png"
             screenshot(geometry, dims, save_path)
@@ -43,7 +44,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Generate screenshots for a given generation.")
     parser.add_argument("--geometry", type=str, default="arm", help="Geometry name")
-    parser.add_argument("--gen", type=int, default=1, help="Generation number")
+    parser.add_argument("--gen", type=int, default=200, help="Generation number")
     args = parser.parse_args()
 
     show_gen(args.geometry, args.gen)

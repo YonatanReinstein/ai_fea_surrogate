@@ -71,8 +71,10 @@ class GNNEvaluator(BaseEvaluator):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(ckpt_path, map_location=self.device)
 
-        self.glob_mean = ckpt["targets_mean"].float()
-        self.glob_std  = ckpt["targets_std"].float()
+        self.target_mean = ckpt["target_mean"].to(self.device)
+        self.target_std  = ckpt["target_std"].to(self.device)
+        self.x_mean = ckpt["x_mean"].to(self.device)
+        self.x_std  = ckpt["x_std"].to(self.device)
 
         self.node_in_dim = ckpt["node_in_dim"]
 
@@ -166,29 +168,40 @@ class GNNEvaluator(BaseEvaluator):
         graph_list, volume_list = zip(*results)
 
         # Build DataLoader
+        batch_size = int(len(dims_list) / 8)
+        all_stress = []
+
         loader = DataLoader(graph_list, batch_size=batch_size, shuffle=False)
-        batch_data = next(iter(loader))
+        for batch_data in loader:
+            # Prepare inputs
+            x, edge_index, batch = gnn_input_fn(batch_data)
+            x[:, 3] = x[:, 3] / 1e+6  
+            torch.set_printoptions(threshold=torch.inf)
+            
+            x = x.to(self.device)
 
-        # Prepare inputs
-        x, edge_index, batch = gnn_input_fn(batch_data)
-        if batch is None:
-            batch = torch.zeros(x.size(0), dtype=torch.long)
+            x = (x - self.x_mean) / self.x_std
+        
+            if batch is None:
+                batch = torch.zeros(x.size(0), dtype=torch.long)
 
-        x = x.to(self.device)
-        edge_index = edge_index.to(self.device)
-        batch = batch.to(self.device)
+            edge_index = edge_index.to(self.device)
+            batch = batch.to(self.device)
 
-        # Predict
-        with torch.no_grad():
-            pred_norm = self.model(x, edge_index, batch)
+            # Predict
+            with torch.no_grad():
+                pred_norm = self.model(x, edge_index, batch)
 
-        # Denormalize
-        stress = pred_norm * self.glob_std + self.glob_mean
-        stress = stress.squeeze()
-        #print("Evaluation completed.")
+            # Denormalize
+            stress = pred_norm * self.target_std + self.target_mean
+            stress = stress.squeeze()
+            #print("Evaluation completed.")
+
+            all_stress.extend(stress.detach().cpu().numpy().tolist())
+            
 
         return {
-            "stress": stress,        # shape [batch_size]
+            "stress": all_stress,        # shape [batch_size]
             "volume": volume_list,    # list of floats
             "yield_strength": self.yield_strength
         }
@@ -235,5 +248,5 @@ if __name__ == "__main__":
         "d35": {"default": 1.5, "min": 0.0, "max": 1.5},
         "d36": {"default": 3.0, "min": 0.0, "max": 3.0}
     }
-    results = evaluator.evaluate([dims_example, dims_example])
+    results = evaluator.evaluate([dims_example])#, dims_example])
     print(results)
