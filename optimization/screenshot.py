@@ -31,10 +31,11 @@ def vector_to_dict(vec, dim_names):
 def show_gen(geometry: str, gen: int):
     dims = json.loads(Path(f"data/{geometry}/CAD_model/dims.json").read_text())
     dim_names = dims.keys()
-    dims_path = f"ga_population_gen_{gen}.npy"
+    dims_path = f"optimization/artifacts/ga_population_gen_{gen}.npy"
     population = np.load(dims_path)
+    print(population.shape)  # (pop_size, dim)
     for i, vec in enumerate(population):
-        if i<10:
+        if i < 5:
             dims = vector_to_dict(vec,dim_names)
             save_path = f"screenshots/gen_{gen}_ind_{i}.png"
             screenshot(geometry, dims, save_path)

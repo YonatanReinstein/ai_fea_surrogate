@@ -2,3 +2,7 @@
 data/arm/dataset/screenshots/*.png filter=lfs diff=lfs merge=lfs -text
 data/beam/dataset/*.pt filter=lfs diff=lfs merge=lfs -text
 data/beam/dataset/screenshots/*png filter=lfs diff=lfs merge=lfs -text
+optimization/arttifacts_V1/*.npy filter=lfs diff=lfs merge=lfs -text
+optimization/arttifacts_V2/*.npy filter=lfs diff=lfs merge=lfs -text
+optimization/screenshots_V1/*.png filter=lfs diff=lfs merge=lfs -text
+optimization/screenshots_V2/*.png filter=lfs diff=lfs merge=lfs -text

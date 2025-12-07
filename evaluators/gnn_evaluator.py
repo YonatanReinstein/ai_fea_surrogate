@@ -145,7 +145,7 @@ class GNNEvaluator(BaseEvaluator):
 
                     # -------- KEY PART --------
                     pool.close()  
-                    sleep(30)      # do not accept new tasks
+                    sleep(3)      # do not accept new tasks
                     pool.terminate()    # kill worker process
                     # -------------------------
                     print("Stopped during evaluation.")
@@ -168,7 +168,7 @@ class GNNEvaluator(BaseEvaluator):
         graph_list, volume_list = zip(*results)
 
         # Build DataLoader
-        batch_size = int(len(dims_list) / 8)
+        batch_size = 20
         all_stress = []
 
         loader = DataLoader(graph_list, batch_size=batch_size, shuffle=False)

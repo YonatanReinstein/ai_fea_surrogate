@@ -1,66 +1,67 @@
 import random
+import os
 import numpy as np
 
 class GeneticAlgorithm:
     def __init__(self, fitness_func, dims_dict,
-                 pop_size=30, generations=40, 
-                 crossover_rate=0.5, mutation_rate=0.4, seed=None):
-        #self.checkpoint_file = "ga_population.npy"
+                 pop_size=200, generations=200, 
+                 crossover_rate=0.85, mutation_rate=0.8, seed=0):
+
         self.fitness_func = fitness_func
         self.dims_dict = dims_dict
 
-        # dimension ordering
         self.dim_names = list(dims_dict.keys())
         self.dim = len(self.dim_names)
 
-
-        # bounds array (dim × 2)
         self.bounds = np.array([
             [dims_dict[name]["min"], dims_dict[name]["max"]]
             for name in self.dim_names
         ])
 
-
         self.pop_size = pop_size
         self.generations = generations
         self.crossover_rate = crossover_rate
-        self.mutation_rate = mutation_rate
+        self.mutation_rate = mutation_rate   # per-individual mutation prob
+        self.starting_gen = 0
 
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
 
     def vector_to_dict(self, vec):
-        """Convert vector → {dim_name: value}"""
         return {name: float(vec[i]) for i, name in enumerate(self.dim_names)}
 
     def dict_to_vector(self, d):
-        """Convert {name: value} → vector"""
         return np.array([d[name] for name in self.dim_names], dtype=float)
 
     def _initialize_population(self):
-        import os
+        population = None
+        gen = 0
+        while True:
+            if os.path.exists(f"optimization/artifacts/ga_population_gen_{gen+1}.npy"):
+                population = np.load(f"optimization/artifacts/ga_population_gen_{gen+1}.npy")
+                gen += 1
+                self.starting_gen = gen
+            else:
+                break
+        if population is not None:
+            print("[GA] Loading checkpoint from ga_population.npy")
+            return population
 
-        # if checkpoint exists → load population instead of initializing
-        if os.path.exists("ga_population.npy"):
-            print(f"[GA] Loading checkpoint from ga_population.npy")
-            return np.load("ga_population.npy")
-
-        # otherwise random init
         low, high = self.bounds[:, 0], self.bounds[:, 1]
         print("[GA] Initializing new population")
         return np.random.uniform(low, high, (self.pop_size, self.dim))
 
-    def _mutate(self, individual, rate=0.3):
-        # per-gene mutation mask
+    def _mutate(self, individual, gen, rate=0.16):
+        # per-gene mutation probability
         mask = np.random.rand(self.dim) < rate
 
-        # scale of mutation ~ 10% of range for each gene
+        # adaptive sigma: shrinks slowly as search progresses
         ranges = self.bounds[:, 1] - self.bounds[:, 0]
-        sigma = 0.15 * ranges
+        sigma_scale = 0.1 #  * (0.98 ** gen)   # starts 0.05 → slowly to ~0.01
+        sigma = sigma_scale * ranges
 
         noise = np.random.normal(0.0, sigma, size=self.dim)
-
         mutated = np.where(mask, individual + noise, individual)
         return np.clip(mutated, self.bounds[:, 0], self.bounds[:, 1])
 
@@ -69,146 +70,138 @@ class GeneticAlgorithm:
             alpha = np.random.uniform(0.3, 0.7)
             return alpha * p1 + (1 - alpha) * p2
         return p1.copy()
-    
+
     def _diversity_scores(self, population):
-        # Compute pairwise distances
         distances = np.linalg.norm(
             population[:, np.newaxis, :] - population[np.newaxis, :, :],
             axis=2
         )
-
-        # Distance of each ind. to all others (exclude self-distance = 0)
         mean_distances = np.mean(distances, axis=1)
 
-        # Normalize between 0 and 1
         if mean_distances.max() > mean_distances.min():
-            normalized = (mean_distances - mean_distances.min()) / (mean_distances.max() - mean_distances.min())
-        else:
-            normalized = np.zeros_like(mean_distances)
+            return (mean_distances - mean_distances.min()) / (mean_distances.max() - mean_distances.min())
+        return np.zeros_like(mean_distances)
 
-        return normalized
-    
+    def _select_parents_tournament(self, fitnesses, population, count, k=3):
+        fitnesses = np.array(fitnesses)
+        parents = []
+        for _ in range(count):
+            idxs = np.random.choice(len(population), size=k, replace=False)
+            best_idx = idxs[np.argmin(fitnesses[idxs])]
+            parents.append(population[best_idx])
+        return parents
+
     def run(self):
         population = self._initialize_population()
 
         best_vec = None
         best_fit = float("inf")
 
-        for gen in range(self.generations):
+        for gen in range(self.starting_gen, self.starting_gen + self.generations):
 
-            # ----- evaluate individuals -----
+            # ---------- Evaluate ----------
             dims_dicts = [self.vector_to_dict(ind) for ind in population]
             res = self.fitness_func(dims_dicts)
 
             raw_volume = np.array(res["volume"])
             raw_stress = np.array(res["stress"])
 
-            # penalize yield violation
+            # ---------- SOFT penalty ----------
             raw_stress_banner = raw_stress.copy()
-            raw_stress = 10000 * np.maximum(raw_stress - res["yield_strength"], 0)
-            raw_volume += raw_stress * 10000
+            violation = np.maximum(raw_stress - res["yield_strength"], 0.0)
+            penalty = violation * 1
+            raw_volume_penalized = raw_volume + penalty
 
-            # diversity
+            # ---------- Diversity ----------
             raw_diversity = self._diversity_scores(population)
+            mean_div = raw_diversity.mean()
 
-            # ----- normalize -----
-            V_norm = (raw_volume - raw_volume.min()) / (raw_volume.ptp() + 1e-8)
-            S_norm = (raw_stress - raw_stress.min()) / (raw_stress.ptp() + 1e-8)
-            D_norm = (raw_diversity - raw_diversity.min()) / (raw_diversity.ptp() + 1e-8)
+            # ---------- Normalize ----------
+            def norm(x):
+                return (x - x.min()) / (x.ptp() + 1e-8)
 
-            w_v = 0.4
-            w_s = 0.6
-            w_d = 0
+            V_norm = norm(raw_volume_penalized)
+            S_norm = norm(penalty)
+            D_norm = norm(raw_diversity)
 
-            fitnesses = w_v * V_norm + w_s * S_norm + w_d * D_norm
+            #w_v = 0.55
+            #w_s = 0.3
+            #w_d = 0.15   
 
-            banners = []
-            for i, fit in enumerate(fitnesses):
-                if i  < 10:
-                    banner = f"rvol: {raw_volume[i]:.4e}, rstress: {raw_stress_banner[i]:.4e} => fit: {fitnesses[i]:.4e}"
-                    banners.append(banner)
-                    #print(banner)
+            w_v = 0.49
+            w_s = 0.49
+            w_d = 0.02
 
-            #from .screenshot import screenshot
-            #for i, banner in enumerate(banners):
-            #    screenshot(
-            #        geometry="arm",
-            #        dims=self.vector_to_dict(population[i]),
-            #        save_path=f"screenshots/gen_{gen}_ind_{i}.png",
-            #        banner=banner)
+            fitnesses = w_v * V_norm + w_s * S_norm + w_d * (1 - D_norm)
 
-            #gen_best_idx = np.argmin(fitnesses)
-            #if fitnesses[gen_best_idx] < best_fit:
-            #    best_fit = fitnesses[gen_best_idx]
-            #    best_vec = population[gen_best_idx].copy()
+            # ---------- Banner: TOP-K BEST INDIVIDUALS ----------
+            from .screenshot import screenshot
 
-            print(f"Gen {gen+1}/{self.generations} | Best fitness: {fitnesses.min():.4e}")
+            top_k = min(1, len(population))  # how many screenshots per gen
+            best_indices = np.argsort(fitnesses)[:top_k]
 
-            # ----- rank individuals -----
+            for rank, idx in enumerate(best_indices):
+                banner = (
+                    f"[gen {gen:03d} | rank {rank:02d}] "
+                    f"rvol: {raw_volume[idx]:.4e}, "
+                    f"rstress: {raw_stress_banner[idx]:.4e} "
+                    f"=> fit: {fitnesses[idx]:.4e}"
+                )
+                screenshot(
+                    geometry="arm",
+                    dims=self.vector_to_dict(population[idx]),
+                    save_path=f"optimization/screenshots/gen_{gen:03d}_rank_{rank:02d}_idx_{idx}.png",
+                    banner=banner
+                )
+
+            # ---------- Global best ----------
+            gen_best_idx = np.argmin(fitnesses)
+            if fitnesses[gen_best_idx] < best_fit:
+                best_fit = fitnesses[gen_best_idx]
+                best_vec = population[gen_best_idx].copy()
+
+            print(f"Gen {gen+1}/{self.generations} | Best fitness: {fitnesses.min():.4e} | Div={mean_div:.4f}")
+
+            # ---------- Rank ----------
             ranked = sorted(zip(fitnesses, population), key=lambda x: x[0])
-            _, sorted_pop = zip(*ranked)
+            sorted_fit, sorted_pop = zip(*ranked)
+            sorted_fit = np.array(sorted_fit)
             sorted_pop = np.array(sorted_pop)
 
+            half = int(self.pop_size * 0.8)
+            survivors = sorted_pop[:half]
 
-       
-            half = int(self.pop_size * 0.6)
+            # ---------- Tournament selection ----------
+            parents_pool = self._select_parents_tournament(
+                sorted_fit[:half], survivors, half, k=2
+            )
 
-            # ---- TOP HALF survive but may mutate ----
-            survivors = []
-            for indiv in sorted_pop[:half]:
-                survivors.append(indiv)
-
-            survivors = np.array(survivors)
-
-            # ---- Parents for crossover come only from TOP HALF ----
-            parents_pool = survivors
-
-            # ---- BOTTOM HALF replaced by children ----
+            # ---------- Children ----------
             children = []
             while len(children) < (self.pop_size - half):
                 p1, p2 = random.sample(list(parents_pool), 2)
                 child = self._crossover(p1, p2)
                 children.append(child)
 
-            # ---- New generation ----
             population = np.vstack([survivors, children])
 
+            # ---------- Mutation (1 elite) ----------
             mutated_population = []
             for i, ind in enumerate(population):
-                if i >= 10:
+                if i < 4:
+                    mutated_population.append(ind)
+                else:
                     if random.random() < self.mutation_rate:
-                        ind = self._mutate(ind)
+                        ind = self._mutate(ind, gen)
                     mutated_population.append(ind)
             population = np.array(mutated_population)
 
+            # ---------- Adaptive mutation rate ----------
+            if gen > 100 and gen % 20 == 0:
+                old_rate = self.mutation_rate
+                self.mutation_rate = min(1.0, self.mutation_rate * 1.15)
+                print(f"🔧 Mutation rate boosted: {old_rate:.3f} → {self.mutation_rate:.3f}")
 
-            # checkpoint
-            if (gen + 1) % 2 == 0:
-                np.save(f"ga_population_gen_{gen+1}.npy", population)
-
-        return self.vector_to_dict(population[0])
-
-    def _select_parents_proportional(self, fitnesses, population, count):
-        fitnesses = np.array(fitnesses)
-
-        # convert to scores where high = good
-        max_f = fitnesses.max()
-        scores = max_f - fitnesses + 1e-8
-
-        prob = scores / scores.sum()
-
-        idxs = np.random.choice(len(population), size=count, p=prob, replace=True)
-        return [population[i] for i in idxs]
-    
-    def _select_parents_tournament(self, fitnesses, population, count, k=3):
-        fitnesses = np.array(fitnesses)
-        parents = []
-        for _ in range(count):
-            # randomly sample k candidates
-            idxs = np.random.choice(len(population), size=k, replace=False)
-            # pick the one with the lowest fitness (remember: lower is better)
-            best_idx = idxs[np.argmin(fitnesses[idxs])]
-            parents.append(population[best_idx])
-        return parents
-
-
+            # ---------- Checkpoint ----------
+            np.save(f"optimization/artifacts/ga_population_gen_{gen+1}.npy", population)
+        return self.vector_to_dict(best_vec)
