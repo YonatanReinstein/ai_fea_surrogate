@@ -161,7 +161,7 @@ class Mesh:
     def all_elements(self) -> List[Element]:
         return list(self.elements.values())
     
-    def plot_mesh(self, save_path=None, resolution=(3840, 2160), aa_type="msaa", banner: str = None):
+    def plot_mesh(self, save_path=None, resolution=(3840, 2160), aa_type="msaa", banner: str = None, elev: float = 0, azim: float = 0):
         import numpy as np
         import pyvista as pv
         from pyvista import CellType
@@ -215,21 +215,22 @@ class Mesh:
         plotter = pv.Plotter(off_screen=off_screen, window_size=resolution)
         plotter.enable_anti_aliasing(aa_type)
 
-        plotter.add_mesh(grid, show_edges=True, opacity=0.6, color="lightgray")
+        plotter.add_mesh(grid, show_edges=True, opacity=0.6, color="lightblue")
 
         # Optional banner text
         if banner is not None:
-            plotter.add_text(banner, position="upper_left", font_size=14, color="black", shadow=True)
+            plotter.add_text(banner, position="upper_left", font_size=50, color="black", shadow=True)
 
         # ---------------------------------------------------------
         # FORCES — now rotated
         # ---------------------------------------------------------
         for nid, node in node_items:
-            force = np.array(node.forces, dtype=float)
-            if np.linalg.norm(force) > 1e-9:
-                start = rotated_node_coords[nid]
-                arrow = pv.Arrow(start=start, direction=apply_rot(force), scale=0.1)
-                plotter.add_mesh(arrow, color="red")
+            if node.id == 1955:
+                force = np.array(node.forces, dtype=float)
+                if np.linalg.norm(force) > 1e-9:
+                    start = rotated_node_coords[nid]
+                    arrow = pv.Arrow(start=start, direction=apply_rot(force), scale=1)
+                    plotter.add_mesh(arrow, color="red")
 
         # ---------------------------------------------------------
         # ANCHORS — now rotated
@@ -242,7 +243,7 @@ class Mesh:
         if anchored:
             plotter.add_points(
                 np.array(anchored),
-                point_size=8,
+                point_size=25,
                 color="blue",
                 render_points_as_spheres=True
             )
@@ -252,8 +253,11 @@ class Mesh:
         # CAMERA RESET
         # ---------------------------------------------------------
         plotter.camera.roll = 0
+        #plotter.camera.elevation = elev
         plotter.camera.elevation = 0
+        #plotter.camera.azimuth = azim
         plotter.camera.azimuth = 0
+        #plotter.camera.zoom(1.5)
 
         # ---------------------------------------------------------
         # SAVE OR SHOW

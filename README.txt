@@ -1,11 +1,10 @@
+usful commands:
 to activate the environment in git bash run:
     env\Scripts\activate         
 to activate the environment in git bash run:
     deactivate
 to kill any ansys Process
     Get-Process | Where-Object { $_.ProcessName -like "ansys*" -or $_.ProcessName -like "MAPDL*" -or $_.ProcessName -like "fluent*" -or $_.ProcessName -like "launcher*" } | Stop-Process -Force
-conclustions:
-    the base and length or the arm should be fixed dims
 
 
 setup for windows 11:
