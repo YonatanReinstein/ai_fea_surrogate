@@ -58,7 +58,7 @@ class GeneticAlgorithm:
 
         # adaptive sigma: shrinks slowly as search progresses
         ranges = self.bounds[:, 1] - self.bounds[:, 0]
-        sigma_scale = 0.1 #  * (0.98 ** gen)   # starts 0.05 → slowly to ~0.01
+        sigma_scale = 0.05# * (0.98 ** gen)   # starts 0.05 → slowly to ~0.01
         sigma = sigma_scale * ranges
 
         noise = np.random.normal(0.0, sigma, size=self.dim)

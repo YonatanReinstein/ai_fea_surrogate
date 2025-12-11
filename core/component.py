@@ -121,8 +121,8 @@ if __name__ == "__main__":
     component.generate_mesh(U=U, V=V, W=W)
     component.mesh.anchor_nodes_by_condition(anchor_condition)
     component.mesh.apply_force_by_pattern(force_pattern)
-    component.mesh.solve(young=2e11, poisson=0.3)
-    component.mesh.plot_mesh()
+    component.mesh.solve(young=2e11, poisson=0.3, screenshot_path=f"mapdl.png")
+    #component.mesh.plot_mesh()
     print("Max stress:", component.mesh.get_max_stress())
 
 
