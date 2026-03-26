@@ -14,6 +14,7 @@
 #include "inc_irit/geom_lib.h"
 #include "inc_irit/cagd_lib.h"
 #include "inc_irit/user_lib.h"
+#include "inc_irit/grap_lib.h"
 
 typedef CagdRType(*LclThicknessFuncCBType)(CagdRType u,
     CagdRType v,
@@ -26,6 +27,7 @@ typedef struct UserMicroLocalDataStruct { /* User specific data in CB funcs. */
 } UserMicroLocalDataStruct;
 
 static CagdRType UniformTilingCB(CagdRType u, CagdRType v, CagdRType w);
+static CagdRType* read_dims(int* ULength, int* VLength, int* WLength);
 
 static int PreProcessTile1FaceParam(
     const UserMicroPreProcessTileCBStruct* CBData,
@@ -39,26 +41,114 @@ static void GenerateMicroStructures(void);
 
 static CagdRType UniformTilingCB(CagdRType u, CagdRType v, CagdRType w)
 {
-    // printf("%f   %f   %f\n", u, v, w);
-    return 0.49;
+    int ULength, VLength, WLength;
+    int UOrder = 2, VOrder = 2, WOrder = 2;
+
+    CagdRType* ctrl = read_dims(&ULength, &VLength, &WLength);
+
+    TrivTVStruct* TV = IritTrivBspTVNew(
+        ULength, VLength, WLength,
+        UOrder, VOrder, WOrder,
+        CAGD_PT_E1_TYPE
+    );
+
+    int knotU = ULength + UOrder;  // total number of knots
+
+    for (int i = 0; i < knotU; i++) {
+        if (i < UOrder) {
+            TV->UKnotVector[i] = 0.0;  // first k knots
+        }
+        else if (i >= ULength) {
+            TV->UKnotVector[i] = 1.0;  // last k knots
+        }
+        else {
+            TV->UKnotVector[i] = (double)(i - UOrder + 1) / (ULength - UOrder + 1);  // internal knots
+        }
+    }
+    int knotV = VLength + VOrder;  // total number of knots
+
+    for (int i = 0; i < knotV; i++) {
+        if (i < VOrder) {
+            TV->VKnotVector[i] = 0.0;  // first k knots
+        }
+        else if (i >= VLength) {
+            TV->VKnotVector[i] = 1.0;  // last k knots
+        }
+        else {
+            TV->VKnotVector[i] = (double)(i - VOrder + 1) / (VLength - VOrder + 1);  // internal knots
+        }
+    }
+    int knotW = WLength + WOrder;  // total number of knots
+
+    for (int i = 0; i < knotW; i++) {
+        if (i < WOrder) {
+            TV->WKnotVector[i] = 0.0;  // first k knots
+        }
+        else if (i >= WLength) {
+            TV->WKnotVector[i] = 1.0;  // last k knots
+        }
+        else {
+            TV->WKnotVector[i] = (double)(i - WOrder + 1) / (WLength - WOrder + 1);  // internal knots
+        }
+    }
+
+    CagdRType UMin;
+    CagdRType UMax;
+    CagdRType VMin;
+    CagdRType VMax;
+    CagdRType WMin;
+    CagdRType WMax;
+
+    IritTrivTVDomain(TV, &UMin, &UMax, &VMin, &VMax, &WMin, &WMax);
+
+    printf("TV domain: U [%f, %f], V [%f, %f], W [%f, %f]\n",
+        UMin, UMax, VMin, VMax, WMin, WMax);
+
+ 
+
+    //TrivTVStruct* TV = IritTrivBzrTVNew(
+    //    ULength, VLength, WLength,
+    //    CAGD_PT_E1_TYPE
+    //);
+
+    int n = VLength * ULength * WLength;
+    printf("ULength: %d, VLength: %d, WLength: %d\n", ULength, VLength, WLength);
+
+
+    printf("n: %d\n", n);
+    for (int i = 0; i < ULength + UOrder; i++)
+        printf("U knot[%d] = %f\n", i, TV->UKnotVector[i]);
+
+
+    /* Copy all control points at once */
+    memcpy(TV->Points[1], ctrl, sizeof(CagdRType) * n);
+
+
+
+    /* Evaluate the trivariate */
+    CagdRType* res = IritTrivTVEval2Malloc(TV, u, v, w);
+    IritTrivTVFree(TV);
+    IritFree(ctrl);
+
+    return res[1];
 }
 
 /*****************************************************************************
-* DESCRIPTION:								     
-*   Prepare one	face parameters	for the	3D grid	tile synthesized on the	fly. 
-*									     
-* PARAMETERS:								     
-*   LclMinDmn, LclMaxDmn:     UVW domain of this tile, in the parent	     
-*		deformation function.					     
-*   Bndry:	THe boundary (out of UMin/Max, VMin/Max, WMin/Max).	     
-*   BndryThickness:  To	set the	thickness of the synthesized boundary,	     
-*		or 0.0 to disable.					     
-*   ThicknessFuncCB: Call back function	to prescribe the thickness desired   
-*		based upon the UVW location.				     
-*   BPrm:	Parameters of this face	to update.			     
-*									     
-* RETURN VALUE:								     
-*   int:								     
+* DESCRIPTION:
+*   Prepare one	face parameters	for the	3D grid	tile synthesized on the	fly.
+*
+* PARAMETERS:
+*   LclMinDmn, LclMaxDmn:     UVW domain of this tile, in the parent
+*		deformation function.
+*   Bndry:	THe boundary (out of UMin/Max, VMin/Max, WMin/Max).
+*   BndryThickness:  To	set the	thickness of the synthesized boundary,
+*		or 0.0 to disable.
+*   ThicknessFuncCB: Call back function	to prescribe the thickness desired
+*		based upon the UVW location.
+*   BPrm:	Parameters of this face	to update.
+*
+* RETURN VALUE:
+*   int:
 *****************************************************************************/
 static int PreProcessTile1FaceParam(
     const UserMicroPreProcessTileCBStruct* CBData,
@@ -152,17 +242,17 @@ static int PreProcessTile1FaceParam(
 }
 
 /*****************************************************************************
-* DESCRIPTION:								     *
-*									     *
-*									     *
-*									     *
-* PARAMETERS:								     *
+* DESCRIPTION:
+*
+*
+*
+* PARAMETERS:
 *   Tile:   Tile to preprocess.	 Here we expect	a NULL as we build tile	     *
-*	    from scratch.						     *
-*   CBData: The	call back data.						     *
-*									     *
-* RETURN VALUE:								     *
-*   IPObjectStruct *:							     *
+*	    from scratch.
+*   CBData: The	call back data.
+*
+* RETURN VALUE:
+*   IPObjectStruct *:
 *****************************************************************************/
 static IPObjectStruct* PreProcessTile(IPObjectStruct* Tile,
     UserMicroPreProcessTileCBStruct* CBData)
@@ -184,16 +274,16 @@ static IPObjectStruct* PreProcessTile(IPObjectStruct* Tile,
 
     IritTrivTVDomain(LclData->DefMap, &UMin, &UMax, &VMin, &VMax, &WMin, &WMax);
 
-    fprintf(stderr, "Tile[%d,%d,%d] from (%.3f, %.3f %.3f) to (%.3f, %.3f, %.3f)\r",
-        CBData->TileIdxs[0],
-        CBData->TileIdxs[1],
-        CBData->TileIdxs[2],
-        LclMinDmn[0],
-        LclMinDmn[1],
-        LclMinDmn[2],
-        LclMaxDmn[0],
-        LclMaxDmn[1],
-        LclMaxDmn[2]);
+    //fprintf(stderr, "Tile[%d,%d,%d] from (%.3f, %.3f %.3f) to (%.3f, %.3f, %.3f)\r\n",
+    //    CBData->TileIdxs[0],
+    //    CBData->TileIdxs[1],
+    //    CBData->TileIdxs[2],
+    //    LclMinDmn[0],
+    //    LclMinDmn[1],
+    //    LclMinDmn[2],
+    //    LclMaxDmn[0],
+    //    LclMaxDmn[1],
+    //    LclMaxDmn[2]);
 
     if (!PreProcessTile1FaceParam(CBData, TRIV_U_MIN_BNDRY,
         0.0, ThicknessFuncCB, &UMinPrms) ||
@@ -265,19 +355,80 @@ static IPObjectStruct* PreProcessTile(IPObjectStruct* Tile,
     return Tile;
 }
 
+
+static CagdRType* read_dims(int* ULength, int* VLength, int* WLength)
+{
+    IPObjectStruct* PObj;
+    const char* DimsFileName = "dims.itd";
+
+    PObj = IritPrsrGetDataFiles(&DimsFileName, 1, FALSE, FALSE);
+    if (PObj == NULL) {
+        fprintf(stderr, "Failed to load dims.itd\n");
+        return NULL;
+    }
+
+    /* First value: ULength */
+    if (PObj == NULL || !IP_IS_NUM_OBJ(PObj)) {
+        fprintf(stderr, "First object is missing or not numeric\n");
+        return NULL;
+    }
+    *ULength = (int)PObj->U.R;
+    PObj = PObj->Pnext;
+
+    /* Second value: VLength */
+    if (PObj == NULL || !IP_IS_NUM_OBJ(PObj)) {
+        fprintf(stderr, "Second object is missing or not numeric\n");
+        return NULL;
+    }
+    *VLength = (int)PObj->U.R;
+    PObj = PObj->Pnext;
+
+    /* Third value: WLength */
+    if (PObj == NULL || !IP_IS_NUM_OBJ(PObj)) {
+        fprintf(stderr, "Third object is missing or not numeric\n");
+        return NULL;
+    }
+    *WLength = (int)PObj->U.R;
+    PObj = PObj->Pnext;
+
+    int n = (*ULength) * (*VLength) * (*WLength);
+
+    int i;
+    CagdRType* ctrl = (CagdRType*)IritMalloc(sizeof(CagdRType) * n);
+    IRIT_ZAP_MEM(ctrl, sizeof(CagdRType) * n);
+
+    if (ctrl == NULL) {
+        fprintf(stderr, "Allocation failed\n");
+        return NULL;
+    }
+
+    for (i = 0; i < n; i++) {
+        if (PObj == NULL || !IP_IS_NUM_OBJ(PObj)) {
+            fprintf(stderr, "Invalid data at %d\n", i);
+            IritFree(ctrl);
+            return NULL;
+        }
+
+        ctrl[i] = PObj->U.R;
+        PObj = PObj->Pnext;
+    }
+
+    return ctrl;
+}
+
 /*****************************************************************************
-* DESCRIPTION:								     *
-*   Create a micro structure with a varying-in-size tiling example.	     *
-*									     *
-* PARAMETERS:								     *
-*   None								     *
-*									     *
-* RETURN VALUE:								     *
-*   void								     *
+* DESCRIPTION:
+*   Create a micro structure with a varying-in-size tiling example.
+*
+* PARAMETERS:
+*   None
+*
+* RETURN VALUE:
+*   void
 *****************************************************************************/
 static void GenerateMicroStructures(void)
 {
-    const char* InputDefMap = "Wing.itd"; // The wing
+    const char* InputDefMap = "outline.itd";
     int i, Handler;
     IPObjectStruct* MS, * DefMapPObj;
     MvarMVStruct* DeformMV;
@@ -285,6 +436,7 @@ static void GenerateMicroStructures(void)
     UserMicroParamStruct MSParam;
     UserMicroRegularParamStruct* MSRegularParam;
     UserMicroLocalDataStruct LclData;
+    printf("Loading deformation function...\n");
 
     DefMapPObj = IritPrsrGetDataFiles(&InputDefMap, 1, FALSE, FALSE);
     if (DefMapPObj == NULL) {
@@ -319,9 +471,9 @@ static void GenerateMicroStructures(void)
         MSRegularParam->TilingSteps[i].Len = 1;
     }
 
-    MSRegularParam->TilingSteps[0].TilesPerIntervals[0] = 1;
-    MSRegularParam->TilingSteps[1].TilesPerIntervals[0] = 1;
-    MSRegularParam->TilingSteps[2].TilesPerIntervals[0] = 1;
+    MSRegularParam->TilingSteps[0].TilesPerIntervals[0] = 3;
+    MSRegularParam->TilingSteps[1].TilesPerIntervals[0] = 3;
+    MSRegularParam->TilingSteps[2].TilesPerIntervals[0] = 3;
 
     /* Call back function - will be called for each tile in the grid just   */
     /* before it is mapped through the deformation function, with the tile  */
@@ -329,19 +481,39 @@ static void GenerateMicroStructures(void)
     MSRegularParam->PreProcessCBFunc = PreProcessTile;
     MSRegularParam->CBFuncData = &LclData;         /* The call back data. */
 
-    /* 0. Uniform tiling. */
-    fprintf(stderr, "\nMS: generating MS with uniform tiling along MS...\n");
-
     LclData.ThicknessFuncCB = UniformTilingCB;
 
-    MS = IritUserMicroStructComposition(&MSParam); /* Construct microstructure. */
+    MS = IritUserMicroStructComposition(&MSParam);
+    int tiles_num = MSRegularParam->TilingSteps[0].TilesPerIntervals[0] * MSRegularParam->TilingSteps[1].TilesPerIntervals[0] * MSRegularParam->TilingSteps[2].TilesPerIntervals[0];
+    int params_per_tile = 7;
+    CagdRType volume = 0;
+    int index = 0;
+    while (index < tiles_num) {
+        IPObjectStruct* MV = MS->U.Lst.PObjList[index];
+        int j = 0;
+        while (j < params_per_tile) {
+            IPObjectStruct* MQ = MV->U.Lst.PObjList[j];
+            volume += fabs(IritTrivTVVolume(MQ->U.Trivars, TRUE));
+            j++;
+        }
+        index++;
+    }
 
-    Handler = IritPrsrOpenDataFile("MSUniform.itd", FALSE, 1);
+    FILE* fp = fopen("props.txt", "w");
+    if (fp == NULL) {
+        perror("Failed to open file");
+        return 1;
+    }
+    fprintf(fp, "volume %f\n", volume);
+    fclose(fp);
+
+    Handler = IritPrsrOpenDataFile("model.itd", FALSE, 1);
     if (MS != NULL) {
         IritPrsrPutObjectToHandler(Handler, MS);
         IritPrsrFreeObject(MS);
     }
     IritPrsrCloseStream(Handler, TRUE);
+
 
     /** End **/
     IritMvarMVFree(DeformMV);

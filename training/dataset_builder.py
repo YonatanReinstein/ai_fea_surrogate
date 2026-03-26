@@ -1,6 +1,6 @@
 import json, random, torch, os, importlib
 from core.component import Component
-from core.IritModel import IIritModel
+from core.IritModel import IritModel, IritCModel
 from ansys.mapdl.core.errors import MapdlRuntimeError
 
 def build_dataset(
@@ -13,7 +13,7 @@ def build_dataset(
 
 
     base_path = f"data/{geometry}"
-    model_path = f"{base_path}/CAD_model/model.irt"
+    model_path = f"{base_path}/CAD_model"
     dims_json_path = f"{base_path}/CAD_model/dims.json"
     dataset_dir = f"{base_path}/dataset"
     screenshots_dir = f"{base_path}/dataset/screenshots"
@@ -47,7 +47,11 @@ def build_dataset(
         while True:
             try:
                 dims = {k: random.uniform(v["min"], v["max"]) for k, v in dims_template.items()}
-                CAD_model = IIritModel(model_path, dims_dict=dims)
+                if os.path.isfile(os.path.join(model_path, "model.exe")):
+                    CAD_model = IritCModel(model_path + "/model.exe", dims_dict=dims)
+                else:
+                    CAD_model = IritModel(model_path + "/model.irt", dims_dict=dims)
+
                 if i < start_idx:
                     print(f"Skipping sample {i + 1} (already in dataset)")
                     break
@@ -62,7 +66,7 @@ def build_dataset(
                 comp.mesh.apply_force_by_pattern(force_pattern) 
                 comp.ansys_sim(screenshot_path=screenshots_dir)
                 data = comp.to_graph_with_labels()
-                #comp.mesh.plot_mesh(save_path=f"{screenshots_dir}/mesh_{i+1}.png")
+                comp.mesh.plot_mesh(save_path=f"{screenshots_dir}/mesh_{i+1}.png")
                 dataset.append(data)
                 metadata.append({
                     "id": i,

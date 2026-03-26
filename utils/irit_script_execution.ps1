@@ -1,7 +1,6 @@
 param(
     [string]$irt_model_path
 )
-# Save current directory
 
 $process = Start-Process `
     -FilePath "irit64" `

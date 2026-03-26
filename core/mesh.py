@@ -2,6 +2,7 @@ from typing import List, Callable
 from .node import Node
 from .element import Element
 from ansys.mapdl.core import launch_mapdl
+import time
 from ansys.mapdl.core.errors import MapdlRuntimeError
 import pyvista as pv
 pv.OFF_SCREEN = True 
@@ -17,54 +18,79 @@ class Mesh:
     def solve(self, young: float, poisson: float, mapdl=None, screenshot_path: str = None):
         self.mapdl = mapdl
         created_mapdl = False
+        print(f"Starting FEA simulation...{time.time()}")
         try:
             if self.mapdl is None:
                 created_mapdl = True
-                self.mapdl = launch_mapdl(mode="grpc", override=True, cleanup_on_exit=True)
+                self.mapdl = launch_mapdl(mode="grpc", nproc=4, override=True, cleanup_on_exit=True)
             self.mapdl.clear()
-            self.mapdl.prep7()
-            self.mapdl.et(1, 185)                 # SOLID185
-            self.mapdl.keyopt(1, 9, 0)            # (default integration)
-            self.mapdl.mp("EX", 1, young)
-            self.mapdl.mp("PRXY", 1, poisson)
-            for node in self.all_nodes():
-                self.mapdl.n(node.id, *node.coords)
-            self.mapdl.type(1)
-            self.mapdl.mat(1)
-            for elem in self.all_elements():
-                self.mapdl.en(elem.id, *[n.id for n in elem.nodes])
-            
-            # Apply anchors
-            self.mapdl.allsel("ALL")
-            self.mapdl.nsel("NONE")
+            #self.mapdl.prep7()
+            #self.mapdl.et(1, 185)                 # SOLID185
+            #self.mapdl.keyopt(1, 9, 0)            # (default integration)
+            #self.mapdl.mp("EX", 1, young)
+            #self.mapdl.mp("PRXY", 1, poisson)
+            #for node in self.all_nodes():
+            #    self.mapdl.n(node.id, *node.coords)
+            #self.mapdl.type(1)
+            #self.mapdl.mat(1)
+            #for elem in self.all_elements():
+            #    self.mapdl.en(elem.id, *[n.id for n in elem.nodes])
+      
+            ## Apply anchors
+            #self.mapdl.allsel("ALL")
+            #self.mapdl.nsel("NONE")
+#
+            #for node in self.all_nodes():
+            #    if node.anchored:
+            #        self.mapdl.nsel("A", "NODE", vmin=node.id, vmax=node.id)
+            #    
+            #self.mapdl.d("ALL", "UX", 0)
+            #self.mapdl.d("ALL", "UY", 0)    
+            #self.mapdl.d("ALL", "UZ", 0)
+#
+            ## Apply forces
+            #for node in self.all_nodes():
+            #    self.mapdl.allsel("ALL")
+            #    self.mapdl.nsel("NONE")
+            #    fx, fy, fz = node.forces
+            #    if any([fx, fy, fz]):
+            #        self.mapdl.nsel("A", "NODE", vmin=node.id, vmax=node.id)
+            #        if fx != 0.0:
+            #            self.mapdl.f("ALL", "FX", fx)
+            #        if fy != 0.0:
+            #            self.mapdl.f("ALL", "FY", fy)
+            #        if fz != 0.0:
+            #            self.mapdl.f("ALL", "FZ", fz)
+#
+            #
+            #self.mapdl.allsel("ALL")     
+            #self.mapdl.run("/SOLU")
+            #self.mapdl.antype("STATIC")
+            #self.mapdl.outres("ALL","ALL")
+#
+            cmds = [
+                "/PREP7",
+                "ET,1,185",
+                "KEYOPT,1,9,0",
+                f"MP,EX,1,{young}",
+                f"MP,PRXY,1,{poisson}",
+            ]
 
-            for node in self.all_nodes():
-                if node.anchored:
-                    self.mapdl.nsel("A", "NODE", vmin=node.id, vmax=node.id)
-                
-            self.mapdl.d("ALL", "UX", 0)
-            self.mapdl.d("ALL", "UY", 0)    
-            self.mapdl.d("ALL", "UZ", 0)
+            cmds += [f"N,{n.id},{n.coords[0]},{n.coords[1]},{n.coords[2]}" for n in self.all_nodes()]
+            cmds += ["TYPE,1", "MAT,1"]
+            cmds += [f"EN,{e.id}," + ",".join(str(n.id) for n in e.nodes) for e in self.all_elements()]
 
-            # Apply forces
-            for node in self.all_nodes():
-                self.mapdl.allsel("ALL")
-                self.mapdl.nsel("NONE")
-                fx, fy, fz = node.forces
-                if any([fx, fy, fz]):
-                    self.mapdl.nsel("A", "NODE", vmin=node.id, vmax=node.id)
-                    if fx != 0.0:
-                        self.mapdl.f("ALL", "FX", fx)
-                    if fy != 0.0:
-                        self.mapdl.f("ALL", "FY", fy)
-                    if fz != 0.0:
-                        self.mapdl.f("ALL", "FZ", fz)
+            for n in self.all_nodes():
+                if n.anchored:
+                    cmds += [f"D,{n.id},UX,0", f"D,{n.id},UY,0", f"D,{n.id},UZ,0"]
+                fx, fy, fz = n.forces
+                if fx: cmds.append(f"F,{n.id},FX,{fx}")
+                if fy: cmds.append(f"F,{n.id},FY,{fy}")
+                if fz: cmds.append(f"F,{n.id},FZ,{fz}")
 
-            
-            self.mapdl.allsel("ALL")     
-            self.mapdl.run("/SOLU")
-            self.mapdl.antype("STATIC")
-            self.mapdl.outres("ALL","ALL")
+            cmds += ["/SOLU", "ANTYPE,STATIC", "OUTRES,ALL,ALL"]
+
+            self.mapdl.input_strings("\n".join(cmds))
             self.mapdl.solve()
             self.mapdl.post1()
             self.mapdl.set("last")
@@ -93,16 +119,6 @@ class Mesh:
             self.mapdl = None
             self.solution_valid = True
 
-            #for element in self.elements.values():
-            #    ancher_element = False
-            #    for node in element.nodes:
-            #        if node.anchored:
-            #            ancher_element = True
-            #            break
-            #    if ancher_element:
-            #        for node in element.nodes:
-            #            node.stress = 0.0
-                
         except MapdlRuntimeError as e:
             print(f"MapdlRuntimeError: {e}")
             if created_mapdl:
@@ -271,21 +287,12 @@ class Mesh:
 
 
 if __name__ == "__main__":
-    # Example usage
-    # Define some nodes and elements
-    nodes = {
-        1: Node(1, [0.0, 0.0, 0.0]),
-        2: Node(2, [1.0, 0.0, 0.0]),
-        3: Node(3, [1.0, 1.0, 0.0]),
-        4: Node(4, [0.0, 1.0, 0.0]),
-        5: Node(5, [0.0, 0.0, 1.0]),
-        6: Node(6, [1.0, 0.0, 1.0]),
-        7: Node(7, [1.0, 1.0, 1.0]),
-        8: Node(8, [0.0, 1.0, 1.0]),
-    }
-    elements = {
-        1: Element(1, [nodes[1], nodes[2], nodes[3], nodes[4], nodes[5], nodes[6], nodes[7], nodes[8]]),
-    }
+    from core.IritModel import IritCModel
+    model = IritCModel("data/tile/CAD_model/model.exe", "data/tile/CAD_model/dims.json")
+    model.__exec__script__()
+    #volume = model.get_volume()
+    #print(f"Volume: {volume}")
+    nodes, elements = model.create_mesh(U=5, V=5, W=5)
     mesh = Mesh(nodes, elements)
     mesh.plot_mesh()
 

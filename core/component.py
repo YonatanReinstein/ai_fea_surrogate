@@ -1,13 +1,13 @@
 from torch_geometric.data import Data
 import torch
-from .IritModel import IIritModel
+from .IritModel import IritModelBase
 from .node import Node
 from .element import Element
 from .mesh import Mesh
 
 
 class Component:
-    def __init__(self, CAD_model: IIritModel, young: float, poisson: float):
+    def __init__(self, CAD_model: IritModelBase, young: float, poisson: float):
         self.CAD_model = CAD_model
         self.young = young
         self.poisson = poisson
@@ -105,13 +105,12 @@ class Component:
 
 
 if __name__ == "__main__":
-
-    model_path = "data/arm/CAD_model/model.irt"
-    json_path = "data/arm/CAD_model/dims.json"
-    cad_model = IIritModel(model_path, json_path)
+    from core.IritModel import IritCModel
+    model_path = "data/tile/CAD_model/model.exe"
+    json_path = "data/tile/CAD_model/dims.json"
+    cad_model = IritCModel(model_path, json_path)
     component = Component(cad_model, young=2.1e11, poisson=0.3)
-    geometry = "arm"
-
+    geometry = "tile"
     import importlib
     module = importlib.import_module(f"data.{geometry}.boundary_conditions")
     anchor_condition = module.anchor_condition
@@ -122,8 +121,10 @@ if __name__ == "__main__":
     component.mesh.anchor_nodes_by_condition(anchor_condition)
     component.mesh.apply_force_by_pattern(force_pattern)
     component.mesh.solve(young=2e11, poisson=0.3, screenshot_path=f"mapdl.png")
-    #component.mesh.plot_mesh()
-    print("Max stress:", component.mesh.get_max_stress())
+    print("volume:", component.get_volume())
+
+    component.mesh.plot_mesh()
+    #print("Max stress:", component.mesh.get_max_stress())
 
 
 
