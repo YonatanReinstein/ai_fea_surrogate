@@ -1,7 +1,6 @@
 from ansys.mapdl.core import MapdlPool
 import numpy as np
 
-
 def run_cube(mapdl, load):
     mapdl.clear()
     mapdl.prep7()
@@ -49,9 +48,9 @@ def run_cube(mapdl, load):
 
 if __name__ == "__main__":
     # --- create pool ---
-    pool = MapdlPool(n_instances=2, nproc=1)  # try 2–4
+    pool = MapdlPool(n_instances=1, nproc=1)  # try 2–4
 
-    loads = [1e5, 2e5]#, 3e5, 4e5, 5e5, 6e5]
+    loads = [1e5, 2e5, 3e5, 4e5]# 5e5, 6e5]
 
     results = pool.map(run_cube, loads)
 
