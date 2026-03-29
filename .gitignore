@@ -1,0 +1,8 @@
+.vscode/
+env/
+__pycache__/
+tmp/
+irit_c_programing/
+usful/
+screenshots/
+screenshots_gnn/
