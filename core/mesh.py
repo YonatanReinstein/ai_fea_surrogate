@@ -18,7 +18,6 @@ class Mesh:
     def solve(self, young: float, poisson: float, mapdl=None, screenshot_path: str = None):
         self.mapdl = mapdl
         created_mapdl = False
-        print(f"Starting FEA simulation...{time.time()}")
         try:
             if self.mapdl is None:
                 created_mapdl = True

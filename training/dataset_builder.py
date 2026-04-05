@@ -6,7 +6,7 @@ from ansys.mapdl.core.errors import MapdlRuntimeError
 def build_dataset(
     geometry: str,
     num_samples: int = 10,
-    seed: int = 45
+    seed: int = 42
 ):
     random.seed(seed)
     torch.manual_seed(seed)

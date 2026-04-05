@@ -68,10 +68,10 @@ class IritModelBase(abc.ABC):
                 dim_list.append(value)
         return dim_list
 
-    #def __del__(self):
-    #    shutil.rmtree(self.tmp_dir, ignore_errors=True)
-    #    if os.path.exists("tmp") and len(os.listdir("tmp")) == 0:
-    #        os.rmdir("tmp")
+    def __del__(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        if os.path.exists("tmp") and len(os.listdir("tmp")) == 0:
+            os.rmdir("tmp")
     
 
 
@@ -108,7 +108,9 @@ class IritCModel(IritModelBase):
                 "dims.irt"
             ],
             cwd=self.tmp_dir,
-            check=True
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
         subprocess.run(
             [str( Path(self.tmp_dir) / "model.exe")],

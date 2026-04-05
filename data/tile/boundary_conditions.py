@@ -8,7 +8,7 @@ def anchor_condition(node: Node, tol: float = 1e-3) -> bool:
 
 def force_pattern(node: Node, tol: float) -> List[float]:
     if abs(node.coords[0] - 1.0) < tol:
-        return [0.0, 0.0, -1e6]
+        return [0.0, 0.0, -1e7]
     return [0.0, 0.0, 0.0]
 
 def mesh_resolution() -> tuple[int]:

@@ -34,9 +34,8 @@ def train_gnn_model(
     # ----------------------------------------------------
     # Paths
     # ----------------------------------------------------
-    dataset_1_path = f"data/{geometry}/dataset/dataset_1.pt"
-    dataset_2_path = f"data/{geometry}/dataset/dataset_2.pt"
-    dataset_3_path = f"data/{geometry}/dataset/dataset_3.pt"
+    dataset_path = f"data/{geometry}/dataset/dataset.pt"
+
     save_dir       = f"data/{geometry}/checkpoints/"
     os.makedirs(save_dir, exist_ok=True)
 
@@ -50,13 +49,9 @@ def train_gnn_model(
     # Load dataset
     # ----------------------------------------------------
     # If you want to use dataset_a + dataset_b instead:
-    dataset_1 = torch.load(dataset_1_path, weights_only=False)
-    dataset_2 = torch.load(dataset_2_path, weights_only=False)
-    dataset_3 = torch.load(dataset_3_path, weights_only=False)
+    dataset = torch.load(dataset_path, weights_only=False)
 
-    dataset = dataset_1 + dataset_2 + dataset_3
-
-
+ 
     for sample in dataset:
         #convert force to MN
         sample.x[:, 3] = sample.x[:, 3] / 1e+6
@@ -65,7 +60,7 @@ def train_gnn_model(
 
     cleaned_dataset = []
     for data in dataset:
-        if data.max_stress < 700:
+        if data.max_stress < 100000:
             cleaned_dataset.append(data)
     dataset = cleaned_dataset
 
@@ -255,7 +250,7 @@ if __name__ == "__main__":
     parser.add_argument("--geometry", default="arm", type=str)
     parser.add_argument("--num_samples", default=3000, type=int)
     parser.add_argument("--epochs", default=300, type=int)
-    parser.add_argument("--lr", default=1e-4, type=float)
+    parser.add_argument("--lr", default=2e-3, type=float)
     parser.add_argument("--batch_size", default=5, type=int)
     parser.add_argument("--hidden_dim", default=128, type=int)
     parser.add_argument("--conv_layers", default=6, type=int)

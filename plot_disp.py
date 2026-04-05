@@ -1,11 +1,11 @@
 
 import torch
 
-dataset_path = "data/arm/dataset/dataset.pt"
+dataset_path = "data/tile/dataset/dataset.pt"
 dataset = torch.load(dataset_path, weights_only=False)  
 max_stress_values = []
 for data in dataset:
-    if data.max_stress < 150 * 1e6:
+    if data.max_stress <   10 * 1e10:
         max_stress_values.append(data.max_stress.item() / 1e+6)
 
 
