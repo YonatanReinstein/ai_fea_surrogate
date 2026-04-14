@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -N train_model
+#PBS -l select=1:ncpus=16:mem=32gb
+#PBS -l walltime=12:00:00
+#PBS -q workq
+
+cd $PBS_O_WORKDIR
+source env/bin/activate
+
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+export PYTHONUNBUFFERED=1
+
+python -u -m training.gnn_training \
+    --geometry tile \
+    --num_samples 2000 \
+    --epochs 300 \
+    --lr 2e-3 \
+    --batch_size 64 \
+    --hidden_dim 128 \
+    --conv_layers 6 \
+    > ${PBS_O_WORKDIR}/run_${PBS_JOBID}.log 2>&1
+M

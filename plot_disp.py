@@ -10,12 +10,15 @@ for data in dataset:
 
 
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 plt.figure(figsize=(8, 5))
 plt.hist(max_stress_values, bins=30, color='skyblue', edgecolor='black')
-plt.title("Distribution of Max Stress in Dataset")
+plt.title(f"Distribution of Max Stress {len(dataset)}")
 plt.xlabel("Max Stress (MPa)")
 plt.ylabel("Frequency")
 plt.grid(axis='y', alpha=0.75) 
-plt.show()
+plt.savefig("stress_distribution.png", dpi=150, bbox_inches="tight")
+print("Saved stress_distribution.png")
         

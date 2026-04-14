@@ -5,7 +5,15 @@ from ansys.mapdl.core import launch_mapdl
 import time
 from ansys.mapdl.core.errors import MapdlRuntimeError
 import pyvista as pv
-pv.OFF_SCREEN = True 
+pv.OFF_SCREEN = True
+
+try:
+    pv.start_xvfb()
+except OSError:
+    pass
+
+import warnings
+warnings.filterwarnings("ignore")
 
 class Mesh:
     def __init__(self, nodes, elements, tolerance=1e-9):
@@ -108,14 +116,13 @@ class Mesh:
                 node.stress = stress[node_id-1]
             # Create the plot but DO NOT display it
             plotter = self.mapdl.post_processing.plot_nodal_eqv_stress(
-                show=False,
                 return_plotter=True)
             #plotter.scene.camera.elevation = 270
             if screenshot_path is not None:
-                plotter.scene.screenshot(screenshot_path)
+                plotter.screenshot(screenshot_path)
             if created_mapdl:
                 self.mapdl.exit()
-            self.mapdl = None
+                self.mapdl = None
             self.solution_valid = True
 
         except MapdlRuntimeError as e:

@@ -8,3 +8,4 @@ optimization/screenshots_V1/*.png filter=lfs diff=lfs merge=lfs -text
 optimization/screenshots_V2/*.png filter=lfs diff=lfs merge=lfs -text
 animation/*.mp4 filter=lfs diff=lfs merge=lfs -text
 animation/frames/*.png filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text

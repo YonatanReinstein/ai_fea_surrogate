@@ -6,6 +6,9 @@ import subprocess
 import json
 from utils.read_inp import read_inp
 from pathlib import Path
+import platform
+
+
 
 
 class IritModelBase(abc.ABC):
@@ -48,14 +51,25 @@ class IritModelBase(abc.ABC):
         if not os.path.exists(f"{self.tmp_dir}/model.itd"):
             self.__exec__script__()
         workspace_dir = os.getcwd()
-        subprocess.run([
-            "powershell",
-            "-ExecutionPolicy", "Bypass",
-            "-File", f"{workspace_dir}/utils/itd_inp_converter.ps1",
-            "-U", str(U),
-            "-V", str(V),
-            "-W", str(W)
-        ], cwd=self.tmp_dir, check=True)
+
+        subprocess.run(
+            f"irit2inp -s {U} {V} {W} model.itd > model.inp",
+            cwd=self.tmp_dir,
+            check=True,
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        
+
+        #subprocess.run([
+        #    "powershell",
+        #    "-ExecutionPolicy", "Bypass",
+        #    "-File", f"{workspace_dir}/utils/itd_inp_converter.ps1",
+        #    "-U", str(U),
+        #    "-V", str(V),
+        #    "-W", str(W)
+        #], cwd=self.tmp_dir, check=True) 
         nodes, elements = read_inp(f"{self.tmp_dir}/model.inp")
         return nodes, elements
 
@@ -101,9 +115,14 @@ class IritCModel(IritModelBase):
 
     def __exec__script__(self):
         self.__set_irit_dims__()
+        system = platform.system()
+
+        irit_cmd = "irit64" if system == "Windows" else "irit"
+        model_name = "model.exe" if system == "Windows" else "model"
+
         subprocess.run(
             [
-                "irit64",
+                irit_cmd,
                 "-t",
                 "dims.irt"
             ],
@@ -112,11 +131,14 @@ class IritCModel(IritModelBase):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
+
         subprocess.run(
-            [str( Path(self.tmp_dir) / "model.exe")],
+            [f"./{model_name}"],
             cwd=self.tmp_dir,
             check=True
         )
+
+
 
 
 if __name__ == "__main__":

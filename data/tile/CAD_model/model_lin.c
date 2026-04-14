@@ -6,6 +6,7 @@
 ******************************************************************************
 * Written by:  Gershon Elber				Ver 1.0, Dec 2017    *
 *****************************************************************************/
+
 #include "inc_irit/irit_sm.h"
 #include "inc_irit/iritprsr.h"
 #include "inc_irit/allocate.h"
@@ -20,7 +21,7 @@ typedef CagdRType(*LclThicknessFuncCBType)(CagdRType u,
     CagdRType w);
 
 typedef struct UserMicroLocalDataStruct { /* User specific data in CB funcs. */
-    TrivTVStruct* DefMap;
+    IritTrivTVStruct* DefMap;
     CagdRType BndryThickness;
     LclThicknessFuncCBType ThicknessFuncCB;
 } UserMicroLocalDataStruct;
@@ -29,13 +30,13 @@ static CagdRType UniformTilingCB(CagdRType u, CagdRType v, CagdRType w);
 static CagdRType* read_dims(int* ULength, int* VLength, int* WLength);
 
 static int PreProcessTile1FaceParam(
-    const UserMicroPreProcessTileCBStruct* CBData,
-    TrivTVBndryType Bndry,
+    const IritUserMicroPreProcessTileCBStruct* CBData,
+    IritTrivTVBndryType Bndry,
     CagdRType BndryThickness,
     LclThicknessFuncCBType ThicknessFuncCB,
-    UserMicroTileBndryPrmStruct* BPrm);
-static IPObjectStruct* PreProcessTile(IPObjectStruct* Tile,
-    UserMicroPreProcessTileCBStruct* CBData);
+    IritUserMicroTileBndryPrmStruct* BPrm);
+static IritPrsrObjectStruct* PreProcessTile(IritPrsrObjectStruct* Tile,
+    IritUserMicroPreProcessTileCBStruct* CBData);
 static void GenerateMicroStructures(void);
 
 static CagdRType UniformTilingCB(CagdRType u, CagdRType v, CagdRType w)
@@ -45,10 +46,10 @@ static CagdRType UniformTilingCB(CagdRType u, CagdRType v, CagdRType w)
 
     CagdRType* ctrl = read_dims(&ULength, &VLength, &WLength);
 
-    TrivTVStruct* TV = TrivBspTVNew(
+    IritTrivTVStruct* TV = IritTrivBspTVNew(
         ULength, VLength, WLength,
         UOrder, VOrder, WOrder,
-        CAGD_PT_E1_TYPE
+        IRIT_CAGD_PT_E1_TYPE
     );
 
     int knotU = ULength + UOrder;  // total number of knots
@@ -91,43 +92,31 @@ static CagdRType UniformTilingCB(CagdRType u, CagdRType v, CagdRType w)
         }
     }
 
-    CagdRType UMin;
-    CagdRType UMax;
-    CagdRType VMin;
-    CagdRType VMax;
-    CagdRType WMin;
-    CagdRType WMax;
-
-    TrivTVDomain(TV, &UMin, &UMax, &VMin, &VMax, &WMin, &WMax);
-
-    printf("TV domain: U [%f, %f], V [%f, %f], W [%f, %f]\n",
-        UMin, UMax, VMin, VMax, WMin, WMax);
-
- 
-
-    //TrivTVStruct* TV = IritTrivBzrTVNew(
-    //    ULength, VLength, WLength,
-    //    CAGD_PT_E1_TYPE
-    //);
 
     int n = VLength * ULength * WLength;
-    printf("ULength: %d, VLength: %d, WLength: %d\n", ULength, VLength, WLength);
 
-
-    printf("n: %d\n", n);
-    for (int i = 0; i < ULength + UOrder; i++)
-        printf("U knot[%d] = %f\n", i, TV->UKnotVector[i]);
-
-
-    /* Copy all control points at once */
-    memcpy(TV->Points[1], ctrl, sizeof(CagdRType) * n);
+    /* IRIT stores Points[1] in W-outermost, V-middle, U-innermost order.
+       ctrl (from dims.itd) is in U-outermost, V-middle, W-innermost order.
+       Transpose U<->W when copying. */
+    {
+        int iu, iv, iw;
+        for (iu = 0; iu < ULength; iu++)
+            for (iv = 0; iv < VLength; iv++)
+                for (iw = 0; iw < WLength; iw++) {
+                    int ctrl_idx = iu * VLength * WLength + iv * WLength + iw;
+                    int irit_idx = iw * VLength * ULength + iv * ULength + iu;
+                    TV->Points[1][irit_idx] = ctrl[ctrl_idx];
+                }
+    }
 
 
 
     /* Evaluate the trivariate */
-    CagdRType* res = TrivTVEval2Malloc(TV, u, v, w);
-    TrivTVFree(TV);
+    CagdRType* res = IritTrivTVEval2Malloc(TV, u, v, w);
+    IritTrivTVFree(TV);
     IritFree(ctrl);
+
+    //printf("Tile (%.3f, %.3f %.3f) eval %.3f\r\n", u , v, w, res[1]);
 
     return res[1];
 }
@@ -150,11 +139,11 @@ static CagdRType UniformTilingCB(CagdRType u, CagdRType v, CagdRType w)
 *   int:
 *****************************************************************************/
 static int PreProcessTile1FaceParam(
-    const UserMicroPreProcessTileCBStruct* CBData,
-    TrivTVBndryType Bndry,
+    const IritUserMicroPreProcessTileCBStruct* CBData,
+    IritTrivTVBndryType Bndry,
     CagdRType BndryThickness,
     LclThicknessFuncCBType ThicknessFuncCB,
-    UserMicroTileBndryPrmStruct* BPrm)
+    IritUserMicroTileBndryPrmStruct* BPrm)
 {
     int i;
     CagdRType u, v, w;
@@ -164,35 +153,35 @@ static int PreProcessTile1FaceParam(
         * DefMapDmnMin = CBData->DefMapDmnMin,
         * DefMapDmnMax = CBData->DefMapDmnMax;
 
-    IRIT_ZAP_MEM(BPrm, sizeof(UserMicroTileBndryPrmStruct));
+    IRIT_ZAP_MEM(BPrm, sizeof(IritUserMicroTileBndryPrmStruct));
 
     switch (Bndry) {
-    case TRIV_U_MIN_BNDRY:
+    case IRIT_TRIV_U_MIN_BNDRY:
         u = LclMinDmn[0];
         v = (LclMinDmn[1] + LclMaxDmn[1]) * 0.5;
         w = (LclMinDmn[2] + LclMaxDmn[2]) * 0.5;
         break;
-    case TRIV_U_MAX_BNDRY:
+    case IRIT_TRIV_U_MAX_BNDRY:
         u = LclMaxDmn[0];
         v = (LclMinDmn[1] + LclMaxDmn[1]) * 0.5;
         w = (LclMinDmn[2] + LclMaxDmn[2]) * 0.5;
         break;
-    case TRIV_V_MIN_BNDRY:
+    case IRIT_TRIV_V_MIN_BNDRY:
         u = (LclMinDmn[0] + LclMaxDmn[0]) * 0.5;
         v = LclMinDmn[1];
         w = (LclMinDmn[2] + LclMaxDmn[2]) * 0.5;
         break;
-    case TRIV_V_MAX_BNDRY:
+    case IRIT_TRIV_V_MAX_BNDRY:
         u = (LclMinDmn[0] + LclMaxDmn[0]) * 0.5;
         v = LclMaxDmn[1];
         w = (LclMinDmn[2] + LclMaxDmn[2]) * 0.5;
         break;
-    case TRIV_W_MIN_BNDRY:
+    case IRIT_TRIV_W_MIN_BNDRY:
         u = (LclMinDmn[0] + LclMaxDmn[0]) * 0.5;
         v = (LclMinDmn[1] + LclMaxDmn[1]) * 0.5;
         w = LclMinDmn[2];
         break;
-    case TRIV_W_MAX_BNDRY:
+    case IRIT_TRIV_W_MAX_BNDRY:
         u = (LclMinDmn[0] + LclMaxDmn[0]) * 0.5;
         v = (LclMinDmn[1] + LclMaxDmn[1]) * 0.5;
         w = LclMaxDmn[2];
@@ -209,22 +198,22 @@ static int PreProcessTile1FaceParam(
     BPrm->OuterRadius = ThicknessFuncCB(u, v, w);
 
     switch (Bndry) {
-    case TRIV_U_MIN_BNDRY:
-    case TRIV_U_MAX_BNDRY:
+    case IRIT_TRIV_U_MIN_BNDRY:
+    case IRIT_TRIV_U_MAX_BNDRY:
         BPrm->Bndry[0] = ThicknessFuncCB(u, LclMinDmn[1], LclMinDmn[2]);
         BPrm->Bndry[1] = ThicknessFuncCB(u, LclMaxDmn[1], LclMinDmn[2]);
         BPrm->Bndry[2] = ThicknessFuncCB(u, LclMinDmn[1], LclMaxDmn[2]);
         BPrm->Bndry[3] = ThicknessFuncCB(u, LclMaxDmn[1], LclMaxDmn[2]);
         break;
-    case TRIV_V_MIN_BNDRY:
-    case TRIV_V_MAX_BNDRY:
+    case IRIT_TRIV_V_MIN_BNDRY:
+    case IRIT_TRIV_V_MAX_BNDRY:
         BPrm->Bndry[0] = ThicknessFuncCB(LclMinDmn[0], v, LclMinDmn[2]);
         BPrm->Bndry[1] = ThicknessFuncCB(LclMaxDmn[0], v, LclMinDmn[2]);
         BPrm->Bndry[2] = ThicknessFuncCB(LclMinDmn[0], v, LclMaxDmn[2]);
         BPrm->Bndry[3] = ThicknessFuncCB(LclMaxDmn[0], v, LclMaxDmn[2]);
         break;
-    case TRIV_W_MIN_BNDRY:
-    case TRIV_W_MAX_BNDRY:
+    case IRIT_TRIV_W_MIN_BNDRY:
+    case IRIT_TRIV_W_MAX_BNDRY:
         BPrm->Bndry[0] = ThicknessFuncCB(LclMinDmn[0], LclMinDmn[1], w);
         BPrm->Bndry[1] = ThicknessFuncCB(LclMaxDmn[0], LclMinDmn[1], w);
         BPrm->Bndry[2] = ThicknessFuncCB(LclMinDmn[0], LclMaxDmn[1], w);
@@ -253,25 +242,25 @@ static int PreProcessTile1FaceParam(
 * RETURN VALUE:
 *   IPObjectStruct *:
 *****************************************************************************/
-static IPObjectStruct* PreProcessTile(IPObjectStruct* Tile,
-    UserMicroPreProcessTileCBStruct* CBData)
+static IritPrsrObjectStruct* PreProcessTile(IritPrsrObjectStruct* Tile,
+    IritUserMicroPreProcessTileCBStruct* CBData)
 {
     UserMicroLocalDataStruct
         * LclData = (UserMicroLocalDataStruct*)CBData->CBFuncData;
     CagdRType UMin, UMax, VMin, VMax, WMin, WMax,
-//        * LclMinDmn = CBData->TileLclDmnMin,
-//        * LclMaxDmn = CBData->TileLclDmnMax,
+        * LclMinDmn = CBData->TileLclDmnMin,
+        * LclMaxDmn = CBData->TileLclDmnMax,
         BndryThickness = LclData->BndryThickness;
-    GMBBBboxStruct BBox;
+    IritGeomBBBboxStruct BBox;
     LclThicknessFuncCBType
         ThicknessFuncCB = LclData->ThicknessFuncCB;
-    UserMicroTileBndryPrmStruct UMinPrms, UMaxPrms,
+    IritUserMicroTileBndryPrmStruct UMinPrms, UMaxPrms,
         VMinPrms, VMaxPrms,
         WMinPrms, WMaxPrms;
 
     assert(Tile == NULL);                          /* We build tiles here... */
 
-    TrivTVDomain(LclData->DefMap, &UMin, &UMax, &VMin, &VMax, &WMin, &WMax);
+    IritTrivTVDomain(LclData->DefMap, &UMin, &UMax, &VMin, &VMax, &WMin, &WMax);
 
     //fprintf(stderr, "Tile[%d,%d,%d] from (%.3f, %.3f %.3f) to (%.3f, %.3f, %.3f)\r\n",
     //    CBData->TileIdxs[0],
@@ -284,24 +273,24 @@ static IPObjectStruct* PreProcessTile(IPObjectStruct* Tile,
     //    LclMaxDmn[1],
     //    LclMaxDmn[2]);
 
-    if (!PreProcessTile1FaceParam(CBData, TRIV_U_MIN_BNDRY,
+    if (!PreProcessTile1FaceParam(CBData, IRIT_TRIV_U_MIN_BNDRY,
         0.0, ThicknessFuncCB, &UMinPrms) ||
-        !PreProcessTile1FaceParam(CBData, TRIV_U_MAX_BNDRY,
+        !PreProcessTile1FaceParam(CBData, IRIT_TRIV_U_MAX_BNDRY,
             0.0, ThicknessFuncCB, &UMaxPrms) ||
-        !PreProcessTile1FaceParam(CBData, TRIV_V_MIN_BNDRY,
+        !PreProcessTile1FaceParam(CBData, IRIT_TRIV_V_MIN_BNDRY,
             0.0, ThicknessFuncCB, &VMinPrms) ||
-        !PreProcessTile1FaceParam(CBData, TRIV_V_MAX_BNDRY,
+        !PreProcessTile1FaceParam(CBData, IRIT_TRIV_V_MAX_BNDRY,
             0.0, ThicknessFuncCB, &VMaxPrms) ||
-        !PreProcessTile1FaceParam(CBData, TRIV_W_MIN_BNDRY,
+        !PreProcessTile1FaceParam(CBData, IRIT_TRIV_W_MIN_BNDRY,
             0.0, ThicknessFuncCB, &WMinPrms) ||
-        !PreProcessTile1FaceParam(CBData, TRIV_W_MAX_BNDRY,
+        !PreProcessTile1FaceParam(CBData, IRIT_TRIV_W_MAX_BNDRY,
             0.0, ThicknessFuncCB, &WMaxPrms)) {
         return NULL;
     }
 
-    Tile = UserMicro3DCrossTile(&UMinPrms, &UMaxPrms, &VMinPrms, &VMaxPrms,
+    Tile = IritUserMicro3DCrossTile(&UMinPrms, &UMaxPrms, &VMinPrms, &VMaxPrms,
         &WMinPrms, &WMaxPrms, FALSE, NULL);
-    GMBBComputeBboxObject(Tile, &BBox, FALSE);
+    IritGeomBBComputeBboxObject(Tile, &BBox, FALSE);
     if (BBox.Min[0] < 0.0 || BBox.Max[0] > 1.0 ||
         BBox.Min[1] < 0.0 || BBox.Max[1] > 1.0 ||
         BBox.Min[2] < 0.0 || BBox.Max[2] > 1.0) {
@@ -311,15 +300,15 @@ static IPObjectStruct* PreProcessTile(IPObjectStruct* Tile,
 #define DEBUG_VERIFY_JACOBIAN
 #ifdef DEBUG_VERIFY_JACOBIAN
     {
-        TrivTVStruct* TV;
+        IritTrivTVStruct* TV;
 
         for (TV = Tile->U.Trivars; TV != NULL; TV = TV->Pnext) {
-            MvarMVStruct
-                * J = MvarCalculateTVJacobian(TV);
+            IritMvarMVStruct
+                * J = IritMvarCalculateTVJacobian(TV);
             CagdBBoxStruct BBox;
 
-            MvarMVBBox(J, &BBox);
-            MvarMVFree(J);
+            IritMvarMVBBox(J, &BBox);
+            IritMvarMVFree(J);
             if (BBox.Min[0] * BBox.Max[0] < 0.0) {
                 fprintf(stderr, "Warning: Negative Jacobian tile found\n");
                 //IritTrivDbg(TV);
@@ -328,25 +317,25 @@ static IPObjectStruct* PreProcessTile(IPObjectStruct* Tile,
     }
 #endif /* DEBUG_VERIFY_JACOBIAN */
 
-    Tile = GMTransformObjectInPlace(Tile, CBData->Mat);
+    Tile = IritGeomTransformObjectInPlace(Tile, CBData->Mat);
 
 #define DEBUG_USER_MS_MAKE_TV_OBJS
 #ifdef DEBUG_USER_MS_MAKE_TV_OBJS
     {
-        IPObjectStruct* PTmp;
-        TrivTVStruct* TV, * BTV,
+        IritPrsrObjectStruct* PTmp;
+        IritTrivTVStruct* TV, * BTV,
             * BzrTVs = NULL;
 
         for (TV = Tile->U.Trivars; TV != NULL; TV = TV->Pnext) {
-            if (TRIV_IS_BEZIER_TV(TV)) {
-                BTV = TrivTVCopy(TV);
+            if (IRIT_TRIV_IS_BEZIER_TV(TV)) {
+                BTV = IritTrivTVCopy(TV);
                 IRIT_LIST_PUSH(BTV, BzrTVs);
             }
             else
-                BzrTVs = CagdListAppend(TrivCnvrtBsp2BzrTV(TV), BzrTVs);
+                BzrTVs = IritCagdListAppend(IritTrivCnvrtBsp2BzrTV(TV), BzrTVs);
         }
-        PTmp = IPLnkListToListObject(BzrTVs, IP_OBJ_TRIVAR);
-        IPFreeObject(Tile);
+        PTmp = IritPrsrLnkListToListObject(BzrTVs, IRIT_PRSR_OBJ_TRIVAR);
+        IritPrsrFreeObject(Tile);
         Tile = PTmp;
     }
 #endif /* DEBUG_USER_MS_MAKE_TV_OBJS */
@@ -357,17 +346,17 @@ static IPObjectStruct* PreProcessTile(IPObjectStruct* Tile,
 
 static CagdRType* read_dims(int* ULength, int* VLength, int* WLength)
 {
-    IPObjectStruct* PObj;
+    IritPrsrObjectStruct* PObj;
     const char* DimsFileName = "dims.itd";
 
-    PObj = IPGetDataFiles(&DimsFileName, 1, FALSE, FALSE);
+    PObj = IritPrsrGetDataFiles(&DimsFileName, 1, FALSE, FALSE);
     if (PObj == NULL) {
         fprintf(stderr, "Failed to load dims.itd\n");
         return NULL;
     }
 
     /* First value: ULength */
-    if (PObj == NULL || !IP_IS_NUM_OBJ(PObj)) {
+    if (PObj == NULL || !IRIT_PRSR_IS_NUM_OBJ(PObj)) {
         fprintf(stderr, "First object is missing or not numeric\n");
         return NULL;
     }
@@ -375,7 +364,7 @@ static CagdRType* read_dims(int* ULength, int* VLength, int* WLength)
     PObj = PObj->Pnext;
 
     /* Second value: VLength */
-    if (PObj == NULL || !IP_IS_NUM_OBJ(PObj)) {
+    if (PObj == NULL || !IRIT_PRSR_IS_NUM_OBJ(PObj)) {
         fprintf(stderr, "Second object is missing or not numeric\n");
         return NULL;
     }
@@ -383,7 +372,7 @@ static CagdRType* read_dims(int* ULength, int* VLength, int* WLength)
     PObj = PObj->Pnext;
 
     /* Third value: WLength */
-    if (PObj == NULL || !IP_IS_NUM_OBJ(PObj)) {
+    if (PObj == NULL || !IRIT_PRSR_IS_NUM_OBJ(PObj)) {
         fprintf(stderr, "Third object is missing or not numeric\n");
         return NULL;
     }
@@ -402,7 +391,7 @@ static CagdRType* read_dims(int* ULength, int* VLength, int* WLength)
     }
 
     for (i = 0; i < n; i++) {
-        if (PObj == NULL || !IP_IS_NUM_OBJ(PObj)) {
+        if (PObj == NULL || !IRIT_PRSR_IS_NUM_OBJ(PObj)) {
             fprintf(stderr, "Invalid data at %d\n", i);
             IritFree(ctrl);
             return NULL;
@@ -429,29 +418,29 @@ static void GenerateMicroStructures(void)
 {
     const char* InputDefMap = "outline.itd";
     int i, Handler;
-    IPObjectStruct* MS, * DefMapPObj;
-    MvarMVStruct* DeformMV;
-    TrivTVStruct* TVMap;
-    UserMicroParamStruct MSParam;
-    UserMicroRegularParamStruct* MSRegularParam;
+    IritPrsrObjectStruct* MS, * DefMapPObj;
+    IritMvarMVStruct* DeformMV;
+    IritTrivTVStruct* TVMap;
+    IritUserMicroParamStruct MSParam;
+    IritUserMicroRegularParamStruct* MSRegularParam;
     UserMicroLocalDataStruct LclData;
-    printf("Loading deformation function...\n");
+    //printf("Loading deformation function...\n");
 
-    DefMapPObj = IPGetDataFiles(&InputDefMap, 1, FALSE, FALSE);
+    DefMapPObj = IritPrsrGetDataFiles(&InputDefMap, 1, FALSE, FALSE);
     if (DefMapPObj == NULL) {
         fprintf(stderr, "Failed to load the deformation function.\n");
         return;
     }
-    assert(IP_IS_TRIVAR_OBJ(DefMapPObj));
+    assert(IRIT_PRSR_IS_TRIVAR_OBJ(DefMapPObj));
     TVMap = DefMapPObj->U.Trivars;
-    DeformMV = MvarCnvrtTVToMV(TVMap);
+    DeformMV = IritMvarCnvrtTVToMV(TVMap);
 
     /* Create the structure to be passed to the callback function. */
     LclData.DefMap = TVMap;
     LclData.BndryThickness = 3;
 
-    IRIT_ZAP_MEM(&MSParam, sizeof(UserMicroParamStruct));
-    MSParam.TilingType = USER_MICRO_TILE_REGULAR;
+    IRIT_ZAP_MEM(&MSParam, sizeof(IritUserMicroParamStruct));
+    MSParam.TilingType = IRIT_USER_MICRO_TILE_REGULAR;
     MSParam.DeformMV = DeformMV;
     MSParam.ApproxLowOrder = 4;
 
@@ -482,17 +471,17 @@ static void GenerateMicroStructures(void)
 
     LclData.ThicknessFuncCB = UniformTilingCB;
 
-    MS = UserMicroStructComposition(&MSParam);
+    MS = IritUserMicroStructComposition(&MSParam);
     int tiles_num = MSRegularParam->TilingSteps[0].TilesPerIntervals[0] * MSRegularParam->TilingSteps[1].TilesPerIntervals[0] * MSRegularParam->TilingSteps[2].TilesPerIntervals[0];
     int params_per_tile = 7;
     CagdRType volume = 0;
     int index = 0;
     while (index < tiles_num) {
-        IPObjectStruct* MV = MS->U.Lst.PObjList[index];
+        IritPrsrObjectStruct* MV = MS->U.Lst.PObjList[index];
         int j = 0;
         while (j < params_per_tile) {
-            IPObjectStruct* MQ = MV->U.Lst.PObjList[j];
-            volume += fabs(TrivTVVolume(MQ->U.Trivars, TRUE));
+            IritPrsrObjectStruct* MQ = MV->U.Lst.PObjList[j];
+            volume += fabs(IritTrivTVVolume(MQ->U.Trivars, TRUE));
             j++;
         }
         index++;
@@ -506,23 +495,23 @@ static void GenerateMicroStructures(void)
     fprintf(fp, "volume %f\n", volume);
     fclose(fp);
 
-    Handler = IPOpenDataFile("model.itd", FALSE, 1);
+    Handler = IritPrsrOpenDataFile("model.itd", FALSE, 1);
     if (MS != NULL) {
-        IPPutObjectToHandler(Handler, MS);
-        IPFreeObject(MS);
+        IritPrsrPutObjectToHandler(Handler, MS);
+        IritPrsrFreeObject(MS);
     }
-    IPCloseStream(Handler, TRUE);
+    IritPrsrCloseStream(Handler, TRUE);
 
 
     /** End **/
-    MvarMVFree(DeformMV);
-    UserMicroTileFree(MSRegularParam->Tile);
+    IritMvarMVFree(DeformMV);
+    IritUserMicroTileFree(MSRegularParam->Tile);
 
     for (i = 0; i < 3; ++i)
         IritFree(MSRegularParam->TilingSteps[i].TilesPerIntervals);
 
     /* Free the structure for the call back function. */
-    TrivTVFree(TVMap);
+    IritTrivTVFree(TVMap);
 }
 
 int main(int argc, char** argv)

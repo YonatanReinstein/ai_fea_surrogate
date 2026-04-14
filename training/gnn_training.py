@@ -30,6 +30,7 @@ def train_gnn_model(
     conv_layers: int = 6
 ):
     torch.manual_seed(42)
+    torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
 
     # ----------------------------------------------------
     # Paths
@@ -117,8 +118,10 @@ def train_gnn_model(
     # ----------------------------------------------------
     # DataLoaders
     # ----------------------------------------------------
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
+                              num_workers=4, persistent_workers=True)
+    val_loader   = DataLoader(val_set, batch_size=batch_size, shuffle=False,
+                              num_workers=2, persistent_workers=True)
 
     # ----------------------------------------------------
     # Model setup
@@ -249,7 +252,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--geometry", default="arm", type=str)
     parser.add_argument("--num_samples", default=3000, type=int)
-    parser.add_argument("--epochs", default=300, type=int)
+    parser.add_argument("--epochs", default=5, type=int)
     parser.add_argument("--lr", default=2e-3, type=float)
     parser.add_argument("--batch_size", default=5, type=int)
     parser.add_argument("--hidden_dim", default=128, type=int)

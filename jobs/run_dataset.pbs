@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -N dataset_builder
+#PBS -l select=1:ncpus=55:mem=150gb
+#PBS -l walltime=24:00:00
+#PBS -q workq
+
+cd $PBS_O_WORKDIR
+source env/bin/activate
+
+# Kill any stale MAPDL processes and clean up stale lock files from previous jobs
+pkill -u $USER -f ansys251 || true
+sleep 5
+rm -rf data/tile/Instance_*/
+
+python -m training.dataset_builder \
+    --geometry tile \
+    --num_samples 6000 \
+    --pool_size 51 \
+    --nproc 1 \
+    --seed 42 \
+    > ${PBS_O_WORKDIR}/run_${PBS_JOBID}.log 2>&1
+
+rm -rf data/tile/Instance_*/

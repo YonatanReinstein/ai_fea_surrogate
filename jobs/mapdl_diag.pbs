@@ -1,0 +1,19 @@
+#!/bin/bash
+#PBS -N mapdl_diag
+#PBS -l select=1:ncpus=4:mem=8gb
+#PBS -l walltime=00:10:00
+#PBS -q workq
+
+cd $PBS_O_WORKDIR
+source env/bin/activate
+
+echo "=== hostname ===" && hostname
+echo "=== which ansys251 ===" && which ansys251
+echo "=== ansys251 -ver ===" && ansys251 -ver 2>&1 || true
+echo "=== license check ===" && python -c "
+from ansys.mapdl.core import launch_mapdl
+mapdl = launch_mapdl(license_server_check=True, start_timeout=60)
+print('MAPDL version:', mapdl.version)
+mapdl.exit()
+print('DONE')
+" 2>&1

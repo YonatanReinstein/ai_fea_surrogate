@@ -1,4 +1,6 @@
 import torch
+import torch.multiprocessing as mp
+mp.set_start_method('spawn', force=True)
 from abc import ABC
 from utils.gnn_surrogate import GNN
 from evaluators.base_evaluator import BaseEvaluator

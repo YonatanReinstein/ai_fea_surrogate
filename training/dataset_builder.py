@@ -1,12 +1,67 @@
-import json, random, torch, os, importlib
+import json, random, torch, os, importlib, signal, sys, time
+from datetime import datetime, timedelta
+print("Starting dataset_builder.py", flush=True)
+import socket
+print(f"Running on hostname: {socket.gethostname()}", flush=True)
+os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
+os.environ["ANSYS251_DIR"] = "/ansys_inc/v251/ansys/bin"
+
+_pool_ref = None
+
+def _cleanup_and_exit(signum, frame):
+    print(f"Signal {signum} received, shutting down pool...", flush=True)
+    if _pool_ref is not None:
+        try:
+            _pool_ref.exit()
+        except Exception:
+            pass
+    sys.exit(1)
+
+signal.signal(signal.SIGTERM, _cleanup_and_exit)
+signal.signal(signal.SIGINT, _cleanup_and_exit)
+
+import ansys.tools.path
+original_version_from_path = ansys.tools.path.version_from_path
+def patched_version_from_path(product, path):
+    if path and "ansys" in path.lower():
+        return 251
+    return original_version_from_path(product, path)
+ansys.tools.path.version_from_path = patched_version_from_path
+ansys.tools.path.path.version_from_path = patched_version_from_path
+
+
+# Patch pool's launch_mapdl to retry on failure (pool only tries once by default).
+# Transient failures (license briefly unavailable, load spike) will recover on retry.
+import ansys.mapdl.core.pool as _mapdl_pool
+_orig_launch_mapdl = _mapdl_pool.launch_mapdl
+def _patched_launch_mapdl(*args, **kwargs):
+    run_location = kwargs.get('run_location')
+    max_retries = 3
+    for attempt in range(max_retries):
+        if run_location:
+            os.makedirs(run_location, exist_ok=True)
+        try:
+            return _orig_launch_mapdl(*args, **kwargs)
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"MAPDL launch attempt {attempt+1}/{max_retries} failed: {e}. Retrying in 15s...", flush=True)
+                time.sleep(15)
+            else:
+                raise
+_mapdl_pool.launch_mapdl = _patched_launch_mapdl
+
 from core.component import Component
 from core.IritModel import IritModel, IritCModel
+from ansys.mapdl.core import MapdlPool
 from ansys.mapdl.core.errors import MapdlRuntimeError
+
 
 def build_dataset(
     geometry: str,
     num_samples: int = 10,
-    seed: int = 42
+    seed: int = 42,
+    pool_size: int = 4,
+    nproc: int = 3
 ):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -43,47 +98,144 @@ def build_dataset(
     with open(dims_json_path, "r") as f:
         dims_template = json.load(f)
 
-    for i in range(num_samples):
-        while True:
-            try:
-                dims = {k: random.uniform(v["min"], v["max"]) for k, v in dims_template.items()}
-                if os.path.isfile(os.path.join(model_path, "model.exe")):
-                    CAD_model = IritCModel(model_path + "/model.exe", dims_dict=dims)
-                else:
-                    CAD_model = IritModel(model_path + "/model.irt", dims_dict=dims)
+    module = importlib.import_module(f"data.{geometry}.boundary_conditions")
+    anchor_condition = module.anchor_condition
+    force_pattern = module.force_pattern
+    mesh_resolution = module.mesh_resolution
 
-                if i < start_idx:
-                    print(f"Skipping sample {i + 1} (already in dataset)")
-                    break
+    # Generate ALL dims upfront in the main process from the seeded RNG.
+    # When resuming, start at dim index start_idx*2 so resumed runs never
+    # overlap with dims (including buffer) used by previous runs.
+    dim_offset = start_idx * 2
+    samples_needed = num_samples - start_idx
+    all_dims = [
+        {k: random.uniform(v["min"], v["max"]) for k, v in dims_template.items()}
+        for _ in range(dim_offset + samples_needed)
+    ]
+    print(f"Generated dims [{dim_offset}..{dim_offset + samples_needed - 1}] (offset={dim_offset})", flush=True)
+
+    def run_single_sample(mapdl, dim_idx):
+        dims = all_dims[dim_idx]
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                exe_path = os.path.join(model_path, "model")
+                exe_win_path = os.path.join(model_path, "model.exe")
+
+                if os.path.isfile(exe_path):
+                    CAD_model = IritCModel(exe_path, dims_dict=dims)
+                elif os.path.isfile(exe_win_path):
+                    CAD_model = IritCModel(exe_win_path, dims_dict=dims)
+                else:
+                    CAD_model = IritModel(os.path.join(model_path, "model.irt"), dims_dict=dims)
+
                 comp = Component(CAD_model, young=young, poisson=poisson)
-                module = importlib.import_module(f"data.{geometry}.boundary_conditions")
-                anchor_condition = module.anchor_condition
-                force_pattern = module.force_pattern
-                mesh_resolution = module.mesh_resolution
                 U, V, W = mesh_resolution()
                 comp.generate_mesh(U=U, V=V, W=W)
                 comp.mesh.anchor_nodes_by_condition(anchor_condition)
-                comp.mesh.apply_force_by_pattern(force_pattern) 
-                comp.ansys_sim(screenshot_path=screenshots_dir)
+                comp.mesh.apply_force_by_pattern(force_pattern)
+                comp.ansys_sim(mapdl=mapdl, screenshot_path=None)
+
                 data = comp.to_graph_with_labels()
-                comp.mesh.plot_mesh(save_path=f"{screenshots_dir}/mesh_{i+1}.png")
-                dataset.append(data)
-                metadata.append({
-                    "id": i,
+                return dim_idx, data, {
+                    "id": dim_idx,
                     **dims,
                     "volume": comp.get_volume(),
                     "max_stress": comp.mesh.get_max_stress(),
-                })
-                print(f"[{i+1:02d}/{num_samples}] {geometry}: σmax={comp.mesh.get_max_stress():.2e}")
-                if (i+1) % 10 == 0:
+                }
+            except MapdlRuntimeError as e:
+                print(f"dim_idx={dim_idx} failed (attempt {attempt+1}/{max_retries}): {e}. Retrying...", flush=True)
+                try:
+                    mapdl.clear()
+                except Exception as clear_err:
+                    # Instance is permanently dead. Kill it so the pool monitor
+                    # respawns it, then return a failure marker so the worker
+                    # thread stays alive and the sample can be re-queued.
+                    print(f"dim_idx={dim_idx} MAPDL instance unrecoverable: {clear_err}", flush=True)
+                    try:
+                        mapdl.exit()
+                    except Exception:
+                        pass
+                    return dim_idx, None, None
+            except Exception as e:
+                print(f"dim_idx={dim_idx} unexpected error (attempt {attempt+1}/{max_retries}): {e}. Retrying...", flush=True)
+                try:
+                    mapdl.clear()
+                except Exception as clear_err:
+                    print(f"dim_idx={dim_idx} MAPDL instance unrecoverable: {clear_err}", flush=True)
+                    try:
+                        mapdl.exit()
+                    except Exception:
+                        pass
+                    return dim_idx, None, None
+        print(f"dim_idx={dim_idx} failed after {max_retries} attempts, skipping.", flush=True)
+        return dim_idx, None, None
+
+    print(f"Creating MapdlPool with pool_size={pool_size}, nproc={nproc}, run_location={base_path}", flush=True)
+    try:
+        pool = MapdlPool(n_instances=pool_size, nproc=nproc, run_location=base_path, license_server_check=False, start_timeout=120)
+        global _pool_ref
+        _pool_ref = pool
+        print("MapdlPool created successfully, starting pool.map()...", flush=True)
+    except Exception as e:
+        print(f"ERROR creating MapdlPool: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        raise
+
+    try:
+        pending = list(range(dim_offset, dim_offset + samples_needed))
+        completed = start_idx
+        t_start = time.time()
+        max_passes = 3
+
+        for pass_idx in range(max_passes):
+            if not pending:
+                break
+            print(f"Pass {pass_idx+1}/{max_passes}: processing {len(pending)} samples...", flush=True)
+            failed_this_pass = []
+
+            for submitted_idx, result in zip(pending, pool.map(run_single_sample, pending)):
+                # run_single_sample always returns (dim_idx, data_or_None, meta_or_None);
+                # None-tuple indicates failure/skip (either out-of-retries or dead instance).
+                if result is None or result[1] is None:
+                    failed_this_pass.append(submitted_idx)
+                    print(f"dim_idx={submitted_idx} skipped, will retry in next pass.", flush=True)
+                    continue
+                dim_idx, data, meta = result
+                dataset.append(data)
+                metadata.append(meta)
+                completed += 1
+
+                elapsed = time.time() - t_start
+                done_so_far = completed - start_idx
+                remaining_count = num_samples - completed
+                eta_str = ""
+                if done_so_far > 0:
+                    eta_sec = elapsed / done_so_far * remaining_count
+                    eta_str = f"  ETA {timedelta(seconds=int(eta_sec))}"
+                now = datetime.now().strftime("%H:%M:%S")
+                print(f"[{now}] [{completed:04d}/{num_samples}] {geometry}: σmax={meta['max_stress']:.2e}{eta_str}", flush=True)
+
+                if completed % 100 == 0:
                     torch.save(dataset, f"{dataset_dir}/dataset.pt")
                     with open(f"{dataset_dir}/metadata.json", "w") as f:
                         json.dump(metadata, f, indent=2)
-                    print(f"Dataset saved to {dataset_dir}/dataset.pt")
-                break
-            except MapdlRuntimeError as e:
-                print(f"Sample {i+1} failed: {e}. Retrying...")
-                continue
+                    print(f"--- Checkpoint saved at sample {completed} ---", flush=True)
+
+            pending = failed_this_pass
+
+        if pending:
+            print(f"WARNING: {len(pending)} samples failed after {max_passes} passes: {pending}", flush=True)
+
+    finally:
+        pool.exit()
+
+    torch.save(dataset, f"{dataset_dir}/dataset.pt")
+    with open(f"{dataset_dir}/metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Dataset saved to {dataset_dir}/dataset.pt")
+
     return dataset, metadata
 
 
@@ -92,7 +244,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build FEA dataset for given geometry.")
     parser.add_argument("--geometry", type=str, default="arm", help="Geometry name (e.g., 'beam', 'arm').")
     parser.add_argument("--num_samples", type=int, default=1000, help="Number of samples to generate.")
+    parser.add_argument("--pool_size", type=int, default=4, help="Number of parallel MAPDL instances.")
+    parser.add_argument("--nproc", type=int, default=1, help="CPUs per MAPDL instance.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     args = parser.parse_args()
-    build_dataset(args.geometry, num_samples=args.num_samples)
-
-
+    build_dataset(args.geometry, num_samples=args.num_samples, pool_size=args.pool_size, nproc=args.nproc, seed=args.seed)

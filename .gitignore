@@ -6,3 +6,5 @@ irit_c_programing/
 usful/
 screenshots/
 screenshots_gnn/
+irit/
+data/tile/dataset/*.pt

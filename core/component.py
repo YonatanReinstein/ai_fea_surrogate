@@ -27,10 +27,10 @@ class Component:
         }
         self.mesh = Mesh(nodes, elements)
         
-    def ansys_sim(self,  screenshot_path: str = None):
+    def ansys_sim(self,  mapdl = None, screenshot_path: str = None):
         if self.mesh is None:
             raise ValueError("Mesh has not been generated yet.")
-        self.mesh.solve(self.young, self.poisson, screenshot_path=screenshot_path) 
+        self.mesh.solve(self.young, self.poisson, mapdl = mapdl, screenshot_path=screenshot_path) 
 
     def get_volume(self):
         return self.CAD_model.get_volume()
