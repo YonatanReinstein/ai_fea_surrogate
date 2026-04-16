@@ -15,3 +15,5 @@ torch-geometric==2.6.1
 ansys-mapdl-core
 ansys-tools-visualization_interface
 pyvista
+
+huggingface_hub>=1.8.0
