@@ -40,4 +40,4 @@ def plot_losses(geometry: str = "arm", save_path: str = None):
     print(f"Loss plot saved to: {save_path}")
 
 if __name__ == "__main__":
-    plot_losses(geometry="arm")
+    plot_losses(geometry="tile")

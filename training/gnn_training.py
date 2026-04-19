@@ -1,6 +1,8 @@
 import torch
 import json
 import os
+import re
+import glob
 from torch_geometric.loader import DataLoader
 from utils.gnn_surrogate import GNN
 
@@ -141,17 +143,43 @@ def train_gnn_model(
 
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
-        step_size=20,
-        gamma=0.9
+        step_size=10,
+        gamma=0.75
     )
 
     train_losses = []
     val_losses   = []
 
+    # ----------------------------------------------------
+    # Resume from latest checkpoint if available
+    # ----------------------------------------------------
+    start_epoch = 0
+    ckpt_files = glob.glob(os.path.join(save_dir, "*_epochs.pt"))
+    epoch_re = re.compile(r"(\d+)_epochs\.pt$")
+    parsed = [(int(m.group(1)), p) for p in ckpt_files for m in [epoch_re.search(p)] if m]
+    if parsed:
+        start_epoch, latest_ckpt = max(parsed, key=lambda t: t[0])
+        print(f"Resuming from checkpoint: {latest_ckpt} (epoch {start_epoch})")
+        ckpt = torch.load(latest_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+
+        losses_path = os.path.join(save_dir, "losses.json")
+        if os.path.exists(losses_path):
+            with open(losses_path, "r") as f:
+                prev = json.load(f)
+            train_losses = prev.get("train_losses", [])[:start_epoch]
+            val_losses   = prev.get("val_losses", [])[:start_epoch]
+
+        # advance scheduler to match the resumed epoch
+        for _ in range(start_epoch):
+            scheduler.step()
+
     # ======================================================
     # Training Loop
     # ======================================================
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch + 1, epochs + 1):
+        # re-seed per epoch so resumed runs don't replay the same batch order
+        torch.manual_seed(42 + epoch)
 
         # -----------------------------
         # TRAIN
