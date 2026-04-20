@@ -10,3 +10,5 @@ irit/
 data/tile/dataset/*.pt
 data/tile/checkpoints/
 *.log
+presentation/
+.claude/

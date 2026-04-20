@@ -22,5 +22,5 @@ class GNN(nn.Module):
             h = h + conv(h, edge_index)
         node_pred = self.head(h)
         graph_pred = global_max_pool(node_pred, batch)
-        return graph_pred
+        return graph_pred , node_pred
 
