@@ -31,7 +31,7 @@ def plot_losses(save_path: str = None):
 
     # ---- Save or show ----
     if save_path is None:
-        base_dir = os.path.dirname(f"training/runs/train")
+        base_dir = os.path.dirname(f"training/runs/train/")
         save_path = os.path.join(base_dir, "loss_plot.png")
 
     plt.savefig(save_path, dpi=300)
