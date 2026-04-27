@@ -73,8 +73,11 @@ class Component:
 
         if edges:
             edge_index = torch.tensor(list(zip(*edges)), dtype=torch.long)
+            coords = x[:, :3]
+            edge_attr = torch.norm(coords[edge_index[0]] - coords[edge_index[1]], dim=1, keepdim=True)
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_attr = torch.empty((0, 1), dtype=torch.float)
 
         # --- Global labels ---
         volume = torch.tensor([self.get_volume()], dtype=torch.float).unsqueeze(0)
@@ -92,8 +95,9 @@ class Component:
         data = Data(
             x=x,
             edge_index=edge_index,
-            node_disp=node_disp,     
-            node_stress=node_stress, 
+            edge_attr=edge_attr,
+            node_disp=node_disp,
+            node_stress=node_stress,
             volume=volume,              
             dims = dims,      
             max_stress=max_stress,

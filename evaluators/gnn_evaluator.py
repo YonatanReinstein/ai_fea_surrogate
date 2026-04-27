@@ -73,15 +73,19 @@ class GNNEvaluator(BaseEvaluator):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(ckpt_path, map_location=self.device)
 
-        self.target_mean = ckpt["target_mean"].to(self.device)
-        self.target_std  = ckpt["target_std"].to(self.device)
+        self.target_mean = ckpt["node_target_mean"].to(self.device)
+        self.target_std  = ckpt["node_target_std"].to(self.device)
         self.x_mean = ckpt["x_mean"].to(self.device)
         self.x_std  = ckpt["x_std"].to(self.device)
+        self.edge_mean = ckpt["edge_mean"].to(self.device)
+        self.edge_std  = ckpt["edge_std"].to(self.device)
 
         self.node_in_dim = ckpt["node_in_dim"]
+        self.edge_in_dim = ckpt.get("edge_in_dim", 1)
 
         self.model = GNN(
             node_in_dim=self.node_in_dim,
+            edge_in_dim=self.edge_in_dim,
             hidden_dim=128,
             num_layers=6
         ).to(self.device)
@@ -176,14 +180,16 @@ class GNNEvaluator(BaseEvaluator):
         loader = DataLoader(graph_list, batch_size=batch_size, shuffle=False)
         for batch_data in loader:
             # Prepare inputs
-            x, edge_index, batch = gnn_input_fn(batch_data)
-            x[:, 3] = x[:, 3] / 1e+6  
+            x, edge_index, edge_attr, batch = gnn_input_fn(batch_data)
+            x[:, 3] = x[:, 3] / 1e+6
             torch.set_printoptions(threshold=torch.inf)
-            
+
             x = x.to(self.device)
+            edge_attr = edge_attr.float().to(self.device)
 
             x = (x - self.x_mean) / self.x_std
-        
+            edge_attr = (edge_attr - self.edge_mean) / self.edge_std
+
             if batch is None:
                 batch = torch.zeros(x.size(0), dtype=torch.long)
 
@@ -192,10 +198,10 @@ class GNNEvaluator(BaseEvaluator):
 
             # Predict
             with torch.no_grad():
-                pred_norm = self.model(x, edge_index, batch)
+                graph_pred, _ = self.model(x, edge_index, edge_attr, batch)
 
             # Denormalize
-            stress = pred_norm * self.target_std + self.target_mean
+            stress = graph_pred * self.target_std + self.target_mean
             stress = stress.squeeze()
             #print("Evaluation completed.")
 

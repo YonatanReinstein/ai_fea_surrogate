@@ -8,6 +8,7 @@ screenshots/
 screenshots_gnn/
 irit/
 data/tile/dataset/*.pt
+data/tile/dataset/*.bak
 data/tile/checkpoints/
 *.log
 presentation/

@@ -27,4 +27,4 @@ install all requirements in the env by running:
     pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121 -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
 
 
-
+to connect to newton run   tmux attach -t tunnel

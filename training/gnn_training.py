@@ -11,7 +11,7 @@ from utils.gnn_surrogate import GNN
 # Helper functions
 # ======================================================
 def gnn_input_fn(data):
-    return data.x, data.edge_index, data.batch
+    return data.x, data.edge_index, data.edge_attr, data.batch
 
 
 def gnn_target_fn(data):
@@ -36,6 +36,7 @@ def train_gnn_model(
     hidden_dim: int = 128,
     conv_layers: int = 6,
     node_loss_weight: float = 1.0,
+    weight_decay: float = 1e-4,
 ):
     torch.manual_seed(42)
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
@@ -117,6 +118,11 @@ def train_gnn_model(
         x_mean = all_x.mean(dim=0)
         x_std  = all_x.std(dim=0) + 1e-8
 
+        # Edge feature stats
+        all_edge_attr = torch.cat([d.edge_attr for d in set], dim=0).float()
+        edge_mean = all_edge_attr.mean(dim=0)
+        edge_std  = all_edge_attr.std(dim=0) + 1e-8
+
         # move stats to device once
         target_mean = target_mean.to(device)
         target_std  = target_std.to(device)
@@ -124,6 +130,8 @@ def train_gnn_model(
         node_target_std  = node_target_std.to(device)
         x_mean      = x_mean.to(device)
         x_std       = x_std.to(device)
+        edge_mean   = edge_mean.to(device)
+        edge_std    = edge_std.to(device)
 
         print("Target mean:", target_mean.detach().cpu().numpy())
         print("Target std:", target_std.detach().cpu().numpy())
@@ -131,6 +139,8 @@ def train_gnn_model(
         print("Node target std:", node_target_std.detach().cpu().numpy())
         print("X mean:", x_mean.detach().cpu().numpy())
         print("X std:", x_std.detach().cpu().numpy())
+        print("Edge mean:", edge_mean.detach().cpu().numpy())
+        print("Edge std:", edge_std.detach().cpu().numpy())
 
     
 
@@ -147,22 +157,18 @@ def train_gnn_model(
     # ----------------------------------------------------
     example = train_set[0]
     node_in_dim = example.x.shape[1]
+    edge_in_dim = example.edge_attr.shape[1]
     out_dim     = gnn_target_fn(example).shape[1]
 
     model = GNN(
         node_in_dim=node_in_dim,
+        edge_in_dim=edge_in_dim,
         hidden_dim=hidden_dim,
         num_layers=conv_layers
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn   = torch.nn.MSELoss()
-
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=10,
-        gamma=0.75
-    )
 
     train_losses = []
     val_losses   = []
@@ -195,9 +201,12 @@ def train_gnn_model(
             train_node_losses  = prev.get("train_node_losses", [])[:start_epoch]
             val_node_losses    = prev.get("val_node_losses", [])[:start_epoch]
 
-        # advance scheduler to match the resumed epoch
-        for _ in range(start_epoch):
-            scheduler.step()
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=10,
+        gamma=0.75,
+        last_epoch=start_epoch - 1
+    )
 
     # ======================================================
     # Training Loop
@@ -217,18 +226,20 @@ def train_gnn_model(
         for batch_data in train_loader:
             optimizer.zero_grad()
 
-            x, edge_index, batch_idx = gnn_input_fn(batch_data)
+            x, edge_index, edge_attr, batch_idx = gnn_input_fn(batch_data)
             x = x.float().to(device)
             edge_index = edge_index.to(device)
+            edge_attr  = edge_attr.float().to(device)
             batch_idx  = batch_idx.to(device)
 
             # normalize features
             x_norm = (x - x_mean) / x_std
+            edge_attr_norm = (edge_attr - edge_mean) / edge_std
 
-            graph_pred, node_pred = model(x_norm, edge_index, batch_idx)
+            graph_pred, node_pred = model(x_norm, edge_index, edge_attr_norm, batch_idx)
 
             targ = gnn_target_fn(batch_data).float().to(device)
-            targ_norm = (targ - target_mean) / target_std
+            targ_norm = (targ - node_target_mean) / node_target_std
 
             node_targ = gnn_node_target_fn(batch_data).float().to(device)
             node_targ_norm = (node_targ - node_target_mean) / node_target_std
@@ -263,17 +274,19 @@ def train_gnn_model(
 
         with torch.no_grad():
             for batch_data in val_loader:
-                x, edge_index, batch_idx = gnn_input_fn(batch_data)
+                x, edge_index, edge_attr, batch_idx = gnn_input_fn(batch_data)
                 x = x.float().to(device)
                 edge_index = edge_index.to(device)
+                edge_attr  = edge_attr.float().to(device)
                 batch_idx  = batch_idx.to(device)
 
                 x_norm = (x - x_mean) / x_std
+                edge_attr_norm = (edge_attr - edge_mean) / edge_std
 
-                graph_pred, node_pred = model(x_norm, edge_index, batch_idx)
+                graph_pred, node_pred = model(x_norm, edge_index, edge_attr_norm, batch_idx)
 
                 targ = gnn_target_fn(batch_data).float().to(device)
-                targ_norm = (targ - target_mean) / target_std
+                targ_norm = (targ - node_target_mean) / node_target_std
 
                 node_targ = gnn_node_target_fn(batch_data).float().to(device)
                 node_targ_norm = (node_targ - node_target_mean) / node_target_std
@@ -303,6 +316,7 @@ def train_gnn_model(
             ckpt = {
                 "model_state": model.state_dict(),
                 "node_in_dim": node_in_dim,
+                "edge_in_dim": edge_in_dim,
                 "out_dim": out_dim,
                 "target_mean": target_mean.detach().cpu(),
                 "target_std": target_std.detach().cpu(),
@@ -310,10 +324,12 @@ def train_gnn_model(
                 "node_target_std": node_target_std.detach().cpu(),
                 "x_mean": x_mean.detach().cpu(),
                 "x_std": x_std.detach().cpu(),
+                "edge_mean": edge_mean.detach().cpu(),
+                "edge_std": edge_std.detach().cpu(),
             }
             torch.save(ckpt, os.path.join(save_dir, f"{epoch}_epochs.pt"))
 
-            with open(os.path.join(save_dir, "losses.json"), "w") as f:
+            with open(os.path.join("training/runs/train", "losses.json"), "w") as f:
                 json.dump({
                     "train_losses": train_losses,
                     "val_losses": val_losses,
@@ -346,6 +362,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_dim", default=128, type=int)
     parser.add_argument("--conv_layers", default=6, type=int)
     parser.add_argument("--node_loss_weight", default=1.0, type=float)
+    parser.add_argument("--weight_decay", default=1e-3, type=float)
     args = parser.parse_args()
 
     train_gnn_model(
@@ -357,4 +374,5 @@ if __name__ == "__main__":
         hidden_dim=args.hidden_dim,
         conv_layers=args.conv_layers,
         node_loss_weight=args.node_loss_weight,
+        weight_decay=args.weight_decay
     )
