@@ -3,7 +3,7 @@ import importlib
 from data.beam.boundary_conditions import mesh_resolution
 from .base_evaluator import BaseEvaluator
 from core.component import Component
-from core.IritModel import IIritModel
+from core.IritModel import IritCModel as IIritModel
 import json
 
      

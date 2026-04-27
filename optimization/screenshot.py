@@ -1,4 +1,4 @@
-from core.IritModel import IIritModel
+from core.IritModel import IritCModel as IIritModel
 from core.component import Component
 import importlib
 from pathlib import Path
@@ -9,7 +9,9 @@ def screenshot(geometry: str, dims: dict, save_path: str, banner: str = None):
     material_properties = json.loads(Path(material_props_path).read_text())
     young = material_properties["young_modulus"]
     poisson = material_properties["poisson_ratio"]
-    cad_model = IIritModel(f"data/{geometry}/CAD_model/model.irt", dims_dict=dims)
+    model_dir = f"data/{geometry}/CAD_model"
+    model_path = f"{model_dir}/model.irt" if Path(f"{model_dir}/model.irt").exists() else f"{model_dir}/model"
+    cad_model = IIritModel(model_path, dims_dict=dims)
     component = Component(cad_model, young, poisson)
     module = importlib.import_module(f"data.{geometry}.boundary_conditions")
     anchor_condition = module.anchor_condition

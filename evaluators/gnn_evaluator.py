@@ -1,10 +1,11 @@
+import os
 import torch
 import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
 from abc import ABC
 from utils.gnn_surrogate import GNN
 from evaluators.base_evaluator import BaseEvaluator
-from core.IritModel import IIritModel
+from core.IritModel import IritCModel as IIritModel
 from core.component import Component
 from training.gnn_training import gnn_input_fn, gnn_target_fn
 import json
@@ -82,12 +83,15 @@ class GNNEvaluator(BaseEvaluator):
 
         self.node_in_dim = ckpt["node_in_dim"]
         self.edge_in_dim = ckpt.get("edge_in_dim", 1)
+        num_layers = max(
+            int(k.split(".")[1]) for k in ckpt["model_state"] if k.startswith("convs")
+        ) + 1
 
         self.model = GNN(
             node_in_dim=self.node_in_dim,
             edge_in_dim=self.edge_in_dim,
             hidden_dim=128,
-            num_layers=6
+            num_layers=num_layers
         ).to(self.device)
 
         self.model.load_state_dict(ckpt["model_state"])
@@ -100,7 +104,11 @@ class GNNEvaluator(BaseEvaluator):
         self.young = material_properties["young_modulus"]
         self.poisson = material_properties["poisson_ratio"]
         self.yield_strength = material_properties["yield_strength"]
-        self.model_path = f"data/{self.geometry_name}/CAD_model/model.irt"
+        model_dir = f"data/{self.geometry_name}/CAD_model"
+        if os.path.exists(f"{model_dir}/model.irt"):
+            self.model_path = f"{model_dir}/model.irt"
+        else:
+            self.model_path = f"{model_dir}/model"
 
         module = importlib.import_module(f"data.{geometry_name}.boundary_conditions")
         self.anchor_condition = module.anchor_condition

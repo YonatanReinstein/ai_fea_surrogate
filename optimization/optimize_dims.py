@@ -36,6 +36,7 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
         crossover_rate=0.85,
         mutation_rate=0.85,
         seed=0,
+        geometry=geometry_name,
     )
 
     best_dims = ga.run()

@@ -4,8 +4,8 @@ import numpy as np
 
 class GeneticAlgorithm:
     def __init__(self, fitness_func, dims_dict,
-                 pop_size=200, generations=200, 
-                 crossover_rate=0.85, mutation_rate=0.8, seed=0):
+                 pop_size=200, generations=200,
+                 crossover_rate=0.85, mutation_rate=0.8, seed=0, geometry="arm"):
 
         self.fitness_func = fitness_func
         self.dims_dict = dims_dict
@@ -18,6 +18,7 @@ class GeneticAlgorithm:
             for name in self.dim_names
         ])
 
+        self.geometry = geometry
         self.pop_size = pop_size
         self.generations = generations
         self.crossover_rate = crossover_rate
@@ -45,6 +46,9 @@ class GeneticAlgorithm:
             else:
                 break
         if population is not None:
+            if population.shape[1] != self.dim:
+                print(f"[GA] Checkpoint dim {population.shape[1]} != problem dim {self.dim}, ignoring checkpoint.")
+                return np.random.uniform(low, high, (self.pop_size, self.dim))
             print("[GA] Loading checkpoint from ga_population.npy")
             return population
 
@@ -148,7 +152,7 @@ class GeneticAlgorithm:
                     f"=> fit: {fitnesses[idx]:.4e}"
                 )
                 screenshot(
-                    geometry="arm",
+                    geometry=self.geometry,
                     dims=self.vector_to_dict(population[idx]),
                     save_path=f"optimization/screenshots/gen_{gen:03d}_rank_{rank:02d}_idx_{idx}.png",
                     banner=banner
