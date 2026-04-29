@@ -5,12 +5,13 @@ mp.set_start_method('spawn', force=True)
 from abc import ABC
 from utils.gnn_surrogate import GNN
 from evaluators.base_evaluator import BaseEvaluator
-from core.IritModel import IritCModel as IIritModel
+from core.IritModel import IritCModel
 from core.component import Component
 from training.gnn_training import gnn_input_fn, gnn_target_fn
 import json
 from multiprocessing import Pool
 from torch_geometric.loader import DataLoader
+from torch_geometric.data import Data
 import importlib
 import threading
 from time import sleep
@@ -51,17 +52,19 @@ def _run_sample_worker(args):
     import random
     sleep(random.uniform(0.1, 0.2))  # Simulate variable computation time
     #print (f"Worker started for sample index: {sample_index%200}")
-    cad_model = IIritModel(model_path, dims_dict=dims)
+    cad_model = IritCModel(model_path, dims_dict=dims)
     component = Component(cad_model, young, poisson)
     component.generate_mesh(U=U, V=V, W=W)
     component.mesh.anchor_nodes_by_condition(anchor_condition)
     component.mesh.apply_force_by_pattern(force_pattern)
-    data = component.to_graph_with_labels(with_labels=False)  
+    data = component.to_graph_with_labels(with_labels=False)
     if screenshot:
         save_path=f"screenshots/mesh_{sample_index+1}.png"
         component.mesh.plot_mesh(save_path=save_path)
     volume = component.get_volume()
-    return data, volume
+    # Convert tensors to numpy to avoid FD-based shared memory across processes
+    data_dict = {k: v.numpy() for k, v in data.items() if hasattr(v, 'numpy')}
+    return data_dict, volume
 
 
 class GNNEvaluator(BaseEvaluator):
@@ -179,7 +182,11 @@ class GNNEvaluator(BaseEvaluator):
 
 
 
-        graph_list, volume_list = zip(*results)
+        graph_dicts, volume_list = zip(*results)
+        graph_list = [
+            Data(**{k: torch.from_numpy(v) for k, v in d.items()})
+            for d in graph_dicts
+        ]
 
         # Build DataLoader
         batch_size = 20

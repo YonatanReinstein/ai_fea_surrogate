@@ -13,3 +13,4 @@ data/tile/checkpoints/
 *.log
 presentation/
 .claude/
+optimization/artifacts/
