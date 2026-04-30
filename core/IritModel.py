@@ -82,10 +82,10 @@ class IritModelBase(abc.ABC):
                 dim_list.append(value)
         return dim_list
 
-    def __del__(self):
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
-        if os.path.exists("tmp") and len(os.listdir("tmp")) == 0:
-            os.rmdir("tmp")
+    #def __del__(self):
+    #    shutil.rmtree(self.tmp_dir, ignore_errors=True)
+    #    if os.path.exists("tmp") and len(os.listdir("tmp")) == 0:
+    #        os.rmdir("tmp")
     
 
 
@@ -142,7 +142,7 @@ class IritCModel(IritModelBase):
 
 
 if __name__ == "__main__":
-    model = IritCModel("data/tile/CAD_model/model.exe", "data/tile/CAD_model/dims.json")
+    model = IritCModel("data/tile/CAD_model/model", "data/tile/CAD_model/dims1.json")
     model.__exec__script__()
     #volume = model.get_volume()
     #print(f"Volume: {volume}")
