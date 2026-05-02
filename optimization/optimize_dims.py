@@ -19,10 +19,21 @@ def load_dims_config(geometry_name):
     return names, bounds, defaults
 
 
-def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, screenshots=False, processes=None):
+def _log_gpu_info():
+    import torch
+    print(f"[gpu] torch={torch.__version__} cuda_available={torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"[gpu] device_name={torch.cuda.get_device_name(0)}")
+        print(f"[gpu] capability={torch.cuda.get_device_capability(0)}")
+        print(f"[gpu] torch.version.cuda={torch.version.cuda}")
+        print(f"[gpu] arch_list={torch.cuda.get_arch_list()}")
+
+
+def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, screenshots=False, processes=None, batch_size=28):
+    _log_gpu_info()
     material_props_path = f"data/{geometry_name}/CAD_model/material_properties.json"
     material_properties = json.loads(Path(material_props_path).read_text())
-    evaluator = get_evaluator(geometry_name, arch=arch, screenshots=screenshots, processes=processes)
+    evaluator = get_evaluator(geometry_name, arch=arch, screenshots=screenshots, processes=processes, batch_size=batch_size)
     fitness_func = make_fitness(evaluator, material_properties["yield_strength"])
     dims_path = f"data/{geometry_name}/CAD_model/dims.json"
     dims_dict = json.loads(Path(dims_path).read_text())
@@ -57,6 +68,7 @@ if __name__ == "__main__":
     parser.add_argument("--generations", type=int, default=400, help="Number of generations")
     parser.add_argument("--screenshots", action="store_true", help="Enable screenshots")
     parser.add_argument("--processes", type=int, default=None, help="Number of processes for evaluation")
+    parser.add_argument("--batch_size", type=int, default=28, help="Batch size for evaluation")
     args = parser.parse_args()
 
-    run_optimization(args.geometry, arch=args.arch, pop_size=args.pop_size, generations=args.generations, screenshots=args.screenshots, processes=args.processes)
+    run_optimization(args.geometry, arch=args.arch, pop_size=args.pop_size, generations=args.generations, screenshots=args.screenshots, processes=args.processes, batch_size=args.batch_size)

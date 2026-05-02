@@ -110,11 +110,11 @@ class Component:
 
 if __name__ == "__main__":
     from core.IritModel import IritCModel
-    model_path = "data/tile/CAD_model/model.exe"
-    json_path = "data/tile/CAD_model/dims.json"
+    model_path = "data/bistable/CAD_model/model"
+    json_path = "data/bistable/CAD_model/dims.json"
     cad_model = IritCModel(model_path, json_path)
     component = Component(cad_model, young=2.1e11, poisson=0.3)
-    geometry = "tile"
+    geometry = "bistable"
     import importlib
     module = importlib.import_module(f"data.{geometry}.boundary_conditions")
     anchor_condition = module.anchor_condition
@@ -124,10 +124,10 @@ if __name__ == "__main__":
     component.generate_mesh(U=U, V=V, W=W)
     component.mesh.anchor_nodes_by_condition(anchor_condition)
     component.mesh.apply_force_by_pattern(force_pattern)
-    component.mesh.solve(young=2e11, poisson=0.3, screenshot_path=f"mapdl.png")
+    #component.mesh.solve(young=2e11, poisson=0.3, screenshot_path=f"mapdl.png")
     print("volume:", component.get_volume())
 
-    component.mesh.plot_mesh()
+    component.mesh.plot_mesh(save_path=f"mesh.png")
     #print("Max stress:", component.mesh.get_max_stress())
 
 

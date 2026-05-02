@@ -5,15 +5,17 @@ from ansys.mapdl.core import launch_mapdl
 import time
 from ansys.mapdl.core.errors import MapdlRuntimeError
 import pyvista as pv
+import warnings
+warnings.filterwarnings("ignore")
+
 pv.OFF_SCREEN = True
 
 try:
-    pv.start_xvfb()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pv.start_xvfb()
 except OSError:
     pass
-
-import warnings
-warnings.filterwarnings("ignore")
 
 class Mesh:
     def __init__(self, nodes, elements, tolerance=1e-9):
@@ -241,17 +243,17 @@ class Mesh:
 
         # Optional banner text
         if banner is not None:
-            plotter.add_text(banner, position="upper_left", font_size=50, color="black", shadow=True)
+            plotter.add_text(banner, position="upper_left", font_size=20, color="black")
 
         # ---------------------------------------------------------
         # FORCES — now rotated
         # ---------------------------------------------------------
         for nid, node in node_items:
-            if node.id == 1955:
+            if node.forces != [0.0, 0.0, 0.0]:
                 force = np.array(node.forces, dtype=float)
                 if np.linalg.norm(force) > 1e-9:
                     start = rotated_node_coords[nid]
-                    arrow = pv.Arrow(start=start, direction=apply_rot(force), scale=1)
+                    arrow = pv.Arrow(start=start, direction=apply_rot(force), scale=0.1)
                     plotter.add_mesh(arrow, color="red")
 
         # ---------------------------------------------------------
@@ -269,17 +271,13 @@ class Mesh:
                 color="blue",
                 render_points_as_spheres=True
             )
-       #     plotter.add_points(np.array(anchored), point_size=18, color="blue")
 
         # ---------------------------------------------------------
         # CAMERA RESET
         # ---------------------------------------------------------
-        plotter.camera.roll = 0
-        #plotter.camera.elevation = elev
-        plotter.camera.elevation = 0
-        #plotter.camera.azimuth = azim
-        plotter.camera.azimuth = 0
-        #plotter.camera.zoom(1.5)
+        plotter.view_xz()
+        plotter.camera.up = (1.0, 0.0, 0.0)  # 90° CCW from standard XZ view
+        plotter.enable_parallel_projection()
 
         # ---------------------------------------------------------
         # SAVE OR SHOW
@@ -294,7 +292,7 @@ class Mesh:
 
 if __name__ == "__main__":
     from core.IritModel import IritCModel
-    model = IritCModel("data/tile/CAD_model/model.exe", "data/tile/CAD_model/dims.json")
+    model = IritCModel("data/bistable/CAD_model/model", "data/bistable/CAD_model/dims.json")
     model.__exec__script__()
     #volume = model.get_volume()
     #print(f"Volume: {volume}")

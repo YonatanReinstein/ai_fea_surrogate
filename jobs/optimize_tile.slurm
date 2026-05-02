@@ -6,7 +6,7 @@
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --partition=public
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:A100:1
 #SBATCH --output=%x_%j.log
 #SBATCH --error=%x_%j.log
 
@@ -20,8 +20,10 @@ export PYTHONUNBUFFERED=1
 mkdir -p optimization/artifacts optimization/screenshots
 
 python -u -m optimization.optimize_dims \
-    --geometry tile \
+    --geometry bistable \
     --arch gnn \
     --pop_size 300 \
-    --generations 300 \
-    --processes 16
+    --generations 30 \
+    --processes 16 \
+    --batch_size 28 \
+

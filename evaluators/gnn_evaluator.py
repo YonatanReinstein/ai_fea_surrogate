@@ -68,10 +68,11 @@ def _run_sample_worker(args):
 
 
 class GNNEvaluator(BaseEvaluator):
-    def __init__(self, geometry_name: str,screenshots: bool = False, processes: int = None):
+    def __init__(self, geometry_name: str, screenshots: bool = False, processes: int = None, batch_size: int = 128):
         super().__init__(geometry_name)
         self.processes = processes
         self.screenshots = screenshots
+        self.batch_size = batch_size
 
         ckpt_path = f"data/{geometry_name}/gnn_surrogate.pt"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -189,15 +190,13 @@ class GNNEvaluator(BaseEvaluator):
         ]
 
         # Build DataLoader
-        batch_size = 20
         all_stress = []
 
-        loader = DataLoader(graph_list, batch_size=batch_size, shuffle=False)
+        loader = DataLoader(graph_list, batch_size=self.batch_size, shuffle=False)
         for batch_data in loader:
             # Prepare inputs
             x, edge_index, edge_attr, batch = gnn_input_fn(batch_data)
             x[:, 3] = x[:, 3] / 1e+6
-            torch.set_printoptions(threshold=torch.inf)
 
             x = x.to(self.device)
             edge_attr = edge_attr.float().to(self.device)
@@ -212,7 +211,7 @@ class GNNEvaluator(BaseEvaluator):
             batch = batch.to(self.device)
 
             # Predict
-            with torch.no_grad():
+            with torch.inference_mode():
                 graph_pred, _ = self.model(x, edge_index, edge_attr, batch)
 
             # Denormalize
