@@ -7,14 +7,7 @@
 * Written by:  Gershon Elber				Ver 1.0, Dec 2017    *
 *****************************************************************************/
 
-#include "inc_irit/irit_sm.h"
-#include "inc_irit/iritprsr.h"
-#include "inc_irit/allocate.h"
-#include "inc_irit/attribut.h"
-#include "inc_irit/geom_lib.h"
-#include "inc_irit/cagd_lib.h"
-#include "inc_irit/user_lib.h"
-#include "inc_irit/grap_lib.h"
+#include "face_centers.h"
 
 typedef CagdRType(*LclThicknessFuncCBType)(CagdRType u,
     CagdRType v,
@@ -26,8 +19,11 @@ typedef struct UserMicroLocalDataStruct { /* User specific data in CB funcs. */
     LclThicknessFuncCBType ThicknessFuncCB;
 } UserMicroLocalDataStruct;
 
-static CagdRType UniformTilingCB(CagdRType u, CagdRType v, CagdRType w);
-static CagdRType* read_dims(int* ULength, int* VLength, int* WLength);
+int g_ni, g_nj, g_nk;
+CagdRType *g_data;
+
+
+static void read_dims(void);
 
 static int PreProcessTile1FaceParam(
     const IritUserMicroPreProcessTileCBStruct* CBData,
@@ -39,87 +35,6 @@ static IritPrsrObjectStruct* PreProcessTile(IritPrsrObjectStruct* Tile,
     IritUserMicroPreProcessTileCBStruct* CBData);
 static void GenerateMicroStructures(void);
 
-static CagdRType UniformTilingCB(CagdRType u, CagdRType v, CagdRType w)
-{
-    int ULength, VLength, WLength;
-    int UOrder = 2, VOrder = 2, WOrder = 2;
-
-    CagdRType* ctrl = read_dims(&ULength, &VLength, &WLength);
-
-    IritTrivTVStruct* TV = IritTrivBspTVNew(
-        ULength, VLength, WLength,
-        UOrder, VOrder, WOrder,
-        IRIT_CAGD_PT_E1_TYPE
-    );
-
-    int knotU = ULength + UOrder;  // total number of knots
-
-    for (int i = 0; i < knotU; i++) {
-        if (i < UOrder) {
-            TV->UKnotVector[i] = 0.0;  // first k knots
-        }
-        else if (i >= ULength) {
-            TV->UKnotVector[i] = 1.0;  // last k knots
-        }
-        else {
-            TV->UKnotVector[i] = (double)(i - UOrder + 1) / (ULength - UOrder + 1);  // internal knots
-        }
-    }
-    int knotV = VLength + VOrder;  // total number of knots
-
-    for (int i = 0; i < knotV; i++) {
-        if (i < VOrder) {
-            TV->VKnotVector[i] = 0.0;  // first k knots
-        }
-        else if (i >= VLength) {
-            TV->VKnotVector[i] = 1.0;  // last k knots
-        }
-        else {
-            TV->VKnotVector[i] = (double)(i - VOrder + 1) / (VLength - VOrder + 1);  // internal knots
-        }
-    }
-    int knotW = WLength + WOrder;  // total number of knots
-
-    for (int i = 0; i < knotW; i++) {
-        if (i < WOrder) {
-            TV->WKnotVector[i] = 0.0;  // first k knots
-        }
-        else if (i >= WLength) {
-            TV->WKnotVector[i] = 1.0;  // last k knots
-        }
-        else {
-            TV->WKnotVector[i] = (double)(i - WOrder + 1) / (WLength - WOrder + 1);  // internal knots
-        }
-    }
-
-
-    int n = VLength * ULength * WLength;
-
-    /* IRIT stores Points[1] in W-outermost, V-middle, U-innermost order.
-       ctrl (from dims.itd) is in U-outermost, V-middle, W-innermost order.
-       Transpose U<->W when copying. */
-    {
-        int iu, iv, iw;
-        for (iu = 0; iu < ULength; iu++)
-            for (iv = 0; iv < VLength; iv++)
-                for (iw = 0; iw < WLength; iw++) {
-                    int ctrl_idx = iu * VLength * WLength + iv * WLength + iw;
-                    int irit_idx = iw * VLength * ULength + iv * ULength + iu;
-                    TV->Points[1][irit_idx] = ctrl[ctrl_idx];
-                }
-    }
-
-
-
-    /* Evaluate the trivariate */
-    CagdRType* res = IritTrivTVEval2Malloc(TV, u, v, w);
-    IritTrivTVFree(TV);
-    IritFree(ctrl);
-
-    //printf("Tile (%.3f, %.3f %.3f) eval %.3f\r\n", u , v, w, res[1]);
-
-    return res[1];
-}
 
 /*****************************************************************************
 * DESCRIPTION:
@@ -344,64 +259,51 @@ static IritPrsrObjectStruct* PreProcessTile(IritPrsrObjectStruct* Tile,
 }
 
 
-static CagdRType* read_dims(int* ULength, int* VLength, int* WLength)
+static void read_dims(void)
 {
     IritPrsrObjectStruct* PObj;
     const char* DimsFileName = "dims.itd";
+    int i, n;
 
     PObj = IritPrsrGetDataFiles(&DimsFileName, 1, FALSE, FALSE);
     if (PObj == NULL) {
         fprintf(stderr, "Failed to load dims.itd\n");
-        return NULL;
+        exit(1);
     }
 
-    /* First value: ULength */
-    if (PObj == NULL || !IRIT_PRSR_IS_NUM_OBJ(PObj)) {
+    if (!IRIT_PRSR_IS_NUM_OBJ(PObj)) {
         fprintf(stderr, "First object is missing or not numeric\n");
-        return NULL;
+        exit(1);
     }
-    *ULength = (int)PObj->U.R;
+    g_ni = (int)PObj->U.R;
     PObj = PObj->Pnext;
 
-    /* Second value: VLength */
     if (PObj == NULL || !IRIT_PRSR_IS_NUM_OBJ(PObj)) {
         fprintf(stderr, "Second object is missing or not numeric\n");
-        return NULL;
+        exit(1);
     }
-    *VLength = (int)PObj->U.R;
+    g_nj = (int)PObj->U.R;
     PObj = PObj->Pnext;
 
-    /* Third value: WLength */
     if (PObj == NULL || !IRIT_PRSR_IS_NUM_OBJ(PObj)) {
         fprintf(stderr, "Third object is missing or not numeric\n");
-        return NULL;
+        exit(1);
     }
-    *WLength = (int)PObj->U.R;
+    g_nk = (int)PObj->U.R;
     PObj = PObj->Pnext;
 
-    int n = (*ULength) * (*VLength) * (*WLength);
-
-    int i;
-    CagdRType* ctrl = (CagdRType*)IritMalloc(sizeof(CagdRType) * n);
-    IRIT_ZAP_MEM(ctrl, sizeof(CagdRType) * n);
-
-    if (ctrl == NULL) {
-        fprintf(stderr, "Allocation failed\n");
-        return NULL;
-    }
+    n = face_count(g_ni, g_nj, g_nk);
+    g_data = (CagdRType*)IritMalloc(sizeof(CagdRType) * n);
+    IRIT_ZAP_MEM(g_data, sizeof(CagdRType) * n);
 
     for (i = 0; i < n; i++) {
         if (PObj == NULL || !IRIT_PRSR_IS_NUM_OBJ(PObj)) {
             fprintf(stderr, "Invalid data at %d\n", i);
-            IritFree(ctrl);
-            return NULL;
+            exit(1);
         }
-
-        ctrl[i] = PObj->U.R;
+        g_data[i] = PObj->U.R;
         PObj = PObj->Pnext;
     }
-
-    return ctrl;
 }
 
 /*****************************************************************************
@@ -471,6 +373,7 @@ static void GenerateMicroStructures(void)
 
     LclData.ThicknessFuncCB = UniformTilingCB;
 
+    read_dims();
     MS = IritUserMicroStructComposition(&MSParam);
     int tiles_num = MSRegularParam->TilingSteps[0].TilesPerIntervals[0] * MSRegularParam->TilingSteps[1].TilesPerIntervals[0] * MSRegularParam->TilingSteps[2].TilesPerIntervals[0];
     int params_per_tile = 7;
