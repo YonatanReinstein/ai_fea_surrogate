@@ -9,6 +9,8 @@ screenshots_gnn/
 irit/
 data/tile/dataset/*.pt
 data/tile/dataset/*.bak
+data/bistable/dataset_*
+data/bistable/instances_*
 data/tile/checkpoints/
 *.log
 presentation/

@@ -23,7 +23,7 @@ python -u -m optimization.optimize_dims \
     --geometry bistable \
     --arch gnn \
     --pop_size 300 \
-    --generations 30 \
+    --generations 300 \
     --processes 16 \
-    --batch_size 28 \
+    --batch_size 128 \
 

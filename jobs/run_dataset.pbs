@@ -1,23 +1,29 @@
 #!/bin/bash
 #PBS -N dataset_builder
-#PBS -l select=1:ncpus=55:mem=150gb
 #PBS -l walltime=24:00:00
-#PBS -q workq
+#PBS -q main_q
+
+
+# Submit with:
+#   qsub -l select=1:ncpus=26:mem=70gb:host=aluf3 -v SEED=42,NUM_SAMPLES=1250,OUTPUT_DIR=data/bistable/dataset_0,RUN_LOCATION=data/bistable/instances_0 jobs/run_dataset.pbs
+#   qsub -l select=1:ncpus=26:mem=70gb:host=aluf5 -v SEED=43,NUM_SAMPLES=1250,OUTPUT_DIR=data/bistable/dataset_1,RUN_LOCATION=data/bistable/instances_1 jobs/run_dataset.pbs
 
 cd $PBS_O_WORKDIR
 source env/bin/activate
 
-# Kill any stale MAPDL processes and clean up stale lock files from previous jobs
 pkill -u $USER -f ansys251 || true
 sleep 5
-rm -rf data/tile/Instance_*/
+
+rm -rf "${RUN_LOCATION}"
 
 python -m training.dataset_builder \
-    --geometry tile \
-    --num_samples 6000 \
-    --pool_size 51 \
-    --nproc 1 \
-    --seed 42 \
+    --geometry bistable \
+    --num_samples ${NUM_SAMPLES} \
+    --pool_size 24 \
+    --nproc 4 \
+    --seed ${SEED} \
+    --output_dir ${OUTPUT_DIR} \
+    --run_location ${RUN_LOCATION} \
     > ${PBS_O_WORKDIR}/run_${PBS_JOBID}.log 2>&1
 
-rm -rf data/tile/Instance_*/
+rm -rf "${RUN_LOCATION}"

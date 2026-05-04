@@ -1,0 +1,17 @@
+#!/bin/bash
+#PBS -N merge_dataset
+#PBS -l select=1:ncpus=1:mem=16gb
+#PBS -l walltime=00:30:00
+#PBS -q long_q
+
+cd $PBS_O_WORKDIR
+source env/bin/activate
+
+python -m training.merge_datasets \
+    --input_dirs \
+        data/bistable/dataset_0 \
+        data/bistable/dataset_1 \
+        data/bistable/dataset_2 \
+        data/bistable/dataset_3 \
+    --output_dir data/bistable/dataset \
+    > ${PBS_O_WORKDIR}/merge_${PBS_JOBID}.log 2>&1

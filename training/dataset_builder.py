@@ -61,18 +61,22 @@ def build_dataset(
     num_samples: int = 10,
     seed: int = 42,
     pool_size: int = 4,
-    nproc: int = 3
+    nproc: int = 3,
+    output_dir: str = None,
+    run_location: str = None,
 ):
     random.seed(seed)
     torch.manual_seed(seed)
 
-
     base_path = f"data/{geometry}"
     model_path = f"{base_path}/CAD_model"
     dims_json_path = f"{base_path}/CAD_model/dims.json"
-    dataset_dir = f"{base_path}/dataset"
-    screenshots_dir = f"{base_path}/dataset/screenshots"
     material_props_path = f"{base_path}/CAD_model/material_properties.json"
+
+    dataset_dir = output_dir if output_dir is not None else f"{base_path}/dataset"
+    screenshots_dir = f"{dataset_dir}/screenshots"
+    if run_location is None:
+        run_location = base_path
 
     os.makedirs(dataset_dir, exist_ok=True)
     os.makedirs(screenshots_dir, exist_ok=True)
@@ -173,7 +177,7 @@ def build_dataset(
 
     print(f"Creating MapdlPool with pool_size={pool_size}, nproc={nproc}, run_location={base_path}", flush=True)
     try:
-        pool = MapdlPool(n_instances=pool_size, nproc=nproc, run_location=base_path, license_server_check=False, start_timeout=120)
+        pool = MapdlPool(n_instances=pool_size, nproc=nproc, run_location=run_location, license_server_check=False, start_timeout=120)
         global _pool_ref
         _pool_ref = pool
         print("MapdlPool created successfully, starting pool.map()...", flush=True)
@@ -247,5 +251,7 @@ if __name__ == "__main__":
     parser.add_argument("--pool_size", type=int, default=4, help="Number of parallel MAPDL instances.")
     parser.add_argument("--nproc", type=int, default=1, help="CPUs per MAPDL instance.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--output_dir", type=str, default=None, help="Directory to save dataset (default: data/<geometry>/dataset).")
+    parser.add_argument("--run_location", type=str, default=None, help="Working directory for MAPDL instances (default: data/<geometry>).")
     args = parser.parse_args()
-    build_dataset(args.geometry, num_samples=args.num_samples, pool_size=args.pool_size, nproc=args.nproc, seed=args.seed)
+    build_dataset(args.geometry, num_samples=args.num_samples, pool_size=args.pool_size, nproc=args.nproc, seed=args.seed, output_dir=args.output_dir, run_location=args.run_location)
