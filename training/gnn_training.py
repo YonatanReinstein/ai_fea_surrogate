@@ -4,14 +4,19 @@ import os
 import re
 import glob
 from torch_geometric.loader import DataLoader
-from utils.gnn_surrogate import GNN
+from utils.gnn_surrogate import GNN, HierarchicalGNN
 
 
 # ======================================================
 # Helper functions
 # ======================================================
 def gnn_input_fn(data):
-    return data.x, data.edge_index, data.edge_attr, data.batch
+    tile_idx  = getattr(data, 'tile_idx',  None)
+    tile_NX   = getattr(data, 'tile_NX',   None)
+    tile_NY   = getattr(data, 'tile_NY',   None)
+    tile_NZ   = getattr(data, 'tile_NZ',   None)
+    tile_x    = getattr(data, 'tile_x',    None)
+    return data.x, data.edge_index, data.edge_attr, data.batch, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x
 
 
 def gnn_target_fn(data):
@@ -36,7 +41,9 @@ def train_gnn_model(
     hidden_dim: int = 128,
     conv_layers: int = 6,
     node_loss_weight: float = 1.0,
+    graph_loss_weight: float = 1.0,
     weight_decay: float = 1e-4,
+    dataset_path: str = None,
 ):
     torch.manual_seed(42)
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
@@ -44,7 +51,7 @@ def train_gnn_model(
     # ----------------------------------------------------
     # Paths
     # ----------------------------------------------------
-    dataset_path = f"data/{geometry}/dataset/dataset.pt"
+    dataset_path = dataset_path or f"data/{geometry}/dataset/dataset.pt"
 
     save_dir       = f"data/{geometry}/checkpoints/"
     os.makedirs(save_dir, exist_ok=True)
@@ -75,6 +82,13 @@ def train_gnn_model(
         sample.max_stress = sample.max_stress / 1e+6
         #convert node_stress to MPa
         sample.node_stress = sample.node_stress / 1e+6
+        # inject per-node strut dimension: dims[3 + tile_idx] = d4..d103
+        if hasattr(sample, 'tile_idx') and hasattr(sample, 'dims'):
+            tile_struts = sample.dims[0, 3:].float()  # [K]
+            strut_param = tile_struts[sample.tile_idx].unsqueeze(1)
+            sample.x = torch.cat([sample.x, strut_param], dim=1)
+            # per-tile feature: one strut value per tile virtual node, shape [K, 1]
+            sample.tile_x = tile_struts.view(-1, 1)
 
     cleaned_dataset = []
     for data in dataset:
@@ -108,45 +122,30 @@ def train_gnn_model(
     # ----------------------------------------------------
     # Compute normalization stats on TRAIN ONLY
     # ----------------------------------------------------
-    # Target stats (e.g. max_stress)
-    for set in [val_set, train_set]:
-        all_targets = torch.cat([gnn_target_fn(d) for d in set], dim=0).float()
-        target_mean = all_targets.mean(dim=0)
-        target_std  = all_targets.std(dim=0) + 1e-8
+    all_targets = torch.cat([gnn_target_fn(d) for d in train_set], dim=0).float()
+    target_mean = all_targets.mean(dim=0).to(device)
+    target_std  = (all_targets.std(dim=0) + 1e-8).to(device)
 
-        # Node-level target stats (per-node von Mises stress)
-        all_node_targets = torch.cat([gnn_node_target_fn(d) for d in set], dim=0).float()
-        node_target_mean = all_node_targets.mean(dim=0)
-        node_target_std  = all_node_targets.std(dim=0) + 1e-8
+    all_node_targets = torch.cat([gnn_node_target_fn(d) for d in train_set], dim=0).float()
+    node_target_mean = all_node_targets.mean(dim=0).to(device)
+    node_target_std  = (all_node_targets.std(dim=0) + 1e-8).to(device)
 
-        # Feature stats (node features)
-        all_x = torch.cat([d.x for d in set], dim=0).float()
-        x_mean = all_x.mean(dim=0)
-        x_std  = all_x.std(dim=0) + 1e-8
+    all_x = torch.cat([d.x for d in train_set], dim=0).float()
+    x_mean = all_x.mean(dim=0).to(device)
+    x_std  = (all_x.std(dim=0) + 1e-8).to(device)
 
-        # Edge feature stats
-        all_edge_attr = torch.cat([d.edge_attr for d in set], dim=0).float()
-        edge_mean = all_edge_attr.mean(dim=0)
-        edge_std  = all_edge_attr.std(dim=0) + 1e-8
+    all_edge_attr = torch.cat([d.edge_attr for d in train_set], dim=0).float()
+    edge_mean = all_edge_attr.mean(dim=0).to(device)
+    edge_std  = (all_edge_attr.std(dim=0) + 1e-8).to(device)
 
-        # move stats to device once
-        target_mean = target_mean.to(device)
-        target_std  = target_std.to(device)
-        node_target_mean = node_target_mean.to(device)
-        node_target_std  = node_target_std.to(device)
-        x_mean      = x_mean.to(device)
-        x_std       = x_std.to(device)
-        edge_mean   = edge_mean.to(device)
-        edge_std    = edge_std.to(device)
-
-        print("Target mean:", target_mean.detach().cpu().numpy())
-        print("Target std:", target_std.detach().cpu().numpy())
-        print("Node target mean:", node_target_mean.detach().cpu().numpy())
-        print("Node target std:", node_target_std.detach().cpu().numpy())
-        print("X mean:", x_mean.detach().cpu().numpy())
-        print("X std:", x_std.detach().cpu().numpy())
-        print("Edge mean:", edge_mean.detach().cpu().numpy())
-        print("Edge std:", edge_std.detach().cpu().numpy())
+    print("Target mean:", target_mean.detach().cpu().numpy())
+    print("Target std:", target_std.detach().cpu().numpy())
+    print("Node target mean:", node_target_mean.detach().cpu().numpy())
+    print("Node target std:", node_target_std.detach().cpu().numpy())
+    print("X mean:", x_mean.detach().cpu().numpy())
+    print("X std:", x_std.detach().cpu().numpy())
+    print("Edge mean:", edge_mean.detach().cpu().numpy())
+    print("Edge std:", edge_std.detach().cpu().numpy())
 
     
 
@@ -154,9 +153,9 @@ def train_gnn_model(
     # DataLoaders
     # ----------------------------------------------------
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                              num_workers=4, persistent_workers=True)
+                              num_workers=4, persistent_workers=True, pin_memory=True)
     val_loader   = DataLoader(val_set, batch_size=batch_size, shuffle=False,
-                              num_workers=2, persistent_workers=True)
+                              num_workers=2, persistent_workers=True, pin_memory=True)
 
     # ----------------------------------------------------
     # Model setup
@@ -166,11 +165,13 @@ def train_gnn_model(
     edge_in_dim = example.edge_attr.shape[1]
     out_dim     = gnn_target_fn(example).shape[1]
 
-    model = GNN(
+    hierarchical = hasattr(train_set[0], 'tile_idx')
+    ModelClass = HierarchicalGNN if hierarchical else GNN
+    model = ModelClass(
         node_in_dim=node_in_dim,
         edge_in_dim=edge_in_dim,
         hidden_dim=hidden_dim,
-        num_layers=conv_layers
+        num_layers=conv_layers,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -232,18 +233,31 @@ def train_gnn_model(
         for batch_data in train_loader:
             optimizer.zero_grad()
 
-            x, edge_index, edge_attr, batch_idx = gnn_input_fn(batch_data)
+            x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x = gnn_input_fn(batch_data)
             x = x.float().to(device)
             edge_index = edge_index.to(device)
             edge_attr  = edge_attr.float().to(device)
             batch_idx  = batch_idx.to(device)
+            if tile_idx is not None:
+                tile_idx = tile_idx.to(device)
+                tile_NX  = tile_NX.to(device)
+                tile_NY  = tile_NY.to(device)
+                tile_NZ  = tile_NZ.to(device)
+            if tile_x is not None:
+                tile_x = tile_x.float().to(device)
 
             # normalize features
             x_norm = (x - x_mean) / x_std
             edge_attr_norm = (edge_attr - edge_mean) / edge_std
 
-            graph_pred, node_pred = model(x_norm, edge_index, edge_attr_norm, batch_idx)
+            graph_pred, node_pred = model(
+                x_norm, edge_index, edge_attr_norm, batch_idx,
+                tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
+                tile_x=tile_x,
+            )
 
+            # graph_pred = max(node_pred), so it lives in node-normalized space.
+            # Normalize the graph target with node stats to match.
             targ = gnn_target_fn(batch_data).float().to(device)
             targ_norm = (targ - node_target_mean) / node_target_std
 
@@ -252,7 +266,7 @@ def train_gnn_model(
 
             graph_loss = loss_fn(graph_pred, targ_norm)
             node_loss  = loss_fn(node_pred, node_targ_norm)
-            loss = graph_loss + node_loss_weight * node_loss
+            loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -280,16 +294,27 @@ def train_gnn_model(
 
         with torch.no_grad():
             for batch_data in val_loader:
-                x, edge_index, edge_attr, batch_idx = gnn_input_fn(batch_data)
+                x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x = gnn_input_fn(batch_data)
                 x = x.float().to(device)
                 edge_index = edge_index.to(device)
                 edge_attr  = edge_attr.float().to(device)
                 batch_idx  = batch_idx.to(device)
+                if tile_idx is not None:
+                    tile_idx = tile_idx.to(device)
+                    tile_NX  = tile_NX.to(device)
+                    tile_NY  = tile_NY.to(device)
+                    tile_NZ  = tile_NZ.to(device)
+                if tile_x is not None:
+                    tile_x = tile_x.float().to(device)
 
                 x_norm = (x - x_mean) / x_std
                 edge_attr_norm = (edge_attr - edge_mean) / edge_std
 
-                graph_pred, node_pred = model(x_norm, edge_index, edge_attr_norm, batch_idx)
+                graph_pred, node_pred = model(
+                    x_norm, edge_index, edge_attr_norm, batch_idx,
+                    tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
+                    tile_x=tile_x,
+                )
 
                 targ = gnn_target_fn(batch_data).float().to(device)
                 targ_norm = (targ - node_target_mean) / node_target_std
@@ -299,7 +324,7 @@ def train_gnn_model(
 
                 graph_loss = loss_fn(graph_pred, targ_norm)
                 node_loss  = loss_fn(node_pred, node_targ_norm)
-                loss = graph_loss + node_loss_weight * node_loss
+                loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
 
                 total_val       += loss.item()
                 total_val_graph += graph_loss.item()
@@ -324,6 +349,7 @@ def train_gnn_model(
                 "node_in_dim": node_in_dim,
                 "edge_in_dim": edge_in_dim,
                 "out_dim": out_dim,
+                "hierarchical": hierarchical,
                 "target_mean": target_mean.detach().cpu(),
                 "target_std": target_std.detach().cpu(),
                 "node_target_mean": node_target_mean.detach().cpu(),
@@ -368,7 +394,9 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_dim", default=128, type=int)
     parser.add_argument("--conv_layers", default=6, type=int)
     parser.add_argument("--node_loss_weight", default=1.0, type=float)
+    parser.add_argument("--graph_loss_weight", default=1.0, type=float)
     parser.add_argument("--weight_decay", default=1e-3, type=float)
+    parser.add_argument("--dataset", default=None, type=str)
     args = parser.parse_args()
 
     train_gnn_model(
@@ -380,5 +408,7 @@ if __name__ == "__main__":
         hidden_dim=args.hidden_dim,
         conv_layers=args.conv_layers,
         node_loss_weight=args.node_loss_weight,
-        weight_decay=args.weight_decay
+        graph_loss_weight=args.graph_loss_weight,
+        weight_decay=args.weight_decay,
+        dataset_path=args.dataset,
     )

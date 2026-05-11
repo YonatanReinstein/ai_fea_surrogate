@@ -3,7 +3,7 @@ import torch
 import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
 from abc import ABC
-from utils.gnn_surrogate import GNN
+from utils.gnn_surrogate import GNN, HierarchicalGNN
 from evaluators.base_evaluator import BaseEvaluator
 from core.IritModel import IritCModel
 from core.component import Component
@@ -47,22 +47,30 @@ def _run_sample_worker(args):
         force_pattern,
         U,
         V,
-        W
+        W,
+        tile_grid,      # (NX, NY, NZ) tuple or None
     ) = args
     import random
-    sleep(random.uniform(0.1, 0.2))  # Simulate variable computation time
-    #print (f"Worker started for sample index: {sample_index%200}")
+    sleep(random.uniform(0.1, 0.2))
     cad_model = IritCModel(model_path, dims_dict=dims)
     component = Component(cad_model, young, poisson)
     component.generate_mesh(U=U, V=V, W=W)
     component.mesh.anchor_nodes_by_condition(anchor_condition)
     component.mesh.apply_force_by_pattern(force_pattern)
-    data = component.to_graph_with_labels(with_labels=False)
+    data = component.to_graph_with_labels(with_labels=False, tile_grid=tile_grid)
+    if tile_grid is not None and hasattr(data, 'tile_idx'):
+        NX, NY, NZ = tile_grid
+        K = NX * NY * NZ
+        strut_params = torch.tensor(
+            [dims.get(f"d{i + 4}", 0.0) for i in range(K)], dtype=torch.float
+        )
+        strut_feat = strut_params[data.tile_idx].unsqueeze(1)
+        data.x = torch.cat([data.x, strut_feat], dim=1)
+        data.tile_x = strut_params.view(-1, 1)
     if screenshot:
-        save_path=f"screenshots/mesh_{sample_index+1}.png"
+        save_path = f"screenshots/mesh_{sample_index+1}.png"
         component.mesh.plot_mesh(save_path=save_path)
     volume = component.get_volume()
-    # Convert tensors to numpy to avoid FD-based shared memory across processes
     data_dict = {k: v.numpy() for k, v in data.items() if hasattr(v, 'numpy')}
     return data_dict, volume
 
@@ -78,6 +86,7 @@ class GNNEvaluator(BaseEvaluator):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(ckpt_path, map_location=self.device)
 
+        # graph_pred = max(node_pred) lives in node-normalized space, so denormalize with node stats
         self.target_mean = ckpt["node_target_mean"].to(self.device)
         self.target_std  = ckpt["node_target_std"].to(self.device)
         self.x_mean = ckpt["x_mean"].to(self.device)
@@ -91,11 +100,12 @@ class GNNEvaluator(BaseEvaluator):
             int(k.split(".")[1]) for k in ckpt["model_state"] if k.startswith("convs")
         ) + 1
 
-        self.model = GNN(
+        ModelClass = HierarchicalGNN if ckpt.get("hierarchical", False) else GNN
+        self.model = ModelClass(
             node_in_dim=self.node_in_dim,
             edge_in_dim=self.edge_in_dim,
             hidden_dim=128,
-            num_layers=num_layers
+            num_layers=num_layers,
         ).to(self.device)
 
         self.model.load_state_dict(ckpt["model_state"])
@@ -119,6 +129,7 @@ class GNNEvaluator(BaseEvaluator):
         self.force_pattern = module.force_pattern
         self.mesh_resolution = module.mesh_resolution
         self.U, self.V, self.W = self.mesh_resolution()
+        self._get_tile_grid = getattr(module, "tile_grid", None)
         self.listener_thread = threading.Thread(target=listener, daemon=True).start()
 
 
@@ -135,17 +146,19 @@ class GNNEvaluator(BaseEvaluator):
         # Build args
         all_args = [
             (
-             self.model_path,
-             dims, 
-             self.young,
-             self.poisson,
-             idx , 
-             self.screenshots,
-             self.anchor_condition,
-             self.force_pattern,
-             self.U,
-             self.V,
-             self.W)
+                self.model_path,
+                dims,
+                self.young,
+                self.poisson,
+                idx,
+                self.screenshots,
+                self.anchor_condition,
+                self.force_pattern,
+                self.U,
+                self.V,
+                self.W,
+                self._get_tile_grid(dims) if self._get_tile_grid is not None else None,
+            )
             for dims, idx in zip(dims_list, indexes)
         ]
         results = []
@@ -195,7 +208,7 @@ class GNNEvaluator(BaseEvaluator):
         loader = DataLoader(graph_list, batch_size=self.batch_size, shuffle=False)
         for batch_data in loader:
             # Prepare inputs
-            x, edge_index, edge_attr, batch = gnn_input_fn(batch_data)
+            x, edge_index, edge_attr, batch, *_ = gnn_input_fn(batch_data)
             x[:, 3] = x[:, 3] / 1e+6
 
             x = x.to(self.device)
@@ -211,8 +224,25 @@ class GNNEvaluator(BaseEvaluator):
             batch = batch.to(self.device)
 
             # Predict
+            tile_idx = getattr(batch_data, 'tile_idx', None)
+            tile_NX  = getattr(batch_data, 'tile_NX',  None)
+            tile_NY  = getattr(batch_data, 'tile_NY',  None)
+            tile_NZ  = getattr(batch_data, 'tile_NZ',  None)
+            tile_x   = getattr(batch_data, 'tile_x',   None)
+            if tile_idx is not None:
+                tile_idx = tile_idx.to(self.device)
+                tile_NX  = tile_NX.to(self.device)
+                tile_NY  = tile_NY.to(self.device)
+                tile_NZ  = tile_NZ.to(self.device)
+            if tile_x is not None:
+                tile_x = tile_x.float().to(self.device)
+
             with torch.inference_mode():
-                graph_pred, _ = self.model(x, edge_index, edge_attr, batch)
+                graph_pred, _ = self.model(
+                    x, edge_index, edge_attr, batch,
+                    tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
+                    tile_x=tile_x,
+                )
 
             # Denormalize
             stress = graph_pred * self.target_std + self.target_mean

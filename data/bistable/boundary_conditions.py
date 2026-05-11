@@ -13,3 +13,7 @@ def force_pattern(node: Node, tol: float) -> List[float]:
 
 def mesh_resolution() -> tuple[int]:
     return (3, 3, 3)
+
+def tile_grid(dims: dict) -> tuple[int, int, int]:
+    # d1=NX, d2=NY, d3=NZ match the ordering in model_lin.c
+    return (int(dims["d1"]), int(dims["d2"]), int(dims["d3"]))

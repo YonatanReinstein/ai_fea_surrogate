@@ -70,8 +70,8 @@ class IritModelBase(abc.ABC):
         #    "-V", str(V),
         #    "-W", str(W)
         #], cwd=self.tmp_dir, check=True) 
-        nodes, elements = read_inp(f"{self.tmp_dir}/model.inp")
-        return nodes, elements
+        nodes, elements, elem_to_tile = read_inp(f"{self.tmp_dir}/model.inp")
+        return nodes, elements, elem_to_tile
 
     def get_dim_list(self) -> list:
         dim_list = []
@@ -87,8 +87,6 @@ class IritModelBase(abc.ABC):
         if os.path.exists("tmp") and len(os.listdir("tmp")) == 0:
             os.rmdir("tmp")
     
-
-
 
 
 class IritModel(IritModelBase):    

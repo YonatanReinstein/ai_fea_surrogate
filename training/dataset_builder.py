@@ -106,6 +106,7 @@ def build_dataset(
     anchor_condition = module.anchor_condition
     force_pattern = module.force_pattern
     mesh_resolution = module.mesh_resolution
+    get_tile_grid = getattr(module, "tile_grid", None)  # optional, geometry-specific
 
     # Generate ALL dims upfront in the main process from the seeded RNG.
     # When resuming, start at dim index start_idx*2 so resumed runs never
@@ -140,7 +141,8 @@ def build_dataset(
                 comp.mesh.apply_force_by_pattern(force_pattern)
                 comp.ansys_sim(mapdl=mapdl, screenshot_path=None)
 
-                data = comp.to_graph_with_labels()
+                tg = get_tile_grid(dims) if get_tile_grid is not None else None
+                data = comp.to_graph_with_labels(tile_grid=tg)
                 return dim_idx, data, {
                     "id": dim_idx,
                     **dims,

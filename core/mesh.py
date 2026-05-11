@@ -290,6 +290,88 @@ class Mesh:
 
 
 
+    def plot_mesh_with_tiles(self, tile_centers, tile_edges=None, node_tile_map=None, save_path=None, resolution=(3840, 2160)):
+        import numpy as np
+        import pyvista as pv
+        from pyvista import CellType
+
+        node_items = sorted(self.nodes.items())
+        id_map = {nid: i for i, (nid, _) in enumerate(node_items)}
+        points = np.array([node.coords for _, node in node_items], dtype=float)
+
+        cells = []
+        cell_types = []
+        for elem in self.elements.values():
+            local_ids = [id_map[n.id] for n in elem.nodes]
+            cells.append(len(local_ids))
+            cells.extend(local_ids)
+            cell_types.append(CellType.HEXAHEDRON)
+
+        grid = pv.UnstructuredGrid(np.array(cells), np.array(cell_types), points)
+        R = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])
+        center = grid.center
+
+        def apply_rot(p):
+            return (R @ (np.asarray(p, float) - center)) + center
+
+        grid.rotate_z(270, point=grid.center, inplace=True)
+
+        off_screen = save_path is not None
+        plotter = pv.Plotter(off_screen=off_screen, window_size=resolution)
+        plotter.enable_anti_aliasing("msaa")
+        plotter.add_mesh(grid, show_edges=True, opacity=0.3, color="lightblue")
+
+        rotated_tc = [apply_rot(c) for c in tile_centers]
+        plotter.add_points(
+            np.array(rotated_tc),
+            point_size=30,
+            color="orange",
+            render_points_as_spheres=True,
+        )
+
+        if tile_edges is not None:
+            for i, j in tile_edges:
+                line = pv.Line(rotated_tc[i], rotated_tc[j])
+                plotter.add_mesh(line, color="orange", line_width=4)
+
+        rotated_node_coords = {
+            nid: apply_rot(np.array(node.coords, float))
+            for nid, node in node_items
+        }
+
+        if node_tile_map is not None:
+            for nid, node in node_items:
+                t = node_tile_map.get(nid)
+                if t is not None:
+                    p1 = rotated_node_coords[nid]
+                    p2 = rotated_tc[t]
+                    line = pv.Line(p1, p2)
+                    plotter.add_mesh(line, color="green", line_width=1, opacity=0.2)
+
+        # Forces
+        for nid, node in node_items:
+            if node.forces != [0.0, 0.0, 0.0]:
+                force = np.array(node.forces, dtype=float)
+                if np.linalg.norm(force) > 1e-9:
+                    arrow = pv.Arrow(start=rotated_node_coords[nid], direction=apply_rot(force), scale=0.1)
+                    plotter.add_mesh(arrow, color="red")
+
+        # Anchors
+        anchored = [rotated_node_coords[nid] for nid, node in node_items if node.anchored is True]
+        if anchored:
+            plotter.add_points(np.array(anchored), point_size=25, color="blue", render_points_as_spheres=True)
+
+        plotter.view_xz()
+        plotter.camera.up = (1.0, 0.0, 0.0)
+        plotter.enable_parallel_projection()
+
+        if save_path is not None:
+            plotter.screenshot(save_path)
+            plotter.close()
+        else:
+            plotter.show()
+
+
 if __name__ == "__main__":
     from core.IritModel import IritCModel
     model = IritCModel("data/bistable/CAD_model/model", "data/bistable/CAD_model/dims.json")

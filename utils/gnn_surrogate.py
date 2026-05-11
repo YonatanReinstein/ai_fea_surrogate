@@ -33,7 +33,8 @@ class GNN(nn.Module):
         nn.init.normal_(self.virtual_node_emb, std=0.02)
         self.virtual_edge_attr = nn.Parameter(torch.zeros(edge_in_dim))
 
-    def forward(self, x, edge_index, edge_attr, batch):
+    def forward(self, x, edge_index, edge_attr, batch,
+                tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None):
         h = self.encoder(x)
 
         N = h.size(0)
@@ -54,6 +55,134 @@ class GNN(nn.Module):
             virtual_edges.size(1), -1
         )
         edge_attr_aug = torch.cat([edge_attr, virtual_edge_attr], dim=0)
+
+        for conv in self.convs:
+            h_aug = h_aug + conv(h_aug, edge_index_aug, edge_attr_aug)
+
+        h = h_aug[:N]
+        node_pred = self.head(h)
+        graph_pred = global_max_pool(node_pred, batch)
+        return graph_pred, node_pred
+
+
+class HierarchicalGNN(nn.Module):
+    """3-level GNN: real nodes ↔ tile virtual nodes ↔ global virtual node.
+
+    Tile nodes are connected to their assigned real nodes (via tile_idx) and
+    to spatially adjacent tiles (6-connected grid from NX×NY×NZ).  The global
+    node aggregates from all tile nodes, giving a clean multi-scale hierarchy.
+    """
+
+    def __init__(self, node_in_dim, edge_in_dim=1, hidden_dim=128, num_layers=6, tile_in_dim=1):
+        super().__init__()
+
+        self.encoder = MLP([node_in_dim, hidden_dim, hidden_dim], norm=None)
+        self.convs = nn.ModuleList(
+            [EdgeAttrConv(hidden_dim, edge_in_dim) for _ in range(num_layers)]
+        )
+        self.head = MLP([hidden_dim, hidden_dim, 1], norm=None)
+
+        # Level 1 — tile virtual nodes
+        self.tile_emb            = nn.Parameter(torch.zeros(hidden_dim))
+        self.tile_input_encoder  = MLP([tile_in_dim, hidden_dim, hidden_dim], norm=None)
+        self.real_tile_edge_attr = nn.Parameter(torch.zeros(edge_in_dim))
+        self.tile_tile_edge_attr = nn.Parameter(torch.zeros(edge_in_dim))
+        nn.init.normal_(self.tile_emb, std=0.02)
+
+        # Level 2 — global virtual node
+        self.global_emb             = nn.Parameter(torch.zeros(hidden_dim))
+        self.tile_global_edge_attr  = nn.Parameter(torch.zeros(edge_in_dim))
+        nn.init.normal_(self.global_emb, std=0.02)
+
+    @staticmethod
+    def _tile_adjacency(NX, NY, NZ, num_graphs, tile_start, device):
+        """Bidirectional 6-connected grid edges between tile virtual nodes."""
+        pairs = []
+        for ix in range(NX):
+            for iy in range(NY):
+                for iz in range(NZ):
+                    flat = ix * NY * NZ + iy * NZ + iz
+                    for dix, diy, diz in [(1, 0, 0), (0, 1, 0), (0, 0, 1)]:
+                        jx, jy, jz = ix + dix, iy + diy, iz + diz
+                        if jx < NX and jy < NY and jz < NZ:
+                            nb = jx * NY * NZ + jy * NZ + jz
+                            pairs += [(flat, nb), (nb, flat)]
+
+        if not pairs:
+            return torch.empty((2, 0), dtype=torch.long, device=device)
+
+        local = torch.tensor(pairs, dtype=torch.long, device=device).t()  # [2, E_local]
+        K = NX * NY * NZ
+        offsets = torch.arange(num_graphs, device=device) * K             # [G]
+        src = (local[0].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1) + tile_start
+        dst = (local[1].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1) + tile_start
+        return torch.stack([src, dst], dim=0)
+
+    def forward(self, x, edge_index, edge_attr, batch,
+                tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None):
+        h = self.encoder(x)
+        N = h.size(0)
+        num_graphs = int(batch.max().item()) + 1 if N > 0 else 0
+        device = h.device
+        real_idx = torch.arange(N, device=device)
+
+        if tile_idx is not None:
+            NX = int(tile_NX[0])
+            NY = int(tile_NY[0])
+            NZ = int(tile_NZ[0])
+            K  = NX * NY * NZ
+
+            tile_start  = N
+            global_start = N + num_graphs * K
+
+            # --- Build augmented node set ---
+            tile_h = self.tile_emb.unsqueeze(0).expand(num_graphs * K, -1).clone()
+            if tile_x is not None:
+                tile_h = tile_h + self.tile_input_encoder(tile_x.float())
+            global_h = self.global_emb.unsqueeze(0).expand(num_graphs, -1).clone()
+            h_aug = torch.cat([h, tile_h, global_h], dim=0)
+
+            # Real ↔ Tile  (each real node → its tile's virtual node)
+            tile_node_abs = tile_start + batch * K + tile_idx
+            rt_edges = torch.cat([
+                torch.stack([real_idx, tile_node_abs], dim=0),
+                torch.stack([tile_node_abs, real_idx], dim=0),
+            ], dim=1)
+
+            # Tile ↔ Tile  (6-connected spatial adjacency)
+            tt_edges = self._tile_adjacency(NX, NY, NZ, num_graphs, tile_start, device)
+
+            # Tile ↔ Global  (every tile node → its graph's global node)
+            all_tile_nodes = torch.arange(num_graphs * K, device=device)
+            graph_of_tile  = all_tile_nodes // K
+            tg_src = tile_start   + all_tile_nodes
+            tg_dst = global_start + graph_of_tile
+            tg_edges = torch.cat([
+                torch.stack([tg_src, tg_dst], dim=0),
+                torch.stack([tg_dst, tg_src], dim=0),
+            ], dim=1)
+
+            edge_index_aug = torch.cat([edge_index, rt_edges, tt_edges, tg_edges], dim=1)
+
+            rt_ea = self.real_tile_edge_attr.unsqueeze(0).expand(rt_edges.size(1), -1)
+            tt_ea = self.tile_tile_edge_attr.unsqueeze(0).expand(tt_edges.size(1), -1)
+            tg_ea = self.tile_global_edge_attr.unsqueeze(0).expand(tg_edges.size(1), -1)
+            edge_attr_aug = torch.cat([edge_attr, rt_ea, tt_ea, tg_ea], dim=0)
+
+        else:
+            # Fallback: single global virtual node (original GNN behaviour)
+            global_start = N
+            global_h = self.global_emb.unsqueeze(0).expand(num_graphs, -1).clone()
+            h_aug = torch.cat([h, global_h], dim=0)
+
+            global_node_abs = global_start + batch
+            virt_edges = torch.cat([
+                torch.stack([real_idx, global_node_abs], dim=0),
+                torch.stack([global_node_abs, real_idx], dim=0),
+            ], dim=1)
+            edge_index_aug = torch.cat([edge_index, virt_edges], dim=1)
+            tg_ea = self.tile_global_edge_attr.unsqueeze(0).expand(virt_edges.size(1), -1)
+            edge_attr_aug = torch.cat([edge_attr, tg_ea], dim=0)
 
         for conv in self.convs:
             h_aug = h_aug + conv(h_aug, edge_index_aug, edge_attr_aug)
