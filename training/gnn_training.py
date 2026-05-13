@@ -3,6 +3,7 @@ import json
 import os
 import re
 import glob
+import time
 from torch_geometric.loader import DataLoader
 from utils.gnn_surrogate import GNN, HierarchicalGNN
 
@@ -153,9 +154,11 @@ def train_gnn_model(
     # DataLoaders
     # ----------------------------------------------------
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                              num_workers=4, persistent_workers=True, pin_memory=True)
+                              num_workers=8, persistent_workers=True, pin_memory=True,
+                              prefetch_factor=4)
     val_loader   = DataLoader(val_set, batch_size=batch_size, shuffle=False,
-                              num_workers=2, persistent_workers=True, pin_memory=True)
+                              num_workers=4, persistent_workers=True, pin_memory=True,
+                              prefetch_factor=4)
 
     # ----------------------------------------------------
     # Model setup
@@ -208,6 +211,9 @@ def train_gnn_model(
             train_node_losses  = prev.get("train_node_losses", [])[:start_epoch]
             val_node_losses    = prev.get("val_node_losses", [])[:start_epoch]
 
+    if start_epoch > 0:
+        for pg in optimizer.param_groups:
+            pg.setdefault("initial_lr", pg["lr"])
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
         step_size=10,
@@ -221,6 +227,7 @@ def train_gnn_model(
     for epoch in range(start_epoch + 1, epochs + 1):
         # re-seed per epoch so resumed runs don't replay the same batch order
         torch.manual_seed(42 + epoch)
+        epoch_t0 = time.time()
 
         # -----------------------------
         # TRAIN
@@ -230,51 +237,89 @@ def train_gnn_model(
         total_train_graph = 0.0
         total_train_node  = 0.0
 
-        for batch_data in train_loader:
+        # Per-section timing (only collected on epoch 1 to keep overhead off the steady state).
+        profile_this_epoch = (epoch == start_epoch + 1)
+        t_data = t_h2d = t_fwd = t_bwd = t_step = 0.0
+        n_steps = 0
+
+        def _sync():
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        loader_iter = iter(train_loader)
+        if profile_this_epoch: _sync()
+        t_mark = time.perf_counter()
+
+        while True:
+            try:
+                batch_data = next(loader_iter)
+            except StopIteration:
+                break
+            if profile_this_epoch:
+                _sync(); t_now = time.perf_counter(); t_data += t_now - t_mark; t_mark = t_now
+
             optimizer.zero_grad()
 
             x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x = gnn_input_fn(batch_data)
-            x = x.float().to(device)
-            edge_index = edge_index.to(device)
-            edge_attr  = edge_attr.float().to(device)
-            batch_idx  = batch_idx.to(device)
+            num_graphs = batch_data.num_graphs
+            x = x.float().to(device, non_blocking=True)
+            edge_index = edge_index.to(device, non_blocking=True)
+            edge_attr  = edge_attr.float().to(device, non_blocking=True)
+            batch_idx  = batch_idx.to(device, non_blocking=True)
             if tile_idx is not None:
-                tile_idx = tile_idx.to(device)
-                tile_NX  = tile_NX.to(device)
-                tile_NY  = tile_NY.to(device)
-                tile_NZ  = tile_NZ.to(device)
+                tile_idx = tile_idx.to(device, non_blocking=True)
+                tile_NX  = tile_NX.to(device,  non_blocking=True)
+                tile_NY  = tile_NY.to(device,  non_blocking=True)
+                tile_NZ  = tile_NZ.to(device,  non_blocking=True)
             if tile_x is not None:
-                tile_x = tile_x.float().to(device)
+                tile_x = tile_x.float().to(device, non_blocking=True)
 
             # normalize features
             x_norm = (x - x_mean) / x_std
             edge_attr_norm = (edge_attr - edge_mean) / edge_std
 
+            targ = gnn_target_fn(batch_data).float().to(device, non_blocking=True)
+            targ_norm = (targ - node_target_mean) / node_target_std
+            node_targ = gnn_node_target_fn(batch_data).float().to(device, non_blocking=True)
+            node_targ_norm = (node_targ - node_target_mean) / node_target_std
+            if profile_this_epoch:
+                _sync(); t_now = time.perf_counter(); t_h2d += t_now - t_mark; t_mark = t_now
+
             graph_pred, node_pred = model(
                 x_norm, edge_index, edge_attr_norm, batch_idx,
                 tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
-                tile_x=tile_x,
+                tile_x=tile_x, num_graphs=num_graphs,
             )
-
-            # graph_pred = max(node_pred), so it lives in node-normalized space.
-            # Normalize the graph target with node stats to match.
-            targ = gnn_target_fn(batch_data).float().to(device)
-            targ_norm = (targ - node_target_mean) / node_target_std
-
-            node_targ = gnn_node_target_fn(batch_data).float().to(device)
-            node_targ_norm = (node_targ - node_target_mean) / node_target_std
-
             graph_loss = loss_fn(graph_pred, targ_norm)
             node_loss  = loss_fn(node_pred, node_targ_norm)
             loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
+            if profile_this_epoch:
+                _sync(); t_now = time.perf_counter(); t_fwd += t_now - t_mark; t_mark = t_now
+
             loss.backward()
+            if profile_this_epoch:
+                _sync(); t_now = time.perf_counter(); t_bwd += t_now - t_mark; t_mark = t_now
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            if profile_this_epoch:
+                _sync(); t_now = time.perf_counter(); t_step += t_now - t_mark; t_mark = t_now
 
             total_train       += loss.item()
             total_train_graph += graph_loss.item()
             total_train_node  += node_loss.item()
+            n_steps += 1
+
+        if profile_this_epoch and n_steps > 0:
+            total = t_data + t_h2d + t_fwd + t_bwd + t_step
+            print(
+                f"[profile] steps={n_steps}  "
+                f"data={t_data:6.1f}s ({100*t_data/total:4.1f}%)  "
+                f"h2d={t_h2d:6.1f}s ({100*t_h2d/total:4.1f}%)  "
+                f"fwd={t_fwd:6.1f}s ({100*t_fwd/total:4.1f}%)  "
+                f"bwd={t_bwd:6.1f}s ({100*t_bwd/total:4.1f}%)  "
+                f"opt={t_step:6.1f}s ({100*t_step/total:4.1f}%)"
+            )
 
         n_train_batches = max(len(train_loader), 1)
         avg_train       = total_train       / n_train_batches
@@ -283,6 +328,12 @@ def train_gnn_model(
         train_losses.append(avg_train)
         train_graph_losses.append(avg_train_graph)
         train_node_losses.append(avg_train_node)
+
+        if torch.cuda.is_available():
+            peak = torch.cuda.max_memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            print(f"[vram] peak={peak:.2f} GB | reserved={reserved:.2f} GB")
+            torch.cuda.reset_peak_memory_stats()
 
         # -----------------------------
         # VALIDATION
@@ -295,33 +346,33 @@ def train_gnn_model(
         with torch.no_grad():
             for batch_data in val_loader:
                 x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x = gnn_input_fn(batch_data)
-                x = x.float().to(device)
-                edge_index = edge_index.to(device)
-                edge_attr  = edge_attr.float().to(device)
-                batch_idx  = batch_idx.to(device)
+                num_graphs = batch_data.num_graphs
+                x = x.float().to(device, non_blocking=True)
+                edge_index = edge_index.to(device, non_blocking=True)
+                edge_attr  = edge_attr.float().to(device, non_blocking=True)
+                batch_idx  = batch_idx.to(device, non_blocking=True)
                 if tile_idx is not None:
-                    tile_idx = tile_idx.to(device)
-                    tile_NX  = tile_NX.to(device)
-                    tile_NY  = tile_NY.to(device)
-                    tile_NZ  = tile_NZ.to(device)
+                    tile_idx = tile_idx.to(device, non_blocking=True)
+                    tile_NX  = tile_NX.to(device,  non_blocking=True)
+                    tile_NY  = tile_NY.to(device,  non_blocking=True)
+                    tile_NZ  = tile_NZ.to(device,  non_blocking=True)
                 if tile_x is not None:
-                    tile_x = tile_x.float().to(device)
+                    tile_x = tile_x.float().to(device, non_blocking=True)
 
                 x_norm = (x - x_mean) / x_std
                 edge_attr_norm = (edge_attr - edge_mean) / edge_std
 
+                targ = gnn_target_fn(batch_data).float().to(device, non_blocking=True)
+                targ_norm = (targ - node_target_mean) / node_target_std
+
+                node_targ = gnn_node_target_fn(batch_data).float().to(device, non_blocking=True)
+                node_targ_norm = (node_targ - node_target_mean) / node_target_std
+
                 graph_pred, node_pred = model(
                     x_norm, edge_index, edge_attr_norm, batch_idx,
                     tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
-                    tile_x=tile_x,
+                    tile_x=tile_x, num_graphs=num_graphs,
                 )
-
-                targ = gnn_target_fn(batch_data).float().to(device)
-                targ_norm = (targ - node_target_mean) / node_target_std
-
-                node_targ = gnn_node_target_fn(batch_data).float().to(device)
-                node_targ_norm = (node_targ - node_target_mean) / node_target_std
-
                 graph_loss = loss_fn(graph_pred, targ_norm)
                 node_loss  = loss_fn(node_pred, node_targ_norm)
                 loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
@@ -371,8 +422,9 @@ def train_gnn_model(
                     "val_node_losses": val_node_losses,
                 }, f, indent=4)
 
+        epoch_secs = time.time() - epoch_t0
         print(
-            f"Epoch {epoch:03d}/{epochs} | "
+            f"Epoch {epoch:03d}/{epochs} | {epoch_secs:6.1f}s | "
             f"Train: {avg_train:.6f} (g {avg_train_graph:.6f} / n {avg_train_node:.6f}) | "
             f"Val: {avg_val:.6f} (g {avg_val_graph:.6f} / n {avg_val_node:.6f}) | "
             f"LR: {optimizer.param_groups[0]['lr']:.2e}"

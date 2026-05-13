@@ -1,7 +1,7 @@
 
 import torch
 
-dataset_path = "data/bistable/dataset_0/dataset.pt"
+dataset_path = "data/bistable/dataset/dataset.pt"
 dataset = torch.load(dataset_path, weights_only=False)  
 print(f"length: {len(dataset)}")
 max_stress_values = []

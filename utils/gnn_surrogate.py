@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from torch_geometric.nn import MessagePassing, global_max_pool
 from torch_geometric.nn.models import MLP
 
@@ -8,7 +9,7 @@ from torch_geometric.nn.models import MLP
 class EdgeAttrConv(MessagePassing):
     def __init__(self, hidden_dim, edge_dim):
         super().__init__(aggr="mean")
-        self.mlp = MLP([2 * hidden_dim + edge_dim, hidden_dim, hidden_dim], norm=None)
+        self.mlp = MLP([2 * hidden_dim + edge_dim, hidden_dim, hidden_dim], norm="layer_norm")
 
     def forward(self, x, edge_index, edge_attr):
         return self.propagate(edge_index, x=x, edge_attr=edge_attr)
@@ -34,11 +35,13 @@ class GNN(nn.Module):
         self.virtual_edge_attr = nn.Parameter(torch.zeros(edge_in_dim))
 
     def forward(self, x, edge_index, edge_attr, batch,
-                tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None):
+                tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
+                num_graphs=None):
         h = self.encoder(x)
 
         N = h.size(0)
-        num_graphs = int(batch.max().item()) + 1 if N > 0 else 0
+        if num_graphs is None:
+            num_graphs = int(batch.max().item()) + 1 if N > 0 else 0
         device = h.device
 
         h_virtual = self.virtual_node_emb.unsqueeze(0).expand(num_graphs, -1)
@@ -57,7 +60,11 @@ class GNN(nn.Module):
         edge_attr_aug = torch.cat([edge_attr, virtual_edge_attr], dim=0)
 
         for conv in self.convs:
-            h_aug = h_aug + conv(h_aug, edge_index_aug, edge_attr_aug)
+            if self.training:
+                h_aug = h_aug + checkpoint(conv, h_aug, edge_index_aug, edge_attr_aug,
+                                           use_reentrant=False)
+            else:
+                h_aug = h_aug + conv(h_aug, edge_index_aug, edge_attr_aug)
 
         h = h_aug[:N]
         node_pred = self.head(h)
@@ -94,9 +101,13 @@ class HierarchicalGNN(nn.Module):
         self.tile_global_edge_attr  = nn.Parameter(torch.zeros(edge_in_dim))
         nn.init.normal_(self.global_emb, std=0.02)
 
+        # Cache for local tile adjacency pairs, keyed by (NX, NY, NZ).
+        # Plain dict — not serialized in state_dict, rebuilt on first forward.
+        self._tile_adj_cache: dict = {}
+
     @staticmethod
-    def _tile_adjacency(NX, NY, NZ, num_graphs, tile_start, device):
-        """Bidirectional 6-connected grid edges between tile virtual nodes."""
+    def _build_local_tile_adj(NX, NY, NZ):
+        """Build local (intra-graph) 6-connected tile pairs. Called once per grid shape."""
         pairs = []
         for ix in range(NX):
             for iy in range(NY):
@@ -107,11 +118,21 @@ class HierarchicalGNN(nn.Module):
                         if jx < NX and jy < NY and jz < NZ:
                             nb = jx * NY * NZ + jy * NZ + jz
                             pairs += [(flat, nb), (nb, flat)]
-
         if not pairs:
+            return None
+        return torch.tensor(pairs, dtype=torch.long).t()  # [2, E_local]
+
+    def _tile_adjacency(self, NX, NY, NZ, num_graphs, tile_start, device):
+        """Bidirectional 6-connected grid edges between tile virtual nodes."""
+        key = (NX, NY, NZ, device)
+        if key not in self._tile_adj_cache:
+            local = self._build_local_tile_adj(NX, NY, NZ)
+            self._tile_adj_cache[key] = local.to(device) if local is not None else None
+        local = self._tile_adj_cache[key]
+
+        if local is None:
             return torch.empty((2, 0), dtype=torch.long, device=device)
 
-        local = torch.tensor(pairs, dtype=torch.long, device=device).t()  # [2, E_local]
         K = NX * NY * NZ
         offsets = torch.arange(num_graphs, device=device) * K             # [G]
         src = (local[0].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1) + tile_start
@@ -119,10 +140,12 @@ class HierarchicalGNN(nn.Module):
         return torch.stack([src, dst], dim=0)
 
     def forward(self, x, edge_index, edge_attr, batch,
-                tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None):
+                tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
+                num_graphs=None):
         h = self.encoder(x)
         N = h.size(0)
-        num_graphs = int(batch.max().item()) + 1 if N > 0 else 0
+        if num_graphs is None:
+            num_graphs = int(batch.max().item()) + 1 if N > 0 else 0
         device = h.device
         real_idx = torch.arange(N, device=device)
 
@@ -136,10 +159,10 @@ class HierarchicalGNN(nn.Module):
             global_start = N + num_graphs * K
 
             # --- Build augmented node set ---
-            tile_h = self.tile_emb.unsqueeze(0).expand(num_graphs * K, -1).clone()
+            tile_h = self.tile_emb.unsqueeze(0).expand(num_graphs * K, -1)
             if tile_x is not None:
                 tile_h = tile_h + self.tile_input_encoder(tile_x.float())
-            global_h = self.global_emb.unsqueeze(0).expand(num_graphs, -1).clone()
+            global_h = self.global_emb.unsqueeze(0).expand(num_graphs, -1)
             h_aug = torch.cat([h, tile_h, global_h], dim=0)
 
             # Real ↔ Tile  (each real node → its tile's virtual node)
@@ -172,7 +195,7 @@ class HierarchicalGNN(nn.Module):
         else:
             # Fallback: single global virtual node (original GNN behaviour)
             global_start = N
-            global_h = self.global_emb.unsqueeze(0).expand(num_graphs, -1).clone()
+            global_h = self.global_emb.unsqueeze(0).expand(num_graphs, -1)
             h_aug = torch.cat([h, global_h], dim=0)
 
             global_node_abs = global_start + batch
@@ -185,7 +208,11 @@ class HierarchicalGNN(nn.Module):
             edge_attr_aug = torch.cat([edge_attr, tg_ea], dim=0)
 
         for conv in self.convs:
-            h_aug = h_aug + conv(h_aug, edge_index_aug, edge_attr_aug)
+            if self.training:
+                h_aug = h_aug + checkpoint(conv, h_aug, edge_index_aug, edge_attr_aug,
+                                           use_reentrant=False)
+            else:
+                h_aug = h_aug + conv(h_aug, edge_index_aug, edge_attr_aug)
 
         h = h_aug[:N]
         node_pred = self.head(h)

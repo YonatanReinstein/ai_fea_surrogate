@@ -2,29 +2,32 @@
 #SBATCH --job-name=train_hier_gnn
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=4:00:00
+#SBATCH --time=30:00:00
 #SBATCH --partition=public
-#SBATCH --gres=gpu:A100:1
+#SBATCH --gres=gpu:A40:1
 #SBATCH --output=%x_%j.log
 #SBATCH --error=%x_%j.log
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=yoyo.reinstein@gmail.com
 
-cd /home/ryonatan/ai_fea_surrogate
+cd "$SLURM_SUBMIT_DIR"
+mkdir -p training/runs/train
 source env/bin/activate
 
-export OMP_NUM_THREADS=16
-export MKL_NUM_THREADS=16
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
 export PYTHONUNBUFFERED=1
 
 python -u -m training.gnn_training \
     --geometry bistable \
-    --dataset data/bistable/dataset/dataset_test.pt \
-    --num_samples 500 \
+    --dataset data/bistable/dataset/dataset.pt \
+    --num_samples 5000 \
     --epochs 100 \
     --lr 1e-3 \
-    --batch_size 8 \
-    --hidden_dim 128 \
+    --batch_size 24 \
+    --hidden_dim 64 \
     --conv_layers 6 \
     --node_loss_weight 1.0 \
     --graph_loss_weight 0.0 \
