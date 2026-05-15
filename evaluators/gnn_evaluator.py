@@ -99,12 +99,13 @@ class GNNEvaluator(BaseEvaluator):
         num_layers = max(
             int(k.split(".")[1]) for k in ckpt["model_state"] if k.startswith("convs")
         ) + 1
+        hidden_dim = ckpt.get("hidden_dim") or ckpt["model_state"]["encoder.lins.0.bias"].shape[0]
 
         ModelClass = HierarchicalGNN if ckpt.get("hierarchical", False) else GNN
         self.model = ModelClass(
             node_in_dim=self.node_in_dim,
             edge_in_dim=self.edge_in_dim,
-            hidden_dim=128,
+            hidden_dim=hidden_dim,
             num_layers=num_layers,
         ).to(self.device)
 

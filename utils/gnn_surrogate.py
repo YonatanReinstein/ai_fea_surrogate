@@ -19,8 +19,10 @@ class EdgeAttrConv(MessagePassing):
 
 
 class GNN(nn.Module):
-    def __init__(self, node_in_dim, edge_in_dim=1, hidden_dim=128, num_layers=6):
+    def __init__(self, node_in_dim, edge_in_dim=1, hidden_dim=128, num_layers=6,
+                 use_checkpoint=False):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
 
         self.encoder = MLP([node_in_dim, hidden_dim, hidden_dim], norm=None)
         self.convs = nn.ModuleList()
@@ -60,7 +62,7 @@ class GNN(nn.Module):
         edge_attr_aug = torch.cat([edge_attr, virtual_edge_attr], dim=0)
 
         for conv in self.convs:
-            if self.training:
+            if self.training and self.use_checkpoint:
                 h_aug = h_aug + checkpoint(conv, h_aug, edge_index_aug, edge_attr_aug,
                                            use_reentrant=False)
             else:
@@ -80,8 +82,14 @@ class HierarchicalGNN(nn.Module):
     node aggregates from all tile nodes, giving a clean multi-scale hierarchy.
     """
 
-    def __init__(self, node_in_dim, edge_in_dim=1, hidden_dim=128, num_layers=6, tile_in_dim=1):
+    def __init__(self, node_in_dim, edge_in_dim=1, hidden_dim=128, num_layers=6, tile_in_dim=1,
+                 use_checkpoint=False, checkpoint_fine_only=False):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
+        # When True, only the encode/decode (fine-mesh) layers are checkpointed.
+        # The coarse middle layers run without checkpoint because their
+        # activations are tiny anyway. Requires use_checkpoint=True to have effect.
+        self.checkpoint_fine_only = checkpoint_fine_only
 
         self.encoder = MLP([node_in_dim, hidden_dim, hidden_dim], norm=None)
         self.convs = nn.ModuleList(
@@ -185,12 +193,39 @@ class HierarchicalGNN(nn.Module):
                 torch.stack([tg_dst, tg_src], dim=0),
             ], dim=1)
 
-            edge_index_aug = torch.cat([edge_index, rt_edges, tt_edges, tg_edges], dim=1)
-
             rt_ea = self.real_tile_edge_attr.unsqueeze(0).expand(rt_edges.size(1), -1)
             tt_ea = self.tile_tile_edge_attr.unsqueeze(0).expand(tt_edges.size(1), -1)
             tg_ea = self.tile_global_edge_attr.unsqueeze(0).expand(tg_edges.size(1), -1)
-            edge_attr_aug = torch.cat([edge_attr, rt_ea, tt_ea, tg_ea], dim=0)
+
+            # Multi-scale schedule: first + last layer touch the fine mesh
+            # (real↔real + real↔tile); middle layers operate only on the coarse
+            # graph (tile↔tile + tile↔global), which has vastly fewer edges.
+            # Encode: gather local geometry and push it up to tiles.
+            # Process: cheap global reasoning at the coarse scale.
+            # Decode: pull tile info back to real nodes + final local refinement.
+            fine_ei = torch.cat([edge_index, rt_edges], dim=1)
+            fine_ea = torch.cat([edge_attr, rt_ea], dim=0)
+
+            coarse_ei = torch.cat([tt_edges, tg_edges], dim=1)
+            coarse_ea = torch.cat([tt_ea, tg_ea], dim=0)
+
+            num_layers = len(self.convs)
+            for i, conv in enumerate(self.convs):
+                is_fine = (i == 0 or i == num_layers - 1 or num_layers <= 2)
+                if is_fine:
+                    ei, ea = fine_ei, fine_ea
+                else:
+                    ei, ea = coarse_ei, coarse_ea
+
+                ckpt_this = (
+                    self.training
+                    and self.use_checkpoint
+                    and (is_fine or not self.checkpoint_fine_only)
+                )
+                if ckpt_this:
+                    h_aug = h_aug + checkpoint(conv, h_aug, ei, ea, use_reentrant=False)
+                else:
+                    h_aug = h_aug + conv(h_aug, ei, ea)
 
         else:
             # Fallback: single global virtual node (original GNN behaviour)
@@ -207,12 +242,12 @@ class HierarchicalGNN(nn.Module):
             tg_ea = self.tile_global_edge_attr.unsqueeze(0).expand(virt_edges.size(1), -1)
             edge_attr_aug = torch.cat([edge_attr, tg_ea], dim=0)
 
-        for conv in self.convs:
-            if self.training:
-                h_aug = h_aug + checkpoint(conv, h_aug, edge_index_aug, edge_attr_aug,
-                                           use_reentrant=False)
-            else:
-                h_aug = h_aug + conv(h_aug, edge_index_aug, edge_attr_aug)
+            for conv in self.convs:
+                if self.training and self.use_checkpoint:
+                    h_aug = h_aug + checkpoint(conv, h_aug, edge_index_aug, edge_attr_aug,
+                                               use_reentrant=False)
+                else:
+                    h_aug = h_aug + conv(h_aug, edge_index_aug, edge_attr_aug)
 
         h = h_aug[:N]
         node_pred = self.head(h)

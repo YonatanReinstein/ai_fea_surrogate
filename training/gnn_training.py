@@ -45,6 +45,8 @@ def train_gnn_model(
     graph_loss_weight: float = 1.0,
     weight_decay: float = 1e-4,
     dataset_path: str = None,
+    use_checkpoint: bool = False,
+    checkpoint_fine_only: bool = False,
 ):
     torch.manual_seed(42)
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
@@ -78,14 +80,16 @@ def train_gnn_model(
  
     for sample in dataset:
         #convert force to MN
-        sample.x[:, 3] = sample.x[:, 3] / 1e+6
+        sample.x[:, 3:6] = sample.x[:, 3:6] / 1e+6
         #convert max_stress to MPa
         sample.max_stress = sample.max_stress / 1e+6
         #convert node_stress to MPa
         sample.node_stress = sample.node_stress / 1e+6
         # inject per-node strut dimension: dims[3 + tile_idx] = d4..d103
-        if hasattr(sample, 'tile_idx') and hasattr(sample, 'dims'):
-            tile_struts = sample.dims[0, 3:].float()  # [K]
+        #if hasattr(sample, 'tile_idx') and hasattr(sample, 'dims'):
+        if True:
+            K = int(sample.tile_NX) * int(sample.tile_NY) * int(sample.tile_NZ)
+            tile_struts = sample.dims[0, 3:3+K].float()  # [K]
             strut_param = tile_struts[sample.tile_idx].unsqueeze(1)
             sample.x = torch.cat([sample.x, strut_param], dim=1)
             # per-tile feature: one strut value per tile virtual node, shape [K, 1]
@@ -169,13 +173,20 @@ def train_gnn_model(
     out_dim     = gnn_target_fn(example).shape[1]
 
     hierarchical = hasattr(train_set[0], 'tile_idx')
-    ModelClass = HierarchicalGNN if hierarchical else GNN
-    model = ModelClass(
+    #ModelClass = HierarchicalGNN if hierarchical else GNN
+    ModelClass = HierarchicalGNN
+    model_kwargs = dict(
         node_in_dim=node_in_dim,
         edge_in_dim=edge_in_dim,
         hidden_dim=hidden_dim,
         num_layers=conv_layers,
-    ).to(device)
+        use_checkpoint=use_checkpoint,
+    )
+    if hierarchical:
+        model_kwargs["checkpoint_fine_only"] = checkpoint_fine_only
+    model = ModelClass(**model_kwargs).to(device)
+    print(f"[model] use_checkpoint={use_checkpoint} "
+          f"checkpoint_fine_only={checkpoint_fine_only if hierarchical else 'N/A'}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn   = torch.nn.MSELoss()
@@ -399,6 +410,7 @@ def train_gnn_model(
                 "model_state": model.state_dict(),
                 "node_in_dim": node_in_dim,
                 "edge_in_dim": edge_in_dim,
+                "hidden_dim": hidden_dim,
                 "out_dim": out_dim,
                 "hierarchical": hierarchical,
                 "target_mean": target_mean.detach().cpu(),
@@ -449,6 +461,17 @@ if __name__ == "__main__":
     parser.add_argument("--graph_loss_weight", default=1.0, type=float)
     parser.add_argument("--weight_decay", default=1e-3, type=float)
     parser.add_argument("--dataset", default=None, type=str)
+    def _bool(s):
+        if isinstance(s, bool):
+            return s
+        return str(s).lower() in ("1", "true", "yes", "y", "on")
+    parser.add_argument("--use_checkpoint", type=_bool, default=False,
+                        help="Enable gradient checkpointing (trades compute for memory). "
+                             "Pass true/false (e.g. --use_checkpoint true).")
+    parser.add_argument("--checkpoint_fine_only", type=_bool, default=False,
+                        help="If use_checkpoint=true, checkpoint only the fine-mesh "
+                             "(encode/decode) layers in HierarchicalGNN. Coarse layers "
+                             "run without checkpoint (their activations are tiny).")
     args = parser.parse_args()
 
     train_gnn_model(
@@ -463,4 +486,6 @@ if __name__ == "__main__":
         graph_loss_weight=args.graph_loss_weight,
         weight_decay=args.weight_decay,
         dataset_path=args.dataset,
+        use_checkpoint=args.use_checkpoint,
+        checkpoint_fine_only=args.checkpoint_fine_only,
     )
