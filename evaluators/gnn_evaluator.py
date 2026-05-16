@@ -14,7 +14,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 import importlib
 import threading
-from time import sleep
+from time import sleep, perf_counter
 import socket
 
 STOP = False   
@@ -51,13 +51,25 @@ def _run_sample_worker(args):
         tile_grid,      # (NX, NY, NZ) tuple or None
     ) = args
     import random
+    timings = {}
     sleep(random.uniform(0.1, 0.2))
+    t = perf_counter()
     cad_model = IritCModel(model_path, dims_dict=dims)
     component = Component(cad_model, young, poisson)
+    timings["cad_model"] = perf_counter() - t
+
+    t = perf_counter()
     component.generate_mesh(U=U, V=V, W=W)
+    timings["generate_mesh"] = perf_counter() - t
+
+    t = perf_counter()
     component.mesh.anchor_nodes_by_condition(anchor_condition)
     component.mesh.apply_force_by_pattern(force_pattern)
+    timings["boundary_conditions"] = perf_counter() - t
+
+    t = perf_counter()
     data = component.to_graph_with_labels(with_labels=False, tile_grid=tile_grid)
+    timings["to_graph"] = perf_counter() - t
     if tile_grid is not None and hasattr(data, 'tile_idx'):
         NX, NY, NZ = tile_grid
         K = NX * NY * NZ
@@ -70,9 +82,11 @@ def _run_sample_worker(args):
     if screenshot:
         save_path = f"screenshots/mesh_{sample_index+1}.png"
         component.mesh.plot_mesh(save_path=save_path)
+    t = perf_counter()
     volume = component.get_volume()
+    timings["get_volume"] = perf_counter() - t
     data_dict = {k: v.numpy() for k, v in data.items() if hasattr(v, 'numpy')}
-    return data_dict, volume
+    return data_dict, volume, timings
 
 
 class GNNEvaluator(BaseEvaluator):
@@ -138,6 +152,7 @@ class GNNEvaluator(BaseEvaluator):
     def evaluate(self, dims_list: list[dict]):
         #print("start evaluation of batch size:", len(dims_list))
         batch_size = len(dims_list)
+        t_eval_start = perf_counter()
 
 
         # Unique screenshot indexes
@@ -145,6 +160,7 @@ class GNNEvaluator(BaseEvaluator):
         self.sample_counter += batch_size
 
         # Build args
+        t = perf_counter()
         all_args = [
             (
                 self.model_path,
@@ -162,9 +178,11 @@ class GNNEvaluator(BaseEvaluator):
             )
             for dims, idx in zip(dims_list, indexes)
         ]
+        t_build_args = perf_counter() - t
         results = []
 
 
+        t = perf_counter()
         if self.processes is None:
             pool = Pool()
         else:
@@ -189,23 +207,20 @@ class GNNEvaluator(BaseEvaluator):
         except KeyboardInterrupt:
             print("KeyboardInterrupt detected. Terminating pool.")
             pool.terminate()
+        t_pool = perf_counter() - t
 
-        #print("pool completed.")
-
-        #print("Preparing GNN inputs...")
-
-
-
-
-        graph_dicts, volume_list = zip(*results)
+        graph_dicts, volume_list, worker_timings = zip(*results)
+        t = perf_counter()
         graph_list = [
             Data(**{k: torch.from_numpy(v) for k, v in d.items()})
             for d in graph_dicts
         ]
+        t_graph_build = perf_counter() - t
 
         # Build DataLoader
         all_stress = []
 
+        t = perf_counter()
         loader = DataLoader(graph_list, batch_size=self.batch_size, shuffle=False)
         for batch_data in loader:
             # Prepare inputs
@@ -248,10 +263,30 @@ class GNNEvaluator(BaseEvaluator):
             # Denormalize
             stress = graph_pred * self.target_std + self.target_mean
             stress = stress.squeeze()
-            #print("Evaluation completed.")
-
             all_stress.extend(stress.detach().cpu().numpy().tolist())
-            
+        t_inference = perf_counter() - t
+
+        # ---- timing report ----
+        n = len(worker_timings)
+        worker_avg = {
+            k: sum(wt[k] for wt in worker_timings) / n
+            for k in worker_timings[0]
+        }
+        worker_total = sum(sum(wt.values()) for wt in worker_timings)
+        t_eval_total = perf_counter() - t_eval_start
+        print(
+            f"[GNNEvaluator] batch={batch_size} processes={self.processes} "
+            f"total={t_eval_total:.2f}s | "
+            f"build_args={t_build_args:.2f}s pool={t_pool:.2f}s "
+            f"graph_build={t_graph_build:.2f}s inference={t_inference:.2f}s",
+            flush=True,
+        )
+        print(
+            f"[GNNEvaluator]   per-sample avg (in worker): "
+            + " ".join(f"{k}={v:.3f}s" for k, v in worker_avg.items())
+            + f" | cpu-sum={worker_total:.2f}s",
+            flush=True,
+        )
 
         return {
             "stress": all_stress,        # shape [batch_size]

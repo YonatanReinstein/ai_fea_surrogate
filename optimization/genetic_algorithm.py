@@ -72,7 +72,8 @@ class GeneticAlgorithm:
     def _crossover(self, p1, p2):
         if random.random() < self.crossover_rate:
             alpha = np.random.uniform(0.3, 0.7)
-            return alpha * p1 + (1 - alpha) * p2
+            child = alpha * p1 + (1 - alpha) * p2
+            return np.clip(child, self.bounds[:, 0], self.bounds[:, 1])
         return p1.copy()
 
     def _diversity_scores(self, population):

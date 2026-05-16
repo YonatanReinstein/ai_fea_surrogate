@@ -1,7 +1,7 @@
 from .mlp_evaluator import MLPEvaluator
 from .gnn_evaluator import GNNEvaluator
 from .mapdl_evaluator import MAPDLEvaluator
-import json
+
 
 def get_evaluator(geometry_name, arch="mlp", screenshots: bool = False, processes: int = None, batch_size: int = 128):
     if arch == "mlp":

@@ -6,7 +6,7 @@
 #SBATCH --mem=100G
 #SBATCH --time=30:00:00
 #SBATCH --partition=public
-#SBATCH --gres=gpu:A100:1
+#SBATCH --gres=gpu:A40:1
 #SBATCH --output=%x_%j.log
 #SBATCH --error=%x_%j.log
 #SBATCH --mail-type=END,FAIL
@@ -26,13 +26,13 @@ python -u -m training.gnn_training \
     --geometry bistable \
     --dataset data/bistable/dataset/dataset_6x6.pt \
     --num_samples 5000 \
-    --epochs 100 \
+    --epochs 202 \
     --lr 1e-3 \
-    --batch_size 60 \
+    --batch_size 30 \
     --hidden_dim 128 \
     --conv_layers 6 \
     --node_loss_weight 1.0 \
     --graph_loss_weight 0.0 \
     --weight_decay 1e-3 \
-    --use_checkpoint true \
-    --checkpoint_fine_only true \
+    --use_checkpoint false \
+    --checkpoint_fine_only false \
