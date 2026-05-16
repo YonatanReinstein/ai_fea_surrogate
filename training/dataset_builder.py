@@ -4,7 +4,9 @@ print("Starting dataset_builder.py", flush=True)
 import socket
 print(f"Running on hostname: {socket.gethostname()}", flush=True)
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
-os.environ["ANSYS251_DIR"] = "/ansys_inc/v251/ansys/bin"
+# PyMAPDL defaults to UDS transport on Linux, but MAPDL 2025 R1 only serves
+# gRPC over plain TCP — force insecure (TCP) transport so the client connects.
+os.environ["PYMAPDL_GRPC_TRANSPORT"] = "insecure"
 
 _pool_ref = None
 
@@ -20,35 +22,13 @@ def _cleanup_and_exit(signum, frame):
 signal.signal(signal.SIGTERM, _cleanup_and_exit)
 signal.signal(signal.SIGINT, _cleanup_and_exit)
 
-import ansys.tools.path
-original_version_from_path = ansys.tools.path.version_from_path
-def patched_version_from_path(product, path):
+import ansys.mapdl.core.pool as _mapdl_pool
+_orig_version_from_path = _mapdl_pool.version_from_path
+def _patched_version_from_path(product, path, *args, **kwargs):
     if path and "ansys" in path.lower():
         return 251
-    return original_version_from_path(product, path)
-ansys.tools.path.version_from_path = patched_version_from_path
-ansys.tools.path.path.version_from_path = patched_version_from_path
-
-
-# Patch pool's launch_mapdl to retry on failure (pool only tries once by default).
-# Transient failures (license briefly unavailable, load spike) will recover on retry.
-import ansys.mapdl.core.pool as _mapdl_pool
-_orig_launch_mapdl = _mapdl_pool.launch_mapdl
-def _patched_launch_mapdl(*args, **kwargs):
-    run_location = kwargs.get('run_location')
-    max_retries = 3
-    for attempt in range(max_retries):
-        if run_location:
-            os.makedirs(run_location, exist_ok=True)
-        try:
-            return _orig_launch_mapdl(*args, **kwargs)
-        except Exception as e:
-            if attempt < max_retries - 1:
-                print(f"MAPDL launch attempt {attempt+1}/{max_retries} failed: {e}. Retrying in 15s...", flush=True)
-                time.sleep(15)
-            else:
-                raise
-_mapdl_pool.launch_mapdl = _patched_launch_mapdl
+    return _orig_version_from_path(product, path, *args, **kwargs)
+_mapdl_pool.version_from_path = _patched_version_from_path
 
 from core.component import Component
 from core.IritModel import IritModel, IritCModel

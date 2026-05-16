@@ -84,8 +84,11 @@ class IritModelBase(abc.ABC):
 
     def __del__(self):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
-        if os.path.exists("tmp") and len(os.listdir("tmp")) == 0:
+        try:
             os.rmdir("tmp")
+        except OSError:
+            # Already removed by another instance, or not empty — either is fine.
+            pass
     
 
 

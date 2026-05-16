@@ -3,34 +3,15 @@ import os
 import time
 
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
-os.environ["ANSYS251_DIR"] = "/ansys_inc/v251/ansys/bin"
-
-import ansys.tools.path
-_original_version_from_path = ansys.tools.path.version_from_path
-def _patched_version_from_path(product, path):
-    if path and "ansys" in path.lower():
-        return 251
-    return _original_version_from_path(product, path)
-ansys.tools.path.version_from_path = _patched_version_from_path
-ansys.tools.path.path.version_from_path = _patched_version_from_path
+os.environ["PYMAPDL_GRPC_TRANSPORT"] = "insecure"
 
 import ansys.mapdl.core.pool as _mapdl_pool
-_orig_launch_mapdl = _mapdl_pool.launch_mapdl
-def _patched_launch_mapdl(*args, **kwargs):
-    run_location = kwargs.get('run_location')
-    max_retries = 3
-    for attempt in range(max_retries):
-        if run_location:
-            os.makedirs(run_location, exist_ok=True)
-        try:
-            return _orig_launch_mapdl(*args, **kwargs)
-        except Exception as e:
-            if attempt < max_retries - 1:
-                print(f"MAPDL launch attempt {attempt+1}/{max_retries} failed: {e}. Retrying in 15s...", flush=True)
-                time.sleep(15)
-            else:
-                raise
-_mapdl_pool.launch_mapdl = _patched_launch_mapdl
+_orig_version_from_path = _mapdl_pool.version_from_path
+def _patched_version_from_path(product, path, *args, **kwargs):
+    if path and "ansys" in path.lower():
+        return 251
+    return _orig_version_from_path(product, path, *args, **kwargs)
+_mapdl_pool.version_from_path = _patched_version_from_path
 
 from ansys.mapdl.core import MapdlPool
 from ansys.mapdl.core.errors import MapdlRuntimeError
@@ -42,7 +23,7 @@ import json
 
 
 class MAPDLEvaluator(BaseEvaluator):
-    def __init__(self, geometry_name, pool_size=4, nproc=3, run_location=None):
+    def __init__(self, geometry_name, pool_size=24, nproc=4, run_location=None):
         super().__init__(geometry_name)
         self.geometry = geometry_name
         self.model_path = f"data/{geometry_name}/CAD_model"

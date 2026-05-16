@@ -10,13 +10,6 @@ warnings.filterwarnings("ignore")
 
 pv.OFF_SCREEN = True
 
-try:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        pv.start_xvfb()
-except OSError:
-    pass
-
 class Mesh:
     def __init__(self, nodes, elements, tolerance=1e-9):
         self.nodes = nodes
@@ -117,10 +110,9 @@ class Mesh:
                 node.displacement = [ux[node_id-1], uy[node_id-1], uz[node_id-1]]
                 node.stress = stress[node_id-1]
             # Create the plot but DO NOT display it
-            plotter = self.mapdl.post_processing.plot_nodal_eqv_stress(
-                return_plotter=True)
-            #plotter.scene.camera.elevation = 270
             if screenshot_path is not None:
+                plotter = self.mapdl.post_processing.plot_nodal_eqv_stress(
+                    return_plotter=True)
                 plotter.screenshot(screenshot_path)
             if created_mapdl:
                 self.mapdl.exit()

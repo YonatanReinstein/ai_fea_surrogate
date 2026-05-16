@@ -1,0 +1,26 @@
+#!/bin/bash
+#PBS -N optimize_tile_gnn
+#PBS -l select=1:ncpus=96:mem=70gb:host=aluf5
+#PBS -l walltime=24:00:00
+#PBS -q long_q
+
+cd /home/ryonatan/projects/ai_fea_surrogate
+source env/bin/activate
+
+pkill -u $USER -f ansys251 || true
+sleep 5
+
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export PYTHONUNBUFFERED=1
+
+mkdir -p optimization/artifacts optimization/screenshots
+
+python -u -m optimization.optimize_dims \
+    --geometry bistable \
+    --arch mapdl \
+    --pop_size 300 \
+    --generations 300 \
+    --processes 16 \
+    --batch_size 10 \
+    > ${PBS_O_WORKDIR}/run_${PBS_JOBID}.log 2>&1
