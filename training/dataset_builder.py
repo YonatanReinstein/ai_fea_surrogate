@@ -87,6 +87,9 @@ def build_dataset(
     force_pattern = module.force_pattern
     mesh_resolution = module.mesh_resolution
     get_tile_grid = getattr(module, "tile_grid", None)  # optional, geometry-specific
+    # Fixed (non-optimized) dims, e.g. grid topology d1/d2/d3 — not in dims.json,
+    # re-injected into every sampled dims dict so the CAD model still gets them.
+    fixed_dims = getattr(module, "fixed_dims", lambda: {})()
 
     # Generate ALL dims upfront in the main process from the seeded RNG.
     # When resuming, start at dim index start_idx*2 so resumed runs never
@@ -108,9 +111,9 @@ def build_dataset(
                 exe_win_path = os.path.join(model_path, "model.exe")
 
                 if os.path.isfile(exe_path):
-                    CAD_model = IritCModel(exe_path, dims_dict=dims)
+                    CAD_model = IritCModel(exe_path, dims_dict=dims, fixed_dims=fixed_dims)
                 elif os.path.isfile(exe_win_path):
-                    CAD_model = IritCModel(exe_win_path, dims_dict=dims)
+                    CAD_model = IritCModel(exe_win_path, dims_dict=dims, fixed_dims=fixed_dims)
                 else:
                     CAD_model = IritModel(os.path.join(model_path, "model.irt"), dims_dict=dims)
 

@@ -4,8 +4,10 @@ def make_fitness(evaluator, yield_strength):
     def fitness(dims):
         result = evaluator.evaluate(dims)
 
-        volumes = [float(volumee) for volumee in result["volume"]]
-        stresses = [float(stress) for stress in result["stress"]]
+        # Evaluators (e.g. MAPDL) may return None for samples that failed all
+        # retries — keep them as None so the optimizer can penalize them.
+        volumes = [None if v is None else float(v) for v in result["volume"]]
+        stresses = [None if s is None else float(s) for s in result["stress"]]
 
         return {
             "volume": volumes,

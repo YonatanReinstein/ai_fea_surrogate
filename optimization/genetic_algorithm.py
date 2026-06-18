@@ -36,23 +36,19 @@ class GeneticAlgorithm:
         return np.array([d[name] for name in self.dim_names], dtype=float)
 
     def _initialize_population(self):
-        population = None
-        gen = 0
-        while True:
-            if os.path.exists(f"optimization/artifacts/ga_population_gen_{gen+1}.npy"):
-                population = np.load(f"optimization/artifacts/ga_population_gen_{gen+1}.npy")
-                gen += 1
-                self.starting_gen = gen
-            else:
-                break
-        if population is not None:
+        checkpoint = "optimization/artifacts/ga_checkpoint.npz"
+        low, high = self.bounds[:, 0], self.bounds[:, 1]
+        if os.path.exists(checkpoint):
+            data = np.load(checkpoint)
+            population = data["population"]
+            gen = int(data["gen"])
             if population.shape[1] != self.dim:
                 print(f"[GA] Checkpoint dim {population.shape[1]} != problem dim {self.dim}, ignoring checkpoint.")
+                print("[GA] Initializing new population")
                 return np.random.uniform(low, high, (self.pop_size, self.dim))
-            print("[GA] Loading checkpoint from ga_population.npy")
+            self.starting_gen = gen
+            print(f"[GA] Loading checkpoint from gen {gen}")
             return population
-
-        low, high = self.bounds[:, 0], self.bounds[:, 1]
         print("[GA] Initializing new population")
         return np.random.uniform(low, high, (self.pop_size, self.dim))
 
@@ -208,5 +204,5 @@ class GeneticAlgorithm:
                 print(f"🔧 Mutation rate boosted: {old_rate:.3f} → {self.mutation_rate:.3f}")
 
             # ---------- Checkpoint ----------
-            np.save(f"optimization/artifacts/ga_population_gen_{gen+1}.npy", population)
+            np.savez("optimization/artifacts/ga_checkpoint.npz", population=population, gen=gen + 1)
         return self.vector_to_dict(best_vec)

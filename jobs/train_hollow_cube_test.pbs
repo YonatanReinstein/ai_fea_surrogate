@@ -1,0 +1,26 @@
+#!/bin/bash
+#PBS -N hc_train_test
+#PBS -l select=1:ncpus=16:mem=32gb
+#PBS -l walltime=00:30:00
+#PBS -q short_q
+
+# Pipeline smoke test: train the frozen-graph GNN (PE + per-node embeddings)
+# on the 100-sample hollow_cube dataset, CPU only, 10 epochs -> one checkpoint.
+#   qsub jobs/train_hollow_cube_test.pbs
+
+cd $PBS_O_WORKDIR
+source env/bin/activate
+
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+export PYTHONUNBUFFERED=1
+
+python -u -m training.gnn_training \
+    --geometry hollow_cube \
+    --num_samples 100 \
+    --epochs 10 \
+    --lr 2e-3 \
+    --batch_size 8 \
+    --hidden_dim 128 \
+    --conv_layers 6 \
+    > ${PBS_O_WORKDIR}/hc_train_${PBS_JOBID}.log 2>&1

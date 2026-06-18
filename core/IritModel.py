@@ -12,12 +12,19 @@ import platform
 
 
 class IritModelBase(abc.ABC):
-    def __init__(self, irt_script_path: str, dims_json: str = None, dims_dict: dict = None):
+    def __init__(self, irt_script_path: str, dims_json: str = None, dims_dict: dict = None, mesh_threads: int = 1, debug: bool = False, fixed_dims: dict = None):
         if dims_json is None and dims_dict is None:
             raise ValueError("Either dims_json or dims_dict must be provided.")
         os.makedirs("tmp", exist_ok=True)
-        self.tmp_dir = tempfile.mkdtemp(prefix="irit_", dir="tmp", )
+        if debug:
+            self.tmp_dir = "tmp/irit_debug"
+            os.makedirs(self.tmp_dir, exist_ok=True)
+        else:
+            self.tmp_dir = tempfile.mkdtemp(prefix="irit_", dir="tmp")
         self.volume = None
+        self._mesh_threads = mesh_threads
+        self._debug = debug
+        self._fixed_dims = fixed_dims or {}
         self.dims_template = dims_dict
         if self.dims_template is None:
             with open(dims_json, 'r') as f:
@@ -52,13 +59,16 @@ class IritModelBase(abc.ABC):
             self.__exec__script__()
         workspace_dir = os.getcwd()
 
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = str(self._mesh_threads)
         subprocess.run(
             f"irit2inp -s {U} {V} {W} model.itd > model.inp",
             cwd=self.tmp_dir,
             check=True,
             shell=True,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
+            env=env,
         )
         
 
@@ -83,6 +93,8 @@ class IritModelBase(abc.ABC):
         return dim_list
 
     def __del__(self):
+        if self._debug:
+            return
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
         try:
             os.rmdir("tmp")
@@ -113,6 +125,14 @@ class IritCModel(IritModelBase):
         shutil.copy(irt_script_path, self.tmp_dir)
         shutil.copy(outline_path, self.tmp_dir)
 
+    def __set_fixed_dims__(self):
+        with open(f"{self.tmp_dir}/fixed_dims.irt", "w") as f:
+            f.write("fixed_dims = nil();\n")
+            for key, value in self._fixed_dims.items():
+                f.write(f"{key} = {value};\n")
+                f.write(f"SNOC({key}, fixed_dims);\n")
+            f.write('save("fixed_dims.itd", fixed_dims);\n')
+            f.write('exit();\n')
 
     def __exec__script__(self):
         self.__set_irit_dims__()
@@ -122,16 +142,22 @@ class IritCModel(IritModelBase):
         model_name = "model.exe" if system == "Windows" else "model"
 
         subprocess.run(
-            [
-                irit_cmd,
-                "-t",
-                "dims.irt"
-            ],
+            [irit_cmd, "-t", "dims.irt"],
             cwd=self.tmp_dir,
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
+
+        if self._fixed_dims:
+            self.__set_fixed_dims__()
+            subprocess.run(
+                [irit_cmd, "-t", "fixed_dims.irt"],
+                cwd=self.tmp_dir,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
 
         subprocess.run(
             [f"./{model_name}"],

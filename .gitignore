@@ -7,6 +7,7 @@ usful/
 screenshots/
 screenshots_gnn/
 irit/
+data/hollow_cube/dataset/*.pt
 data/tile/dataset/*.pt
 data/bistable/dataset/*.pt
 data/bistable/dataset/*.pt.new

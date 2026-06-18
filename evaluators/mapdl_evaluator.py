@@ -23,15 +23,19 @@ import json
 
 
 class MAPDLEvaluator(BaseEvaluator):
-    def __init__(self, geometry_name, pool_size=24, nproc=4, run_location=None):
+    def __init__(self, geometry_name, pool_size=24, nproc=4, mesh_threads=4, run_location=None):
         super().__init__(geometry_name)
         self.geometry = geometry_name
+        self.mesh_threads = mesh_threads
         self.model_path = f"data/{geometry_name}/CAD_model"
         module = importlib.import_module(f"data.{geometry_name}.boundary_conditions")
         self.anchor_condition = module.anchor_condition
         self.force_pattern = module.force_pattern
         self.mesh_resolution = module.mesh_resolution
         self.U, self.V, self.W = self.mesh_resolution()
+        # Fixed (non-optimized) dims, e.g. grid topology d1/d2/d3. Re-injected
+        # into every dims dict since they are no longer part of the search space.
+        self.fixed_dims = getattr(module, "fixed_dims", lambda: {})()
         with open(f"data/{geometry_name}/CAD_model/material_properties.json", "r") as f:
             self.material_properties = json.load(f)
 
@@ -48,6 +52,10 @@ class MAPDLEvaluator(BaseEvaluator):
         )
         print("MapdlPool created successfully.", flush=True)
 
+    def _run_indexed(self, mapdl, idx, dims):
+        """Wrapper that preserves submission order across pool.map completion order."""
+        return (idx, self._run_single(mapdl, dims))
+
     def _run_single(self, mapdl, dims: dict):
         exe_path = os.path.join(self.model_path, "model")
         exe_win_path = os.path.join(self.model_path, "model.exe")
@@ -55,11 +63,11 @@ class MAPDLEvaluator(BaseEvaluator):
         for attempt in range(max_retries):
             try:
                 if os.path.isfile(exe_path):
-                    CAD_model = IritCModel(exe_path, dims_dict=dims)
+                    CAD_model = IritCModel(exe_path, dims_dict=dims, mesh_threads=self.mesh_threads, fixed_dims=self.fixed_dims)
                 elif os.path.isfile(exe_win_path):
-                    CAD_model = IritCModel(exe_win_path, dims_dict=dims)
+                    CAD_model = IritCModel(exe_win_path, dims_dict=dims, mesh_threads=self.mesh_threads, fixed_dims=self.fixed_dims)
                 else:
-                    CAD_model = IritModel(os.path.join(self.model_path, "model.irt"), dims_dict=dims)
+                    CAD_model = IritModel(os.path.join(self.model_path, "model.irt"), dims_dict=dims, mesh_threads=self.mesh_threads)
 
                 comp = Component(CAD_model=CAD_model, young=self.material_properties["young_modulus"], poisson=self.material_properties["poisson_ratio"])
                 comp.generate_mesh(U=self.U, V=self.V, W=self.W)
@@ -69,7 +77,10 @@ class MAPDLEvaluator(BaseEvaluator):
 
                 return {
                     "volume": comp.get_volume(),
-                    "stress": comp.mesh.get_max_stress(),
+                    # MAPDL runs in consistent SI (young_modulus in Pa) so its
+                    # stress is in Pa; convert to MPa so this evaluator agrees
+                    # with the GNN evaluator and yield_strength (both MPa).
+                    "stress": comp.mesh.get_max_stress() / 1e6,
                     "disp":   comp.mesh.get_max_displacement(),
                 }
             except MapdlRuntimeError as e:
@@ -105,14 +116,16 @@ class MAPDLEvaluator(BaseEvaluator):
         for pass_idx in range(max_passes):
             if not pending:
                 break
-            pending_dims = [dims_list[i] for i in pending]
+            pending_tasks = [(i, dims_list[i]) for i in pending]
             print(f"Pass {pass_idx+1}/{max_passes}: processing {len(pending)} samples...", flush=True)
             still_pending = []
-            for orig_idx, result in zip(pending, self.pool.map(self._run_single, pending_dims)):
+            # pool.map returns in completion order, not submission order.
+            # _run_indexed embeds the original index so we can restore correct ordering.
+            for idx, result in self.pool.map(self._run_indexed, pending_tasks):
                 if result is None:
-                    still_pending.append(orig_idx)
+                    still_pending.append(idx)
                 else:
-                    results[orig_idx] = result
+                    results[idx] = result
             pending = still_pending
 
         if pending:

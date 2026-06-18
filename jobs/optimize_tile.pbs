@@ -7,6 +7,11 @@
 cd /home/ryonatan/projects/ai_fea_surrogate
 source env/bin/activate
 
+rm -r optimization/artifacts/*
+rm -r optimization/screenshots/* 
+rm -r data/hollow_cube/Instance_*
+rm -r data/hollow_cube/ansys_*
+
 pkill -u $USER -f ansys251 || true
 sleep 5
 
@@ -17,10 +22,16 @@ export PYTHONUNBUFFERED=1
 mkdir -p optimization/artifacts optimization/screenshots
 
 python -u -m optimization.optimize_dims \
-    --geometry bistable \
+    --geometry hollow_cube \
     --arch mapdl \
-    --pop_size 300 \
-    --generations 300 \
+    --optimizer cma \
+    --generations 10000 \
+    --search_space reflect \
+    --constraint_mode quadratic \
     --processes 16 \
     --batch_size 10 \
+    --reset_on_stagnation \
     > ${PBS_O_WORKDIR}/run_${PBS_JOBID}.log 2>&1
+
+rm -r data/bistable/Instance_*
+rm -r data/bistable/ansys_*

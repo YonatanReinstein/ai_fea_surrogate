@@ -11,9 +11,10 @@ def screenshot(geometry: str, dims: dict, save_path: str, banner: str = None):
     poisson = material_properties["poisson_ratio"]
     model_dir = f"data/{geometry}/CAD_model"
     model_path = f"{model_dir}/model.irt" if Path(f"{model_dir}/model.irt").exists() else f"{model_dir}/model"
-    cad_model = IIritModel(model_path, dims_dict=dims)
-    component = Component(cad_model, young, poisson)
     module = importlib.import_module(f"data.{geometry}.boundary_conditions")
+    fixed_dims = getattr(module, "fixed_dims", lambda: {})()
+    cad_model = IIritModel(model_path, dims_dict=dims, fixed_dims=fixed_dims)
+    component = Component(cad_model, young, poisson)
     anchor_condition = module.anchor_condition
     force_pattern = module.force_pattern
     mesh_resolution = module.mesh_resolution

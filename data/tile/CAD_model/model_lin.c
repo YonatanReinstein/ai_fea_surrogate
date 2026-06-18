@@ -361,9 +361,14 @@ static void GenerateMicroStructures(void)
         MSRegularParam->TilingSteps[i].Len = 1;
     }
 
-    MSRegularParam->TilingSteps[0].TilesPerIntervals[0] = 3;
-    MSRegularParam->TilingSteps[1].TilesPerIntervals[0] = 3;
-    MSRegularParam->TilingSteps[2].TilesPerIntervals[0] = 3;
+    /* Read dims.itd first so the tiling grid matches the face-center grid  */
+    /* (g_ni/g_nj/g_nk); the per-tile face centers must align with the      */
+    /* g_ni x g_nj x g_nk grid sampled by UniformTilingCB.                  */
+    read_dims();
+
+    MSRegularParam->TilingSteps[0].TilesPerIntervals[0] = g_ni;
+    MSRegularParam->TilingSteps[1].TilesPerIntervals[0] = g_nj;
+    MSRegularParam->TilingSteps[2].TilesPerIntervals[0] = g_nk;
 
     /* Call back function - will be called for each tile in the grid just   */
     /* before it is mapped through the deformation function, with the tile  */
@@ -373,7 +378,6 @@ static void GenerateMicroStructures(void)
 
     LclData.ThicknessFuncCB = UniformTilingCB;
 
-    read_dims();
     MS = IritUserMicroStructComposition(&MSParam);
     int tiles_num = MSRegularParam->TilingSteps[0].TilesPerIntervals[0] * MSRegularParam->TilingSteps[1].TilesPerIntervals[0] * MSRegularParam->TilingSteps[2].TilesPerIntervals[0];
     int params_per_tile = 7;

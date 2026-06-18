@@ -39,6 +39,7 @@ def _run_sample_worker(args):
     (
         model_path,
         dims,
+        fixed_dims,
         young,
         poisson,
         sample_index,
@@ -54,7 +55,7 @@ def _run_sample_worker(args):
     timings = {}
     sleep(random.uniform(0.1, 0.2))
     t = perf_counter()
-    cad_model = IritCModel(model_path, dims_dict=dims)
+    cad_model = IritCModel(model_path, dims_dict=dims, fixed_dims=fixed_dims)
     component = Component(cad_model, young, poisson)
     timings["cad_model"] = perf_counter() - t
 
@@ -74,7 +75,7 @@ def _run_sample_worker(args):
         NX, NY, NZ = tile_grid
         K = NX * NY * NZ
         strut_params = torch.tensor(
-            [dims.get(f"d{i + 4}", 0.0) for i in range(K)], dtype=torch.float
+            [dims.get(f"d{i + 1}", 0.0) for i in range(K)], dtype=torch.float
         )
         strut_feat = strut_params[data.tile_idx].unsqueeze(1)
         data.x = torch.cat([data.x, strut_feat], dim=1)
@@ -115,16 +116,35 @@ class GNNEvaluator(BaseEvaluator):
         ) + 1
         hidden_dim = ckpt.get("hidden_dim") or ckpt["model_state"]["encoder.lins.0.bias"].shape[0]
 
+        # Fixed-topology exploit: PE + per-node embedding (0 -> disabled).
+        self.pe_dim = ckpt.get("pe_dim", 0)
+        num_pos_nodes = ckpt.get("num_pos_nodes", 0)
+
         ModelClass = HierarchicalGNN if ckpt.get("hierarchical", False) else GNN
-        self.model = ModelClass(
+        model_kwargs = dict(
             node_in_dim=self.node_in_dim,
             edge_in_dim=self.edge_in_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-        ).to(self.device)
+        )
+        if ckpt.get("hierarchical", False):
+            model_kwargs["pe_dim"] = self.pe_dim
+            model_kwargs["num_pos_nodes"] = num_pos_nodes
+        self.model = ModelClass(**model_kwargs).to(self.device)
 
         self.model.load_state_dict(ckpt["model_state"])
         self.model.eval()
+
+        # Shared frozen-graph artifacts (pe standardized exactly as in training).
+        self.pe = None
+        self.node_id = None
+        if self.pe_dim:
+            graph_path = f"data/{self.geometry_name}/dataset/graph.pt"
+            if os.path.exists(graph_path):
+                g = torch.load(graph_path, weights_only=False)
+                pe = g["pe"].float()
+                self.pe = (pe - pe.mean(0)) / (pe.std(0) + 1e-8)
+                self.node_id = torch.arange(g["num_nodes"], dtype=torch.long)
 
         self.sample_counter = 0
 
@@ -145,6 +165,7 @@ class GNNEvaluator(BaseEvaluator):
         self.mesh_resolution = module.mesh_resolution
         self.U, self.V, self.W = self.mesh_resolution()
         self._get_tile_grid = getattr(module, "tile_grid", None)
+        self.fixed_dims = getattr(module, "fixed_dims", lambda: {})()
         self.listener_thread = threading.Thread(target=listener, daemon=True).start()
 
 
@@ -165,6 +186,7 @@ class GNNEvaluator(BaseEvaluator):
             (
                 self.model_path,
                 dims,
+                self.fixed_dims,
                 self.young,
                 self.poisson,
                 idx,
@@ -215,6 +237,12 @@ class GNNEvaluator(BaseEvaluator):
             Data(**{k: torch.from_numpy(v) for k, v in d.items()})
             for d in graph_dicts
         ]
+        # Attach shared frozen-graph PE + stable node id (broadcast onto each sample).
+        if self.pe is not None:
+            for g in graph_list:
+                if g.x.shape[0] == self.pe.shape[0]:
+                    g.pe = self.pe
+                    g.node_id = self.node_id
         t_graph_build = perf_counter() - t
 
         # Build DataLoader
@@ -224,7 +252,7 @@ class GNNEvaluator(BaseEvaluator):
         loader = DataLoader(graph_list, batch_size=self.batch_size, shuffle=False)
         for batch_data in loader:
             # Prepare inputs
-            x, edge_index, edge_attr, batch, *_ = gnn_input_fn(batch_data)
+            x, edge_index, edge_attr, batch, _ti, _nx, _ny, _nz, _tx, pe, node_id = gnn_input_fn(batch_data)
             x[:, 3] = x[:, 3] / 1e+6
 
             x = x.to(self.device)
@@ -252,12 +280,16 @@ class GNNEvaluator(BaseEvaluator):
                 tile_NZ  = tile_NZ.to(self.device)
             if tile_x is not None:
                 tile_x = tile_x.float().to(self.device)
+            if pe is not None:
+                pe = pe.float().to(self.device)
+            if node_id is not None:
+                node_id = node_id.to(self.device)
 
             with torch.inference_mode():
                 graph_pred, _ = self.model(
                     x, edge_index, edge_attr, batch,
                     tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
-                    tile_x=tile_x,
+                    tile_x=tile_x, pe=pe, node_id=node_id,
                 )
 
             # Denormalize

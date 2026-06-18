@@ -84,11 +84,32 @@ class Mesh:
 
             for n in self.all_nodes():
                 if n.anchored:
+#                    cmds += [f"D,{n.id},UX,0", f"D,{n.id},UY,0", f"D,{n.id},UZ,0"]
                     cmds += [f"D,{n.id},UX,0", f"D,{n.id},UY,0", f"D,{n.id},UZ,0"]
-                fx, fy, fz = n.forces
-                if fx: cmds.append(f"F,{n.id},FX,{fx}")
-                if fy: cmds.append(f"F,{n.id},FY,{fy}")
-                if fz: cmds.append(f"F,{n.id},FZ,{fz}")
+
+
+            force_nodes = [n for n in self.all_nodes() if any(n.forces)]
+            if force_nodes:
+                total_fx = sum(n.forces[0] for n in force_nodes)
+                total_fy = sum(n.forces[1] for n in force_nodes)
+                total_fz = sum(n.forces[2] for n in force_nodes)
+                cx = sum(n.coords[0] for n in force_nodes) / len(force_nodes)
+                cy = sum(n.coords[1] for n in force_nodes) / len(force_nodes)
+                cz = sum(n.coords[2] for n in force_nodes) / len(force_nodes)
+                pilot_id = max(self.nodes.keys()) + 1
+                cmds += [
+                    f"N,{pilot_id},{cx},{cy},{cz}",
+                    "ET,2,21",
+                    "KEYOPT,2,3,0",
+                    "R,2,1e-20,1e-20,1e-20,1e-20,1e-20,1e-20",
+                    "TYPE,2", "REAL,2",
+                    f"E,{pilot_id}",
+                ]
+                for n in force_nodes:
+                    cmds.append(f"CERIG,{pilot_id},{n.id},UXYZ")
+                if total_fx: cmds.append(f"F,{pilot_id},FX,{total_fx}")
+                if total_fy: cmds.append(f"F,{pilot_id},FY,{total_fy}")
+                if total_fz: cmds.append(f"F,{pilot_id},FZ,{total_fz}")
 
             cmds += ["/SOLU", "ANTYPE,STATIC", "OUTRES,ALL,ALL"]
 

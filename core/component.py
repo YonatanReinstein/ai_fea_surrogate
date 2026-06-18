@@ -142,13 +142,14 @@ class Component:
 
 if __name__ == "__main__":
     from core.IritModel import IritCModel
-    model_path = "data/bistable/CAD_model/model"
-    json_path = "data/bistable/CAD_model/dims.json"
-    cad_model = IritCModel(model_path, json_path)
-    component = Component(cad_model, young=2.1e11, poisson=0.3)
-    geometry = "bistable"
     import importlib
+    geometry = "hollow_cube"  # Change to "bistable" to test the bistable component
     module = importlib.import_module(f"data.{geometry}.boundary_conditions")
+    model_path = "data/hollow_cube/CAD_model/model"
+    json_path = "data/hollow_cube/CAD_model/dims.json"
+    cad_model = IritCModel(model_path, json_path, debug=True,
+                           fixed_dims=module.fixed_dims())
+    component = Component(cad_model, young=2.1e11, poisson=0.3)
     anchor_condition = module.anchor_condition
     force_pattern = module.force_pattern
     mesh_resolution = module.mesh_resolution
@@ -161,46 +162,46 @@ if __name__ == "__main__":
 
     component.mesh.plot_mesh(save_path=f"mesh.png")
 
-    # --- Tile connectivity visualization ---
-    # Use to_graph_with_labels so tile_idx/NX/NY/NZ are identical to what the GNN receives.
-    def _resolve(v):
-        return v["default"] if isinstance(v, dict) else v
-
-    resolved_dims = {k: _resolve(v) for k, v in cad_model.dims_template.items()}
-    NX, NY, NZ = module.tile_grid(resolved_dims)
-    data = component.to_graph_with_labels(with_labels=False, tile_grid=(NX, NY, NZ))
-    tile_idx = data.tile_idx.numpy()  # [N] — same tensor the GNN uses
-
-    node_list = list(component.mesh.nodes.values())  # same iteration order as to_graph_with_labels
-    K = NX * NY * NZ
-    from collections import defaultdict
-    tile_node_coords = defaultdict(list)
-    node_tile_map = {}
-    for node, t in zip(node_list, tile_idx):
-        tile_node_coords[int(t)].append(node.coords)
-        node_tile_map[node.id] = int(t)
-
-    tile_centers = []
-    for t in range(K):
-        coords = tile_node_coords[t]
-        if coords:
-            tile_centers.append([sum(c[i] for c in coords) / len(coords) for i in range(3)])
-        else:
-            tile_centers.append([0.0, 0.0, 0.0])
-
-    tile_edges = []
-    for ix in range(NX):
-        for iy in range(NY):
-            for iz in range(NZ):
-                flat = ix * NY * NZ + iy * NZ + iz
-                for dix, diy, diz in [(1, 0, 0), (0, 1, 0), (0, 0, 1)]:
-                    jx, jy, jz = ix + dix, iy + diy, iz + diz
-                    if jx < NX and jy < NY and jz < NZ:
-                        nb = jx * NY * NZ + jy * NZ + jz
-                        tile_edges.append((flat, nb))
-
-    component.mesh.plot_mesh_with_tiles(tile_centers, tile_edges, node_tile_map=node_tile_map, save_path="mesh_tiles.png")
-    #print("Max stress:", component.mesh.get_max_stress())
+    ## --- Tile connectivity visualization ---
+    ## Use to_graph_with_labels so tile_idx/NX/NY/NZ are identical to what the GNN receives.
+    #def _resolve(v):
+    #    return v["default"] if isinstance(v, dict) else v
+#
+    #resolved_dims = {k: _resolve(v) for k, v in cad_model.dims_template.items()}
+    #NX, NY, NZ = module.tile_grid(resolved_dims)
+    #data = component.to_graph_with_labels(with_labels=False, tile_grid=(NX, NY, NZ))
+    #tile_idx = data.tile_idx.numpy()  # [N] — same tensor the GNN uses
+#
+    #node_list = list(component.mesh.nodes.values())  # same iteration order as to_graph_with_labels
+    #K = NX * NY * NZ
+    #from collections import defaultdict
+    #tile_node_coords = defaultdict(list)
+    #node_tile_map = {}
+    #for node, t in zip(node_list, tile_idx):
+    #    tile_node_coords[int(t)].append(node.coords)
+    #    node_tile_map[node.id] = int(t)
+#
+    #tile_centers = []
+    #for t in range(K):
+    #    coords = tile_node_coords[t]
+    #    if coords:
+    #        tile_centers.append([sum(c[i] for c in coords) / len(coords) for i in range(3)])
+    #    else:
+    #        tile_centers.append([0.0, 0.0, 0.0])
+#
+    #tile_edges = []
+    #for ix in range(NX):
+    #    for iy in range(NY):
+    #        for iz in range(NZ):
+    #            flat = ix * NY * NZ + iy * NZ + iz
+    #            for dix, diy, diz in [(1, 0, 0), (0, 1, 0), (0, 0, 1)]:
+    #                jx, jy, jz = ix + dix, iy + diy, iz + diz
+    #                if jx < NX and jy < NY and jz < NZ:
+    #                    nb = jx * NY * NZ + jy * NZ + jz
+    #                    tile_edges.append((flat, nb))
+#
+    #component.mesh.plot_mesh_with_tiles(tile_centers, tile_edges, node_tile_map=node_tile_map, save_path="mesh_tiles.png")
+    ##print("Max stress:", component.mesh.get_max_stress())
 
 
 

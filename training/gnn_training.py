@@ -17,7 +17,10 @@ def gnn_input_fn(data):
     tile_NY   = getattr(data, 'tile_NY',   None)
     tile_NZ   = getattr(data, 'tile_NZ',   None)
     tile_x    = getattr(data, 'tile_x',    None)
-    return data.x, data.edge_index, data.edge_attr, data.batch, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x
+    pe        = getattr(data, 'pe',        None)  # fixed-graph positional encoding
+    node_id   = getattr(data, 'node_id',   None)  # stable per-node index
+    return (data.x, data.edge_index, data.edge_attr, data.batch,
+            tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, pe, node_id)
 
 
 def gnn_target_fn(data):
@@ -77,7 +80,16 @@ def train_gnn_model(
     # If you want to use dataset_a + dataset_b instead:
     dataset = torch.load(dataset_path, weights_only=False)
 
- 
+    # Where the per-tile strut thicknesses start in the dims vector depends on
+    # how the geometry encodes its grid topology:
+    #   - grid in fixed_dims (hollow_cube, bistable): ALL dims are struts -> offset 0
+    #   - grid in dims[d1,d2,d3] (tile, variable grid): struts follow -> offset 3
+    import importlib
+    _bc = importlib.import_module(f"data.{geometry}.boundary_conditions")
+    _fixed_dims = getattr(_bc, "fixed_dims", lambda: {})()
+    strut_offset = 0 if _fixed_dims else 3
+    print(f"[strut] geometry={geometry} fixed_grid={bool(_fixed_dims)} strut_offset={strut_offset}")
+
     for sample in dataset:
         #convert force to MN
         sample.x[:, 3:6] = sample.x[:, 3:6] / 1e+6
@@ -85,15 +97,43 @@ def train_gnn_model(
         sample.max_stress = sample.max_stress / 1e+6
         #convert node_stress to MPa
         sample.node_stress = sample.node_stress / 1e+6
-        # inject per-node strut dimension: dims[3 + tile_idx] = d4..d103
+        # inject per-node strut dimension: dims[strut_offset + tile_idx]
         #if hasattr(sample, 'tile_idx') and hasattr(sample, 'dims'):
         if True:
             K = int(sample.tile_NX) * int(sample.tile_NY) * int(sample.tile_NZ)
-            tile_struts = sample.dims[0, 3:3+K].float()  # [K]
+            tile_struts = sample.dims[0, strut_offset:strut_offset+K].float()  # [K]
             strut_param = tile_struts[sample.tile_idx].unsqueeze(1)
             sample.x = torch.cat([sample.x, strut_param], dim=1)
             # per-tile feature: one strut value per tile virtual node, shape [K, 1]
             sample.tile_x = tile_struts.view(-1, 1)
+
+    # ----------------------------------------------------
+    # Fixed-topology exploit: attach shared graph artifacts
+    # ----------------------------------------------------
+    # For frozen-topology geometries (e.g. hollow_cube) the graph and node
+    # ordering are identical across samples, so Laplacian positional encodings
+    # and a stable per-node id are shared. Loaded once from graph.pt and
+    # broadcast onto every sample. Absent file -> generic GNN behaviour.
+    graph_path = os.path.join(os.path.dirname(dataset_path), "graph.pt")
+    pe_dim, num_pos_nodes = 0, 0
+    if os.path.exists(graph_path):
+        g = torch.load(graph_path, weights_only=False)
+        pe = g["pe"].float()
+        # standardize each eigenvector column to unit std (raw entries ~1/sqrt(N))
+        pe = (pe - pe.mean(0)) / (pe.std(0) + 1e-8)
+        node_id = torch.arange(g["num_nodes"], dtype=torch.long)
+        pe_dim = pe.shape[1]
+        num_pos_nodes = g["num_nodes"]
+        attached = 0
+        for sample in dataset:
+            if sample.x.shape[0] == num_pos_nodes:
+                sample.pe = pe
+                sample.node_id = node_id
+                attached += 1
+        print(f"[fixed-graph] graph.pt loaded: pe_dim={pe_dim}, nodes={num_pos_nodes}, "
+              f"attached to {attached}/{len(dataset)} samples")
+    else:
+        print(f"[fixed-graph] no graph.pt at {graph_path}; using generic GNN")
 
     cleaned_dataset = []
     for data in dataset:
@@ -181,6 +221,8 @@ def train_gnn_model(
         hidden_dim=hidden_dim,
         num_layers=conv_layers,
         use_checkpoint=use_checkpoint,
+        pe_dim=pe_dim,
+        num_pos_nodes=num_pos_nodes,
     )
     if hierarchical:
         model_kwargs["checkpoint_fine_only"] = checkpoint_fine_only
@@ -271,7 +313,7 @@ def train_gnn_model(
 
             optimizer.zero_grad()
 
-            x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x = gnn_input_fn(batch_data)
+            x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, pe, node_id = gnn_input_fn(batch_data)
             num_graphs = batch_data.num_graphs
             x = x.float().to(device, non_blocking=True)
             edge_index = edge_index.to(device, non_blocking=True)
@@ -284,6 +326,10 @@ def train_gnn_model(
                 tile_NZ  = tile_NZ.to(device,  non_blocking=True)
             if tile_x is not None:
                 tile_x = tile_x.float().to(device, non_blocking=True)
+            if pe is not None:
+                pe = pe.float().to(device, non_blocking=True)
+            if node_id is not None:
+                node_id = node_id.to(device, non_blocking=True)
 
             # normalize features
             x_norm = (x - x_mean) / x_std
@@ -299,7 +345,7 @@ def train_gnn_model(
             graph_pred, node_pred = model(
                 x_norm, edge_index, edge_attr_norm, batch_idx,
                 tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
-                tile_x=tile_x, num_graphs=num_graphs,
+                tile_x=tile_x, num_graphs=num_graphs, pe=pe, node_id=node_id,
             )
             graph_loss = loss_fn(graph_pred, targ_norm)
             node_loss  = loss_fn(node_pred, node_targ_norm)
@@ -356,7 +402,7 @@ def train_gnn_model(
 
         with torch.no_grad():
             for batch_data in val_loader:
-                x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x = gnn_input_fn(batch_data)
+                x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, pe, node_id = gnn_input_fn(batch_data)
                 num_graphs = batch_data.num_graphs
                 x = x.float().to(device, non_blocking=True)
                 edge_index = edge_index.to(device, non_blocking=True)
@@ -369,6 +415,10 @@ def train_gnn_model(
                     tile_NZ  = tile_NZ.to(device,  non_blocking=True)
                 if tile_x is not None:
                     tile_x = tile_x.float().to(device, non_blocking=True)
+                if pe is not None:
+                    pe = pe.float().to(device, non_blocking=True)
+                if node_id is not None:
+                    node_id = node_id.to(device, non_blocking=True)
 
                 x_norm = (x - x_mean) / x_std
                 edge_attr_norm = (edge_attr - edge_mean) / edge_std
@@ -382,7 +432,7 @@ def train_gnn_model(
                 graph_pred, node_pred = model(
                     x_norm, edge_index, edge_attr_norm, batch_idx,
                     tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
-                    tile_x=tile_x, num_graphs=num_graphs,
+                    tile_x=tile_x, num_graphs=num_graphs, pe=pe, node_id=node_id,
                 )
                 graph_loss = loss_fn(graph_pred, targ_norm)
                 node_loss  = loss_fn(node_pred, node_targ_norm)
@@ -413,6 +463,8 @@ def train_gnn_model(
                 "hidden_dim": hidden_dim,
                 "out_dim": out_dim,
                 "hierarchical": hierarchical,
+                "pe_dim": pe_dim,
+                "num_pos_nodes": num_pos_nodes,
                 "target_mean": target_mean.detach().cpu(),
                 "target_std": target_std.detach().cpu(),
                 "node_target_mean": node_target_mean.detach().cpu(),

@@ -25,7 +25,8 @@ typedef struct BistableLocalDataStruct {
     CagdRType *FrameThicknesses;  /* NX*NY*NZ values, X-outermost order */
 } BistableLocalDataStruct;
 
-static int read_bistable_params(int *NX, int *NY, int *NZ,
+static int read_fixed_dims(int *NX, int *NY, int *NZ);
+static int read_bistable_params(int NX, int NY, int NZ,
                                 CagdRType **FrameThicknesses);
 static IritPrsrObjectStruct *PreProcessTile(IritPrsrObjectStruct *Tile,
     IritUserMicroPreProcessTileCBStruct *CBData);
@@ -33,15 +34,47 @@ static void GenerateMicroStructures(void);
 
 /*****************************************************************************
 * DESCRIPTION:
-*   Read tiling grid dimensions and per-tile FrameThickness values from
-*   dims.itd.
-*   List format: [NX, NY, NZ, ft_0, ft_1, ..., ft_{NX*NY*NZ-1}]
+*   Read tiling grid dimensions (NX, NY, NZ) from fixed_dims.itd.
+*   List format: [NX, NY, NZ]
+*
+* RETURN VALUE:
+*   int: TRUE on success, FALSE on failure.
+*****************************************************************************/
+static int read_fixed_dims(int *NX, int *NY, int *NZ)
+{
+    IritPrsrObjectStruct *PObj;
+    const char *FileName = "fixed_dims.itd";
+
+    PObj = IritPrsrGetDataFiles(&FileName, 1, FALSE, FALSE);
+    if (PObj == NULL) {
+        fprintf(stderr, "Failed to load fixed_dims.itd\n");
+        return FALSE;
+    }
+
+    if (!IRIT_PRSR_IS_NUM_OBJ(PObj)) { fprintf(stderr, "NX missing in fixed_dims.itd\n"); return FALSE; }
+    *NX = (int)PObj->U.R;
+    PObj = PObj->Pnext;
+
+    if (PObj == NULL || !IRIT_PRSR_IS_NUM_OBJ(PObj)) { fprintf(stderr, "NY missing in fixed_dims.itd\n"); return FALSE; }
+    *NY = (int)PObj->U.R;
+    PObj = PObj->Pnext;
+
+    if (PObj == NULL || !IRIT_PRSR_IS_NUM_OBJ(PObj)) { fprintf(stderr, "NZ missing in fixed_dims.itd\n"); return FALSE; }
+    *NZ = (int)PObj->U.R;
+
+    return TRUE;
+}
+
+/*****************************************************************************
+* DESCRIPTION:
+*   Read per-tile FrameThickness values from dims.itd.
+*   List format: [ft_0, ft_1, ..., ft_{NX*NY*NZ-1}]
 *   Values are stored in X-outermost (U-outermost) order.
 *
 * RETURN VALUE:
 *   int: TRUE on success, FALSE on failure.
 *****************************************************************************/
-static int read_bistable_params(int *NX, int *NY, int *NZ,
+static int read_bistable_params(int NX, int NY, int NZ,
                                 CagdRType **FrameThicknesses)
 {
     IritPrsrObjectStruct *PObj;
@@ -54,19 +87,7 @@ static int read_bistable_params(int *NX, int *NY, int *NZ,
         return FALSE;
     }
 
-    if (!IRIT_PRSR_IS_NUM_OBJ(PObj)) { fprintf(stderr, "NX missing\n"); return FALSE; }
-    *NX = (int)PObj->U.R;
-    PObj = PObj->Pnext;
-
-    if (PObj == NULL || !IRIT_PRSR_IS_NUM_OBJ(PObj)) { fprintf(stderr, "NY missing\n"); return FALSE; }
-    *NY = (int)PObj->U.R;
-    PObj = PObj->Pnext;
-
-    if (PObj == NULL || !IRIT_PRSR_IS_NUM_OBJ(PObj)) { fprintf(stderr, "NZ missing\n"); return FALSE; }
-    *NZ = (int)PObj->U.R;
-    PObj = PObj->Pnext;
-
-    n = (*NX) * (*NY) * (*NZ);
+    n = NX * NY * NZ;
     *FrameThicknesses = (CagdRType *)IritMalloc(sizeof(CagdRType) * n);
 
     for (i = 0; i < n; i++) {
@@ -150,7 +171,12 @@ static void GenerateMicroStructures(void)
     IritUserMicroRegularParamStruct *MSRegularParam;
     BistableLocalDataStruct LclData;
 
-    if (!read_bistable_params(&LclData.NX, &LclData.NY, &LclData.NZ,
+    if (!read_fixed_dims(&LclData.NX, &LclData.NY, &LclData.NZ)) {
+        fprintf(stderr, "Failed to read fixed dims.\n");
+        return;
+    }
+
+    if (!read_bistable_params(LclData.NX, LclData.NY, LclData.NZ,
                               &LclData.FrameThicknesses)) {
         fprintf(stderr, "Failed to read bistable parameters.\n");
         return;
@@ -191,6 +217,11 @@ static void GenerateMicroStructures(void)
     MSRegularParam->CBFuncData = &LclData;
 
     MS = IritUserMicroStructComposition(&MSParam);
+    if (MS == NULL) {
+        fprintf(stderr, "IritUserMicroStructComposition returned NULL.\n");
+        IritFree(LclData.FrameThicknesses);
+        return;
+    }
 
     /* Compute volume by summing all trivariates across all tiles. */
     {
@@ -200,13 +231,20 @@ static void GenerateMicroStructures(void)
 
         for (index = 0; index < tiles_num; index++) {
             IritPrsrObjectStruct *MV = MS->U.Lst.PObjList[index];
-            int j;
-            for (j = 0; MV->U.Lst.PObjList[j] != NULL; j++) {
-                IritPrsrObjectStruct *MQ = MV->U.Lst.PObjList[j];
-                if (IRIT_PRSR_IS_TRIVAR_OBJ(MQ)) {
-                    IritTrivTVStruct *TV;
-                    for (TV = MQ->U.Trivars; TV != NULL; TV = TV->Pnext)
-                        volume += fabs(IritTrivTVVolume(TV, TRUE));
+            if (MV == NULL) continue;
+            if (IRIT_PRSR_IS_TRIVAR_OBJ(MV)) {
+                IritTrivTVStruct *TV;
+                for (TV = MV->U.Trivars; TV != NULL; TV = TV->Pnext)
+                    volume += fabs(IritTrivTVVolume(TV, TRUE));
+            } else {
+                int j;
+                for (j = 0; MV->U.Lst.PObjList[j] != NULL; j++) {
+                    IritPrsrObjectStruct *MQ = MV->U.Lst.PObjList[j];
+                    if (IRIT_PRSR_IS_TRIVAR_OBJ(MQ)) {
+                        IritTrivTVStruct *TV;
+                        for (TV = MQ->U.Trivars; TV != NULL; TV = TV->Pnext)
+                            volume += fabs(IritTrivTVVolume(TV, TRUE));
+                    }
                 }
             }
         }

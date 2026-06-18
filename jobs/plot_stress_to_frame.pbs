@@ -1,0 +1,20 @@
+#!/bin/bash
+
+
+#PBS -N plot
+#PBS -l select=1:ncpus=96:mem=70gb:host=aluf5
+#PBS -l walltime=24:00:00
+#PBS -q long_q
+
+
+
+
+pkill -u $USER -f ansys251 || true
+
+cd /home/ryonatan/projects/ai_fea_surrogate
+source env/bin/activate
+
+python -m analysis.stress_vs_thickness  > ${PBS_O_WORKDIR}/run_${PBS_JOBID}.log 2>&1
+
+rm -r data/bistable/Instance_*
+rm -r data/bistable/ansys_*

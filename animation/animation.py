@@ -92,6 +92,7 @@ def render_frame(args):
     (i,
      frame_vec,
      dim_names,
+     fixed_dims,
      model_path,
      young,
      poisson,
@@ -109,7 +110,7 @@ def render_frame(args):
     save_path = os.path.join("animation", "frames", f"frame_{i:04d}.png")
 
     U, V, W = mesh_res
-    dims_dict = vector_to_dict(dim_names, frame_vec)
+    dims_dict = {**fixed_dims, **vector_to_dict(dim_names, frame_vec)}
 
     cad_model = IIritModel(model_path, dims_dict=dims_dict)
     comp = Component(cad_model, young, poisson)
@@ -157,6 +158,7 @@ if __name__ == "__main__":
     U, V, W = mesh_resolution()
 
     dim_names = list(dims_template.keys())
+    fixed_dims = getattr(bc_module, "fixed_dims", lambda: {})()
 
     # --------------------------------------------------------
     # Build the list of GA samples
@@ -206,6 +208,7 @@ if __name__ == "__main__":
             i,
             frames[i],
             dim_names,
+            fixed_dims,
             model_path,
             young,
             poisson,
