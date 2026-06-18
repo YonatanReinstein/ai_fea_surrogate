@@ -20,10 +20,16 @@ export PYTHONUNBUFFERED=1
 mkdir -p optimization/artifacts optimization/screenshots
 
 python -u -m optimization.optimize_dims \
-    --geometry bistable \
+    --geometry hollow_cube \
     --arch gnn \
-    --pop_size 300 \
-    --generations 100 \
+    --optimizer cma \
+    --generations 10000 \
+    --search_space reflect \
+    --constraint_mode quadratic \
     --processes 64 \
     --batch_size 30 \
+    --reset_on_stagnation 
+
+rm -r data/hollow_cube/Instance_*
+rm -r data/hollow_cube/ansys_*
 

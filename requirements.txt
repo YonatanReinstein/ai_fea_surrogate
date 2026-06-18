@@ -17,3 +17,4 @@ ansys-tools-visualization_interface
 pyvista
 
 huggingface_hub>=1.8.0
+cma

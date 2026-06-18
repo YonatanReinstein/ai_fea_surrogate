@@ -9,8 +9,8 @@
 #SBATCH --gres=gpu:A40:1
 #SBATCH --output=%x_%j.log
 #SBATCH --error=%x_%j.log
-#SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=yoyo.reinstein@gmail.com
+
+
 
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p training/runs/train
@@ -22,11 +22,12 @@ export PYTHONUNBUFFERED=1
 
 ulimit -n 65536
 
+
 python -u -m training.gnn_training \
-    --geometry bistable \
-    --dataset data/bistable/dataset/dataset_6x6.pt \
-    --num_samples 5000 \
-    --epochs 202 \
+    --geometry hollow_cube \
+    --dataset data/hollow_cube/dataset/dataset.pt \
+    --num_samples 4000 \
+    --epochs 200 \
     --lr 1e-3 \
     --batch_size 30 \
     --hidden_dim 128 \
