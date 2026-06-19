@@ -1,0 +1,29 @@
+#!/bin/bash
+#PBS -N hc_train
+#PBS -l select=1:ncpus=26:mem=64gb
+#PBS -l walltime=12:00:00
+#PBS -q main_q
+
+# Full training of the frozen-graph GNN (PE + per-node embeddings) on the
+# 1000-sample hollow_cube dataset (8x1x1 grid, 513 nodes). CPU only.
+# Auto-resumes from data/hollow_cube/checkpoints/*_epochs.pt if present.
+#   qsub jobs/train_hollow_cube.pbs
+
+cd $PBS_O_WORKDIR
+source env/bin/activate
+
+export OMP_NUM_THREADS=26
+export MKL_NUM_THREADS=26
+export PYTHONUNBUFFERED=1
+
+python -u -m training.gnn_training \
+    --geometry hollow_cube \
+    --num_samples 1000 \
+    --epochs 300 \
+    --lr 2e-3 \
+    --batch_size 16 \
+    --hidden_dim 128 \
+    --conv_layers 6 \
+    --node_loss_weight 1.0 \
+    --graph_loss_weight 0.0 \
+    > ${PBS_O_WORKDIR}/hc_train_${PBS_JOBID}.log 2>&1

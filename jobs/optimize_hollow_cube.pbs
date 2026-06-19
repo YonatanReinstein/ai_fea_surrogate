@@ -1,0 +1,30 @@
+#!/bin/bash
+#PBS -N hc_optimize
+#PBS -l select=1:ncpus=16:mem=32gb
+#PBS -l walltime=02:00:00
+#PBS -q short_q
+
+# CMA optimization of the hollow_cube lattice using the trained GNN surrogate.
+# Minimize material volume subject to max_stress <= yield, over the 8 per-tile
+# shell thicknesses d1..d8. Reads weights from data/hollow_cube/gnn_surrogate.pt.
+#   qsub jobs/optimize_hollow_cube.pbs
+
+cd $PBS_O_WORKDIR
+source env/bin/activate
+
+export PATH="$PWD/irit/bin:$PATH"
+export IRIT_PATH="$PWD/irit/bin/"
+export PYTHONPATH="$PWD:$PYTHONPATH"
+export OMP_NUM_THREADS=2
+export PYTHONUNBUFFERED=1
+
+python -u -m optimization.optimize_dims \
+    --geometry hollow_cube \
+    --arch gnn \
+    --optimizer cma \
+    --search_space reflect \
+    --constraint_mode quadratic \
+    --generations 60 \
+    --processes 8 \
+    --batch_size 16 \
+    > ${PBS_O_WORKDIR}/opt_hc_${PBS_JOBID}.log 2>&1

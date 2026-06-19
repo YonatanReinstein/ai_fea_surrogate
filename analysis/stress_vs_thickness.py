@@ -10,7 +10,7 @@ import importlib
 from evaluators.mapdl_evaluator import MAPDLEvaluator
 
 GEOMETRY = "hollow_cube"  # "bistable" or "hollow_tile"
-N_POINTS = 1
+N_POINTS = 20
 POOL_SIZE = 1
 
 dims_template = json.loads(Path(f"data/{GEOMETRY}/CAD_model/dims.json").read_text())

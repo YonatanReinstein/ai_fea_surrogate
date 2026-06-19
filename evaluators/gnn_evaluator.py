@@ -253,7 +253,7 @@ class GNNEvaluator(BaseEvaluator):
         for batch_data in loader:
             # Prepare inputs
             x, edge_index, edge_attr, batch, _ti, _nx, _ny, _nz, _tx, pe, node_id = gnn_input_fn(batch_data)
-            x[:, 3] = x[:, 3] / 1e+6
+            x[:, 3:6] = x[:, 3:6] / 1e+6   # scale force vector (Fx,Fy,Fz) to match training (gnn_training.py:95)
 
             x = x.to(self.device)
             edge_attr = edge_attr.float().to(self.device)
