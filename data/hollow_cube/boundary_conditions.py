@@ -12,7 +12,7 @@ def force_pattern(node: Node, tol: float) -> List[float]:
         mr = mesh_resolution()
         n_nodes_on_face =  mr[0]  * mr[1] * fd["d2"] * fd["d3"]
         #force_per_node = -1.5e5 * fd["d2"] * fd["d3"] / n_nodes_on_face
-        force_per_node = -1e7 / n_nodes_on_face
+        force_per_node = -5e7 / n_nodes_on_face
         return [0.0, force_per_node, 0.0]
     return [0.0, 0.0, 0.0]
 

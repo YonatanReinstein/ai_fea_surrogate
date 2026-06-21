@@ -29,7 +29,7 @@ def _log_gpu_info():
         print(f"[gpu] arch_list={torch.cuda.get_arch_list()}")
 
 
-def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, screenshots=False, processes=None, batch_size=28, optimizer="ga", penalty_weight=10.0, constraint_mode="auglag", search_space="logit", reset_on_stagnation=False, max_unproductive_resets=2):
+def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, screenshots=False, processes=None, batch_size=28, optimizer="ga", penalty_weight=10.0, constraint_mode="auglag", search_space="logit", sigma0=None, reset_on_stagnation=False, max_unproductive_resets=2):
     _log_gpu_info()
     material_props_path = f"data/{geometry_name}/CAD_model/material_properties.json"
     material_properties = json.loads(Path(material_props_path).read_text())
@@ -50,6 +50,7 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
             penalty_weight=penalty_weight,
             constraint_mode=constraint_mode,
             search_space=search_space,
+            sigma0=sigma0,
             reset_on_stagnation=reset_on_stagnation,
             max_unproductive_resets=max_unproductive_resets,
         )
@@ -98,8 +99,9 @@ if __name__ == "__main__":
     parser.add_argument("--penalty_weight", type=float, default=10.0, help="Dimensionless stress-constraint penalty weight (cma, linear mode only)")
     parser.add_argument("--constraint_mode", type=str, default="auglag", choices=["linear", "auglag", "quadratic"], help="CMA stress-constraint handler: 'linear' static penalty, 'quadratic' static squared penalty, or 'auglag' augmented Lagrangian")
     parser.add_argument("--search_space", type=str, default="logit", choices=["logit", "box", "reflect"], help="CMA search variables: 'logit' unbounded R^N via sigmoid to (lo, hi); 'box' normalized [0,1]^N with cma.BoundPenalty; 'reflect' unbounded R^N folded into [lo, hi] by a period-2 triangle wave (reflecting bounds, no penalty)")
+    parser.add_argument("--sigma0", type=float, default=None, help="CMA initial step size (sigma). Defaults to 2.0 for logit space, 0.25 for box/reflect. Larger values increase exploration range.")
     parser.add_argument("--reset_on_stagnation", action="store_true", help="On a soft-stagnation stop (tolstagnation/tolflatfitness), reset CMA covariance and sigma while keeping the current mean, then continue. Real convergence (tolfun/tolx) still exits.")
     parser.add_argument("--max_unproductive_resets", type=int, default=2, help="With --reset_on_stagnation: after this many consecutive resets without improvement in best feasible volume, declare hard stagnation and stop.")
     args = parser.parse_args()
 
-    run_optimization(args.geometry, arch=args.arch, pop_size=args.pop_size, generations=args.generations, screenshots=args.screenshots, processes=args.processes, batch_size=args.batch_size, optimizer=args.optimizer, penalty_weight=args.penalty_weight, constraint_mode=args.constraint_mode, search_space=args.search_space, reset_on_stagnation=args.reset_on_stagnation, max_unproductive_resets=args.max_unproductive_resets)
+    run_optimization(args.geometry, arch=args.arch, pop_size=args.pop_size, generations=args.generations, screenshots=args.screenshots, processes=args.processes, batch_size=args.batch_size, optimizer=args.optimizer, penalty_weight=args.penalty_weight, constraint_mode=args.constraint_mode, search_space=args.search_space, sigma0=args.sigma0, reset_on_stagnation=args.reset_on_stagnation, max_unproductive_resets=args.max_unproductive_resets)

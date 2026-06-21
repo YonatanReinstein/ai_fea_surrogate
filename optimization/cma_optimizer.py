@@ -255,8 +255,8 @@ class CMAOptimizer:
             "tolfun": 1e-4,
             "tolfunhist": 1e-5,
             "tolx": 1e-4,
-            "tolstagnation": 100,
-            "tolflatfitness": 20,
+            "tolstagnation": 500,
+            "tolflatfitness": 100,
         }
         if self.pop_size is not None:
             opts["popsize"] = self.pop_size
@@ -287,6 +287,7 @@ class CMAOptimizer:
         # checkpoint loader may overwrite these from a saved run.
         self._best_feas_vol = float("inf")
         self._best_feas_dims = None
+        self._best_feas_gen = -1
         # Counter for stagnation resets (also varies the RNG seed each time).
         self._reset_count = 0
         # Hard-stagnation tracking: how many consecutive resets produced no
@@ -361,6 +362,7 @@ class CMAOptimizer:
             # that records "smallest objective ever seen." Instead, take the
             # lightest sample whose stress is at or below yield.
             feas_mask = strs <= yld  # NaN <= yld is False, so failed samples excluded
+            improved_best = False
             if np.any(feas_mask):
                 feas_vols = np.where(feas_mask, vol, np.inf)
                 feas_best_idx = int(np.argmin(feas_vols))
@@ -368,6 +370,8 @@ class CMAOptimizer:
                 if feas_best_vol < self._best_feas_vol:
                     self._best_feas_vol = feas_best_vol
                     self._best_feas_dims = dims_dicts[feas_best_idx]
+                    self._best_feas_gen = gen
+                    improved_best = True
 
             n_feasible = int(np.sum(feas_mask))
             al_tag = ""
@@ -400,6 +404,22 @@ class CMAOptimizer:
                 )
             except Exception as e:
                 print(f"[CMA] screenshot failed: {e}", flush=True)
+
+            # Stable "best feasible so far" image, overwritten only when the
+            # global best improves. Unlike cma_gen_XXX.png (this gen's best by
+            # penalized objective), this always shows the design that will be
+            # returned at the end of the run.
+            if improved_best:
+                try:
+                    screenshot(
+                        geometry=self.geometry,
+                        dims=self._best_feas_dims,
+                        save_path="optimization/screenshots/cma_best.png",
+                        banner=(f"[CMA best @ gen {gen:03d}] "
+                                f"vol: {self._best_feas_vol:.4e}"),
+                    )
+                except Exception as e:
+                    print(f"[CMA] best screenshot failed: {e}", flush=True)
 
             with open(self._checkpoint_path(), "wb") as f:
                 pickle.dump({"es": es, "gen": gen + 1, "V_ref": self.V_ref,

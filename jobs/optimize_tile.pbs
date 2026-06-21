@@ -26,12 +26,15 @@ python -u -m optimization.optimize_dims \
     --arch mapdl \
     --optimizer cma \
     --generations 10000 \
+    --pop_size 30 \
     --search_space reflect \
+    --sigma0 0.4 \
     --constraint_mode quadratic \
     --processes 16 \
     --batch_size 10 \
     --reset_on_stagnation \
+    --max_unproductive_resets 5 \
     > ${PBS_O_WORKDIR}/run_${PBS_JOBID}.log 2>&1
 
-rm -r data/bistable/Instance_*
-rm -r data/bistable/ansys_*
+rm -r data/hollow_cube/Instance_*
+rm -r data/hollow_cube/ansys_*
