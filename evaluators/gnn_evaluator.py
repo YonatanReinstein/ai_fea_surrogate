@@ -17,7 +17,22 @@ import threading
 from time import sleep, perf_counter
 import socket
 
-STOP = False   
+STOP = False
+
+# Per-process cache of the frozen-graph constants (edge_index, tile_idx). Loaded
+# once per persistent worker from graph.pt and reused for every sample, so the
+# 206k-edge rebuild in to_graph_with_labels is skipped on fixed-topology runs.
+_FIXED_GRAPH_CACHE = {}
+
+
+def _get_fixed_graph(graph_path):
+    g = _FIXED_GRAPH_CACHE.get(graph_path)
+    if g is None:
+        gg = torch.load(graph_path, weights_only=False)
+        g = (gg["edge_index"].long(), gg["tile_idx"].long())
+        _FIXED_GRAPH_CACHE[graph_path] = g
+    return g
+
 
 def listener():
     global STOP
@@ -50,10 +65,10 @@ def _run_sample_worker(args):
         V,
         W,
         tile_grid,      # (NX, NY, NZ) tuple or None
+        graph_path,     # path to frozen graph.pt, or None for generic rebuild
     ) = args
     import random
     timings = {}
-    sleep(random.uniform(0.1, 0.2))
     t = perf_counter()
     cad_model = IritCModel(model_path, dims_dict=dims, fixed_dims=fixed_dims)
     component = Component(cad_model, young, poisson)
@@ -69,7 +84,15 @@ def _run_sample_worker(args):
     timings["boundary_conditions"] = perf_counter() - t
 
     t = perf_counter()
-    data = component.to_graph_with_labels(with_labels=False, tile_grid=tile_grid)
+    fixed = None
+    if graph_path is not None and os.path.exists(graph_path):
+        edge_index, tile_idx = _get_fixed_graph(graph_path)
+        # Guard: only take the fast path if this sample's mesh matches the
+        # frozen topology; otherwise fall back to a full rebuild.
+        if len(component.mesh.nodes) == tile_idx.shape[0]:
+            fixed = component.to_graph_fixed(edge_index, tile_idx, tile_grid)
+    data = fixed if fixed is not None else \
+        component.to_graph_with_labels(with_labels=False, tile_grid=tile_grid)
     timings["to_graph"] = perf_counter() - t
     if tile_grid is not None and hasattr(data, 'tile_idx'):
         NX, NY, NZ = tile_grid
@@ -135,16 +158,19 @@ class GNNEvaluator(BaseEvaluator):
         self.model.load_state_dict(ckpt["model_state"])
         self.model.eval()
 
+        # Frozen-graph fast path: if graph.pt exists, workers reuse its constant
+        # edge_index/tile_idx instead of rebuilding the graph per sample.
+        graph_path = f"data/{self.geometry_name}/dataset/graph.pt"
+        self.graph_path = graph_path if os.path.exists(graph_path) else None
+
         # Shared frozen-graph artifacts (pe standardized exactly as in training).
         self.pe = None
         self.node_id = None
-        if self.pe_dim:
-            graph_path = f"data/{self.geometry_name}/dataset/graph.pt"
-            if os.path.exists(graph_path):
-                g = torch.load(graph_path, weights_only=False)
-                pe = g["pe"].float()
-                self.pe = (pe - pe.mean(0)) / (pe.std(0) + 1e-8)
-                self.node_id = torch.arange(g["num_nodes"], dtype=torch.long)
+        if self.pe_dim and self.graph_path is not None:
+            g = torch.load(graph_path, weights_only=False)
+            pe = g["pe"].float()
+            self.pe = (pe - pe.mean(0)) / (pe.std(0) + 1e-8)
+            self.node_id = torch.arange(g["num_nodes"], dtype=torch.long)
 
         self.sample_counter = 0
 
@@ -167,6 +193,11 @@ class GNNEvaluator(BaseEvaluator):
         self._get_tile_grid = getattr(module, "tile_grid", None)
         self.fixed_dims = getattr(module, "fixed_dims", lambda: {})()
         self.listener_thread = threading.Thread(target=listener, daemon=True).start()
+
+        # Persistent worker pool: spawn the workers (and pay the heavy torch/irit
+        # re-import cost under 'spawn') exactly once, then reuse across every
+        # generation. Re-creating the pool per evaluate() dominated wall time.
+        self.pool = Pool(processes=self.processes)
 
 
 
@@ -197,6 +228,7 @@ class GNNEvaluator(BaseEvaluator):
                 self.V,
                 self.W,
                 self._get_tile_grid(dims) if self._get_tile_grid is not None else None,
+                self.graph_path,
             )
             for dims, idx in zip(dims_list, indexes)
         ]
@@ -205,30 +237,28 @@ class GNNEvaluator(BaseEvaluator):
 
 
         t = perf_counter()
-        if self.processes is None:
-            pool = Pool()
-        else:
-            pool = Pool(processes=self.processes)
-        it = pool.imap(_run_sample_worker, all_args)
+        it = self.pool.imap(_run_sample_worker, all_args)
         try:
             for result in it:
                 if STOP:
                     print("Graceful stop requested.")
 
                     # -------- KEY PART --------
-                    pool.close()  
+                    self.pool.close()
                     sleep(3)      # do not accept new tasks
-                    pool.terminate()    # kill worker process
+                    self.pool.terminate()    # kill worker process
                     # -------------------------
                     print("Stopped during evaluation.")
-                    pool.join() 
+                    self.pool.join()
+                    self.pool = None
 
                     break
 
                 results.append(result)
         except KeyboardInterrupt:
             print("KeyboardInterrupt detected. Terminating pool.")
-            pool.terminate()
+            self.pool.terminate()
+            self.pool = None
         t_pool = perf_counter() - t
 
         graph_dicts, volume_list, worker_timings = zip(*results)

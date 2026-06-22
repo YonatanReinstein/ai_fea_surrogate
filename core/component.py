@@ -139,6 +139,46 @@ class Component:
             data.tile_NZ = torch.tensor([NZ], dtype=torch.long)
         return data
 
+    def to_graph_fixed(self, edge_index, tile_idx, tile_grid) -> Data:
+        """Fast graph build for frozen-topology geometries (inference only).
+
+        edge_index and tile_idx are constant across dim samples and supplied
+        precomputed (data/<geometry>/dataset/graph.pt), so the expensive
+        Python edge-set rebuild and node->tile mapping in
+        to_graph_with_labels are skipped. Only the coordinate-dependent
+        node features and edge_attr (distances) are recomputed here. Node
+        ordering matches to_graph_with_labels (mesh.nodes.values(), n.id-1),
+        which is what edge_index/tile_idx were built against.
+        """
+        nodes = list(self.mesh.nodes.values())
+
+        coords   = torch.tensor([list(n.coords) for n in nodes], dtype=torch.float)        # [N,3]
+        forces   = torch.tensor([list(n.forces) if n.forces else [0.0, 0.0, 0.0]
+                                 for n in nodes], dtype=torch.float)                        # [N,3]
+        anchored = torch.tensor([[float(n.anchored)] for n in nodes], dtype=torch.float)   # [N,1]
+
+        feats = [coords, forces, anchored]
+        if tile_grid is not None:
+            NX, NY, NZ = tile_grid
+            t  = tile_idx.long()
+            ix = (t // (NY * NZ)).float() / max(NX - 1, 1)
+            iy = ((t // NZ) % NY).float() / max(NY - 1, 1)
+            iz = (t % NZ).float() / max(NZ - 1, 1)
+            feats.append(torch.stack([ix, iy, iz], dim=1))                                  # [N,3]
+        x = torch.cat(feats, dim=1)
+
+        edge_attr = torch.norm(coords[edge_index[0]] - coords[edge_index[1]],
+                               dim=1, keepdim=True)
+
+        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+        if tile_grid is not None:
+            NX, NY, NZ = tile_grid
+            data.tile_idx = tile_idx.long()
+            data.tile_NX  = torch.tensor([NX], dtype=torch.long)
+            data.tile_NY  = torch.tensor([NY], dtype=torch.long)
+            data.tile_NZ  = torch.tensor([NZ], dtype=torch.long)
+        return data
+
 
 if __name__ == "__main__":
     from core.IritModel import IritCModel

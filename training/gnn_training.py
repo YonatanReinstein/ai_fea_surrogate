@@ -267,10 +267,10 @@ def train_gnn_model(
     if start_epoch > 0:
         for pg in optimizer.param_groups:
             pg.setdefault("initial_lr", pg["lr"])
-    scheduler = torch.optim.lr_scheduler.StepLR(
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        step_size=10,
-        gamma=0.75,
+        T_max=epochs,
+        eta_min=lr * 0.01,
         last_epoch=start_epoch - 1
     )
 

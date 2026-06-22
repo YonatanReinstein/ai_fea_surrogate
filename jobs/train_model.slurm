@@ -2,7 +2,7 @@
 #SBATCH --job-name=train_hier_gnn
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=100G
 #SBATCH --time=30:00:00
 #SBATCH --partition=public
@@ -16,8 +16,8 @@ cd "$SLURM_SUBMIT_DIR"
 mkdir -p training/runs/train
 source env/bin/activate
 
-export OMP_NUM_THREADS=8
-export MKL_NUM_THREADS=8
+export OMP_NUM_THREADS=2
+export MKL_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 
 ulimit -n 65536
@@ -26,10 +26,10 @@ ulimit -n 65536
 python -u -m training.gnn_training \
     --geometry hollow_cube \
     --dataset data/hollow_cube/dataset/dataset.pt \
-    --num_samples 4000 \
+    --num_samples 1000 \
     --epochs 200 \
     --lr 1e-3 \
-    --batch_size 30 \
+    --batch_size 16 \
     --hidden_dim 128 \
     --conv_layers 6 \
     --node_loss_weight 1.0 \
