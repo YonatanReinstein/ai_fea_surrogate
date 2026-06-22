@@ -19,7 +19,7 @@ export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
 
-mkdir -p optimization/artifacts optimization/screenshots
+#mkdir -p optimization/artifacts optimization/screenshots
 
 python -u -m optimization.optimize_dims \
     --geometry hollow_cube \

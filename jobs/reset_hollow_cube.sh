@@ -39,7 +39,7 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-4}"
 
 echo "==> Grid (fixed_dims) for this reset:"
-python -c "from data.hollow_cube.boundary_conditions import fixed_dims, tile_grid; print('   fixed_dims =', fixed_dims()); print('   tile_grid  =', tile_grid())"
+#python -c "from data.hollow_cube.boundary_conditions import fixed_dims,; print('   fixed_dims =', fixed_dims()); print('   tile_grid  =', tile_grid())"
 
 echo "==> [1/3] Regenerating CAD artifacts (outline.itd, dims.json)..."
 python data/hollow_cube/CAD_model/gen_outline.py

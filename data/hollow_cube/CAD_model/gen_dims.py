@@ -13,7 +13,12 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[3]))
-from data.hollow_cube.boundary_conditions import tile_grid
+from data.hollow_cube.boundary_conditions import fixed_dims
+
+
+def tile_grid():
+    fd = fixed_dims()
+    return (int(fd["d1"]), int(fd["d2"]), int(fd["d3"]))
 
 CAD_DIR = Path(__file__).parent
 
