@@ -31,6 +31,7 @@ def fixed_dims() -> dict:
     #d1 = length, d2 = height, d3 = width. all in tiles
     return {"d1": 40.0, "d2": 21.0, "d3": 1.0}
     
+def tile_grid(dims: dict = None) -> tuple[int, int, int]:
     # d1=NX, d2=NY, d3=NZ match the ordering in model_lin.c
     fd = fixed_dims()
     return (int(fd["d1"]), int(fd["d2"]), int(fd["d3"]))
