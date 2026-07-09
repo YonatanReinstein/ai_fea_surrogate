@@ -38,8 +38,8 @@ class GNN(nn.Module):
 
     def forward(self, x, edge_index, edge_attr, batch,
                 tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
-                num_graphs=None, pe=None, node_id=None):
-        # pe/node_id accepted for API parity with HierarchicalGNN; unused here.
+                num_graphs=None, node_id=None):
+        # node_id accepted for API parity with HierarchicalGNN; unused here.
         h = self.encoder(x)
 
         N = h.size(0)
@@ -85,7 +85,7 @@ class HierarchicalGNN(nn.Module):
 
     def __init__(self, node_in_dim, edge_in_dim=1, hidden_dim=128, num_layers=6, tile_in_dim=1,
                  use_checkpoint=False, checkpoint_fine_only=False,
-                 pe_dim=0, num_pos_nodes=0, pe_sign_flip=True):
+                 num_pos_nodes=0):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         # When True, only the encode/decode (fine-mesh) layers are checkpointed.
@@ -93,18 +93,15 @@ class HierarchicalGNN(nn.Module):
         # activations are tiny anyway. Requires use_checkpoint=True to have effect.
         self.checkpoint_fine_only = checkpoint_fine_only
 
-        # --- Fixed-topology exploits (hollow_cube etc.) -------------------
-        # The graph is frozen and node ordering is stable, so we can feed
-        # precomputed Laplacian positional encodings (pe_dim>0) and learn a
+        # --- Fixed-topology exploit (hollow_cube etc.) ---------------------
+        # The graph is frozen and node ordering is stable, so we can learn a
         # per-node embedding table (num_pos_nodes>0) indexed by the stable
-        # node id. Both default to off, preserving the generic GNN behaviour.
-        self.pe_dim = pe_dim
-        self.pe_sign_flip = pe_sign_flip
+        # node id. Defaults to off, preserving the generic GNN behaviour.
         self.node_emb = nn.Embedding(num_pos_nodes, hidden_dim) if num_pos_nodes else None
         if self.node_emb is not None:
             nn.init.normal_(self.node_emb.weight, std=0.02)
 
-        self.encoder = MLP([node_in_dim + pe_dim, hidden_dim, hidden_dim], norm=None)
+        self.encoder = MLP([node_in_dim, hidden_dim, hidden_dim], norm=None)
         self.convs = nn.ModuleList(
             [EdgeAttrConv(hidden_dim, edge_in_dim) for _ in range(num_layers)]
         )
@@ -162,21 +159,11 @@ class HierarchicalGNN(nn.Module):
 
     def forward(self, x, edge_index, edge_attr, batch,
                 tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
-                num_graphs=None, pe=None, node_id=None):
+                num_graphs=None, node_id=None):
         N = x.size(0)
         if num_graphs is None:
             num_graphs = int(batch.max().item()) + 1 if N > 0 else 0
         device = x.device
-
-        # --- Fixed-topology inputs ---
-        if pe is not None and self.pe_dim:
-            if self.training and self.pe_sign_flip:
-                # Eigenvectors have arbitrary sign; flip per-graph so the model
-                # can't latch onto a fixed sign convention.
-                signs = torch.randint(0, 2, (num_graphs, pe.size(1)), device=device,
-                                      dtype=pe.dtype) * 2 - 1
-                pe = pe * signs[batch]
-            x = torch.cat([x, pe], dim=-1)
 
         h = self.encoder(x)
         if self.node_emb is not None and node_id is not None:

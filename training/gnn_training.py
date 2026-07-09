@@ -17,10 +17,9 @@ def gnn_input_fn(data):
     tile_NY   = getattr(data, 'tile_NY',   None)
     tile_NZ   = getattr(data, 'tile_NZ',   None)
     tile_x    = getattr(data, 'tile_x',    None)
-    pe        = getattr(data, 'pe',        None)  # fixed-graph positional encoding
     node_id   = getattr(data, 'node_id',   None)  # stable per-node index
     return (data.x, data.edge_index, data.edge_attr, data.batch,
-            tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, pe, node_id)
+            tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, node_id)
 
 
 def gnn_target_fn(data):
@@ -111,26 +110,21 @@ def train_gnn_model(
     # Fixed-topology exploit: attach shared graph artifacts
     # ----------------------------------------------------
     # For frozen-topology geometries (e.g. hollow_cube) the graph and node
-    # ordering are identical across samples, so Laplacian positional encodings
-    # and a stable per-node id are shared. Loaded once from graph.pt and
-    # broadcast onto every sample. Absent file -> generic GNN behaviour.
+    # ordering are identical across samples, so a stable per-node id is
+    # shared. Loaded once from graph.pt and broadcast onto every sample.
+    # Absent file -> generic GNN behaviour.
     graph_path = os.path.join(os.path.dirname(dataset_path), "graph.pt")
-    pe_dim, num_pos_nodes = 0, 0
+    num_pos_nodes = 0
     if os.path.exists(graph_path):
         g = torch.load(graph_path, weights_only=False)
-        pe = g["pe"].float()
-        # standardize each eigenvector column to unit std (raw entries ~1/sqrt(N))
-        pe = (pe - pe.mean(0)) / (pe.std(0) + 1e-8)
         node_id = torch.arange(g["num_nodes"], dtype=torch.long)
-        pe_dim = pe.shape[1]
         num_pos_nodes = g["num_nodes"]
         attached = 0
         for sample in dataset:
             if sample.x.shape[0] == num_pos_nodes:
-                sample.pe = pe
                 sample.node_id = node_id
                 attached += 1
-        print(f"[fixed-graph] graph.pt loaded: pe_dim={pe_dim}, nodes={num_pos_nodes}, "
+        print(f"[fixed-graph] graph.pt loaded: nodes={num_pos_nodes}, "
               f"attached to {attached}/{len(dataset)} samples")
     else:
         print(f"[fixed-graph] no graph.pt at {graph_path}; using generic GNN")
@@ -143,6 +137,12 @@ def train_gnn_model(
 
     num_samples = min(num_samples, len(dataset))
     print(f"Dataset size after cleaning: {len(dataset)}")
+
+    all_graph_targets_full = torch.cat([gnn_target_fn(d) for d in dataset], dim=0).float()
+    graph_target_mean_full = all_graph_targets_full.mean()
+    graph_target_std_full  = all_graph_targets_full.std() + 1e-8
+    print(f"Dataset max_stress mean: {graph_target_mean_full.item():.4f} MPa")
+    print(f"Dataset max_stress std:  {graph_target_std_full.item():.4f} MPa")
 
     total_samples = len(dataset)
     if num_samples is None or num_samples > total_samples:
@@ -221,7 +221,6 @@ def train_gnn_model(
         hidden_dim=hidden_dim,
         num_layers=conv_layers,
         use_checkpoint=use_checkpoint,
-        pe_dim=pe_dim,
         num_pos_nodes=num_pos_nodes,
     )
     if hierarchical:
@@ -313,7 +312,7 @@ def train_gnn_model(
 
             optimizer.zero_grad()
 
-            x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, pe, node_id = gnn_input_fn(batch_data)
+            x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, node_id = gnn_input_fn(batch_data)
             num_graphs = batch_data.num_graphs
             x = x.float().to(device, non_blocking=True)
             edge_index = edge_index.to(device, non_blocking=True)
@@ -326,8 +325,6 @@ def train_gnn_model(
                 tile_NZ  = tile_NZ.to(device,  non_blocking=True)
             if tile_x is not None:
                 tile_x = tile_x.float().to(device, non_blocking=True)
-            if pe is not None:
-                pe = pe.float().to(device, non_blocking=True)
             if node_id is not None:
                 node_id = node_id.to(device, non_blocking=True)
 
@@ -345,7 +342,7 @@ def train_gnn_model(
             graph_pred, node_pred = model(
                 x_norm, edge_index, edge_attr_norm, batch_idx,
                 tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
-                tile_x=tile_x, num_graphs=num_graphs, pe=pe, node_id=node_id,
+                tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
             )
             graph_loss = loss_fn(graph_pred, targ_norm)
             node_loss  = loss_fn(node_pred, node_targ_norm)
@@ -402,7 +399,7 @@ def train_gnn_model(
 
         with torch.no_grad():
             for batch_data in val_loader:
-                x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, pe, node_id = gnn_input_fn(batch_data)
+                x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, node_id = gnn_input_fn(batch_data)
                 num_graphs = batch_data.num_graphs
                 x = x.float().to(device, non_blocking=True)
                 edge_index = edge_index.to(device, non_blocking=True)
@@ -415,8 +412,6 @@ def train_gnn_model(
                     tile_NZ  = tile_NZ.to(device,  non_blocking=True)
                 if tile_x is not None:
                     tile_x = tile_x.float().to(device, non_blocking=True)
-                if pe is not None:
-                    pe = pe.float().to(device, non_blocking=True)
                 if node_id is not None:
                     node_id = node_id.to(device, non_blocking=True)
 
@@ -432,7 +427,7 @@ def train_gnn_model(
                 graph_pred, node_pred = model(
                     x_norm, edge_index, edge_attr_norm, batch_idx,
                     tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
-                    tile_x=tile_x, num_graphs=num_graphs, pe=pe, node_id=node_id,
+                    tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
                 )
                 graph_loss = loss_fn(graph_pred, targ_norm)
                 node_loss  = loss_fn(node_pred, node_targ_norm)
@@ -463,7 +458,6 @@ def train_gnn_model(
                 "hidden_dim": hidden_dim,
                 "out_dim": out_dim,
                 "hierarchical": hierarchical,
-                "pe_dim": pe_dim,
                 "num_pos_nodes": num_pos_nodes,
                 "target_mean": target_mean.detach().cpu(),
                 "target_std": target_std.detach().cpu(),
@@ -487,10 +481,12 @@ def train_gnn_model(
                 }, f, indent=4)
 
         epoch_secs = time.time() - epoch_t0
+        train_graph_rmse_mpa = avg_train_graph ** 0.5 * graph_target_std_full.item()
+        val_graph_rmse_mpa   = avg_val_graph   ** 0.5 * graph_target_std_full.item()
         print(
             f"Epoch {epoch:03d}/{epochs} | {epoch_secs:6.1f}s | "
-            f"Train: {avg_train:.6f} (g {avg_train_graph:.6f} / n {avg_train_node:.6f}) | "
-            f"Val: {avg_val:.6f} (g {avg_val_graph:.6f} / n {avg_val_node:.6f}) | "
+            f"Train: {avg_train:.6f} (g {avg_train_graph:.6f} [{train_graph_rmse_mpa:.4f} MPa] / n {avg_train_node:.6f}) | "
+            f"Val: {avg_val:.6f} (g {avg_val_graph:.6f} [{val_graph_rmse_mpa:.4f} MPa] / n {avg_val_node:.6f}) | "
             f"LR: {optimizer.param_groups[0]['lr']:.2e}"
         )
 

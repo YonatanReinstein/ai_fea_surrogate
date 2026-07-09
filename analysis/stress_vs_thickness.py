@@ -55,7 +55,7 @@ fig, ax = plt.subplots(figsize=(7, 4))
 ax.plot(t_vals, s_vals, marker="o", markersize=4, linewidth=1.5)
 ax.set_xlabel("Frame thickness d1")
 ax.set_ylabel("Max von Mises stress (MPa)")
-ax.set_title("Bistable tile max stress vs frame thickness")
+ax.set_title("Hollow-cube tile: max stress vs frame thickness")
 ax.grid(True, alpha=0.3)
 plt.tight_layout()
 
