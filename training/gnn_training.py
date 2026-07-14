@@ -5,6 +5,7 @@ import re
 import glob
 import time
 from torch_geometric.loader import DataLoader
+from torch_geometric.utils import scatter
 from utils.gnn_surrogate import GNN, HierarchicalGNN
 
 
@@ -32,6 +33,21 @@ def gnn_node_target_fn(data):
     return data.node_stress.view(-1, 1)
 
 
+def weighted_node_mse(node_pred, node_targ_norm, node_targ_raw, batch_idx):
+    # Weighted MSE: each node's squared error is scaled by
+    # weight_i = raw_von_mises_stress_i / sum(raw_von_mises_stress over the same graph),
+    # so higher-stress nodes count more toward that graph's loss. Weights are
+    # computed per graph (not over the whole batch) so samples with more nodes
+    # or an overall higher stress level don't dominate other samples in the batch.
+    raw = node_targ_raw.squeeze(-1)
+    graph_totals = scatter(raw, batch_idx, dim=0, reduce="sum")
+    weights = raw / (graph_totals[batch_idx] + 1e-8)
+
+    sq_err = (node_pred.squeeze(-1) - node_targ_norm.squeeze(-1)) ** 2
+    per_graph_loss = scatter(weights * sq_err, batch_idx, dim=0, reduce="sum")
+    return per_graph_loss.mean()
+
+
 # ======================================================
 # Main Training Function
 # ======================================================
@@ -49,6 +65,7 @@ def train_gnn_model(
     dataset_path: str = None,
     use_checkpoint: bool = False,
     checkpoint_fine_only: bool = False,
+    use_node_emb: bool = True,
 ):
     torch.manual_seed(42)
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
@@ -175,6 +192,7 @@ def train_gnn_model(
     node_target_mean = all_node_targets.mean(dim=0).to(device)
     node_target_std  = (all_node_targets.std(dim=0) + 1e-8).to(device)
 
+
     all_x = torch.cat([d.x for d in train_set], dim=0).float()
     x_mean = all_x.mean(dim=0).to(device)
     x_std  = (all_x.std(dim=0) + 1e-8).to(device)
@@ -215,6 +233,8 @@ def train_gnn_model(
     hierarchical = hasattr(train_set[0], 'tile_idx')
     #ModelClass = HierarchicalGNN if hierarchical else GNN
     ModelClass = HierarchicalGNN
+    num_pos_nodes = num_pos_nodes if use_node_emb else 0
+    print(f"[model] use_node_emb={use_node_emb} num_pos_nodes={num_pos_nodes}")
     model_kwargs = dict(
         node_in_dim=node_in_dim,
         edge_in_dim=edge_in_dim,
@@ -333,7 +353,7 @@ def train_gnn_model(
             edge_attr_norm = (edge_attr - edge_mean) / edge_std
 
             targ = gnn_target_fn(batch_data).float().to(device, non_blocking=True)
-            targ_norm = (targ - node_target_mean) / node_target_std
+            targ_norm = (targ - target_mean) / target_std
             node_targ = gnn_node_target_fn(batch_data).float().to(device, non_blocking=True)
             node_targ_norm = (node_targ - node_target_mean) / node_target_std
             if profile_this_epoch:
@@ -344,8 +364,11 @@ def train_gnn_model(
                 tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
                 tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
             )
-            graph_loss = loss_fn(graph_pred, targ_norm)
-            node_loss  = loss_fn(node_pred, node_targ_norm)
+            # graph_pred = global_max_pool(node_pred, batch) lives in node-normalized
+            # space, so convert it to graph-target-normalized space before comparing.
+            graph_pred_target_norm = (graph_pred * node_target_std + node_target_mean - target_mean) / target_std
+            graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
+            node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx)
             loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
             if profile_this_epoch:
                 _sync(); t_now = time.perf_counter(); t_fwd += t_now - t_mark; t_mark = t_now
@@ -419,7 +442,7 @@ def train_gnn_model(
                 edge_attr_norm = (edge_attr - edge_mean) / edge_std
 
                 targ = gnn_target_fn(batch_data).float().to(device, non_blocking=True)
-                targ_norm = (targ - node_target_mean) / node_target_std
+                targ_norm = (targ - target_mean) / target_std
 
                 node_targ = gnn_node_target_fn(batch_data).float().to(device, non_blocking=True)
                 node_targ_norm = (node_targ - node_target_mean) / node_target_std
@@ -429,8 +452,9 @@ def train_gnn_model(
                     tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
                     tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
                 )
-                graph_loss = loss_fn(graph_pred, targ_norm)
-                node_loss  = loss_fn(node_pred, node_targ_norm)
+                graph_pred_target_norm = (graph_pred * node_target_std + node_target_mean - target_mean) / target_std
+                graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
+                node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx)
                 loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
 
                 total_val       += loss.item()
@@ -520,6 +544,9 @@ if __name__ == "__main__":
                         help="If use_checkpoint=true, checkpoint only the fine-mesh "
                              "(encode/decode) layers in HierarchicalGNN. Coarse layers "
                              "run without checkpoint (their activations are tiny).")
+    parser.add_argument("--use_node_emb", type=_bool, default=True,
+                        help="Enable the per-node learned embedding table for fixed-topology "
+                             "geometries. Pass false to ablate it (e.g. --use_node_emb false).")
     args = parser.parse_args()
 
     train_gnn_model(
@@ -534,6 +561,7 @@ if __name__ == "__main__":
         graph_loss_weight=args.graph_loss_weight,
         weight_decay=args.weight_decay,
         dataset_path=args.dataset,
+        use_node_emb=args.use_node_emb,
         use_checkpoint=args.use_checkpoint,
         checkpoint_fine_only=args.checkpoint_fine_only,
     )

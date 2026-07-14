@@ -26,14 +26,15 @@ ulimit -n 65536
 python -u -m training.gnn_training \
     --geometry hollow_cube \
     --dataset data/hollow_cube/dataset/dataset.pt \
-    --num_samples 1000 \
-    --epochs 200 \
-    --lr 1e-3 \
-    --batch_size 16 \
+    --num_samples 500 \
+    --epochs 400 \
+    --lr 1e-4 \
+    --batch_size 4 \
     --hidden_dim 128 \
     --conv_layers 6 \
     --node_loss_weight 1.0 \
     --graph_loss_weight 0.0 \
-    --weight_decay 1e-3 \
+    --weight_decay 2e-4 \
     --use_checkpoint false \
     --checkpoint_fine_only false \
+    --use_node_emb false \

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from torch_geometric.nn import MessagePassing, global_max_pool
+from torch_geometric.nn import MessagePassing , global_max_pool
 from torch_geometric.nn.models import MLP
 
 

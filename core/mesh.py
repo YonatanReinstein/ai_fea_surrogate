@@ -303,6 +303,63 @@ class Mesh:
 
 
 
+    def plot_stress_heatmap(self, node_stress: dict, save_path=None, resolution=(3840, 2160),
+                             aa_type="msaa", banner: str = None, cmap="jet",
+                             clim=None, title="Von Mises Stress (MPa)"):
+        """Render the mesh colored by per-node stress, matching Ansys's nodal
+        equivalent-stress plot style (same camera as plot_mesh).
+
+        node_stress: dict mapping mesh node id -> scalar stress value.
+        Missing node ids default to 0.0.
+        """
+        import numpy as np
+        import pyvista as pv
+        from pyvista import CellType
+
+        node_items = sorted(self.nodes.items())
+        id_map = {nid: i for i, (nid, _) in enumerate(node_items)}
+        points = np.array([node.coords for _, node in node_items], dtype=float)
+        scalars = np.array([node_stress.get(nid, 0.0) for nid, _ in node_items], dtype=float)
+
+        cells = []
+        cell_types = []
+        for elem in self.elements.values():
+            local_ids = [id_map[n.id] for n in elem.nodes]
+            cells.append(len(local_ids))
+            cells.extend(local_ids)
+            cell_types.append(CellType.HEXAHEDRON)
+
+        grid = pv.UnstructuredGrid(np.array(cells), np.array(cell_types), points)
+        grid.point_data[title] = scalars
+
+        grid.rotate_z(270, point=grid.center, inplace=True)
+
+        off_screen = save_path is not None
+        plotter = pv.Plotter(off_screen=off_screen, window_size=resolution)
+        plotter.enable_anti_aliasing(aa_type)
+
+        plotter.add_mesh(
+            grid,
+            scalars=title,
+            cmap=cmap,
+            show_edges=True,
+            clim=clim,
+            scalar_bar_args={"title": title, "vertical": True},
+        )
+
+        if banner is not None:
+            plotter.add_text(banner, position="upper_left", font_size=20, color="black")
+
+        plotter.view_xz()
+        plotter.camera.up = (1.0, 0.0, 0.0)
+        plotter.enable_parallel_projection()
+
+        if save_path is not None:
+            plotter.screenshot(save_path)
+            plotter.close()
+        else:
+            plotter.show()
+
     def plot_mesh_with_tiles(self, tile_centers, tile_edges=None, node_tile_map=None, save_path=None, resolution=(3840, 2160)):
         import numpy as np
         import pyvista as pv

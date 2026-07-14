@@ -36,7 +36,7 @@ python -u -m optimization.optimize_dims \
     --sigma0 0.5 \
     --constraint_mode quadratic \
     --processes 90 \
-    --batch_size 12 \
+    --batch_size 4 \
     --penalty_weight 10.0 \
     --reset_on_stagnation \
     --max_unproductive_resets 5 \

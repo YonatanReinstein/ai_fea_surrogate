@@ -59,6 +59,7 @@ def _run_sample_worker(args):
         poisson,
         sample_index,
         screenshot,
+        heatmap,
         anchor_condition,
         force_pattern,
         U,
@@ -110,21 +111,33 @@ def _run_sample_worker(args):
     volume = component.get_volume()
     timings["get_volume"] = perf_counter() - t
     data_dict = {k: v.numpy() for k, v in data.items() if hasattr(v, 'numpy')}
-    return data_dict, volume, timings
+    # Only pay the pickling cost of the mesh (nodes/elements) when a heatmap
+    # was actually requested; node prediction happens later in the main
+    # process (batched inference), so the mesh has to travel back with it.
+    mesh_obj = component.mesh if heatmap else None
+    return data_dict, volume, timings, mesh_obj
 
 
 class GNNEvaluator(BaseEvaluator):
-    def __init__(self, geometry_name: str, screenshots: bool = False, processes: int = None, batch_size: int = 128):
+    def __init__(self, geometry_name: str, screenshots: bool = False, processes: int = None, batch_size: int = 128,
+                 heatmap: bool = False, heatmap_dir: str = "screenshots"):
         super().__init__(geometry_name)
         self.processes = processes
         self.screenshots = screenshots
         self.batch_size = batch_size
+        # When enabled, evaluate() also renders a per-sample stress heatmap
+        # (Ansys-style nodal von Mises coloring) driven by the GNN's
+        # node-level predictions instead of a real FEA solve.
+        self.heatmap = heatmap
+        self.heatmap_dir = heatmap_dir
+        if self.heatmap:
+            os.makedirs(self.heatmap_dir, exist_ok=True)
 
         ckpt_path = f"data/{geometry_name}/gnn_surrogate.pt"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(ckpt_path, map_location=self.device)
 
-        # graph_pred = max(node_pred) lives in node-normalized space, so denormalize with node stats
+        # graph_pred = max(node_pred) lives in node-normalized space
         self.target_mean = ckpt["node_target_mean"].to(self.device)
         self.target_std  = ckpt["node_target_std"].to(self.device)
         self.x_mean = ckpt["x_mean"].to(self.device)
@@ -217,6 +230,7 @@ class GNNEvaluator(BaseEvaluator):
                 self.poisson,
                 idx,
                 self.screenshots,
+                self.heatmap,
                 self.anchor_condition,
                 self.force_pattern,
                 self.U,
@@ -256,7 +270,7 @@ class GNNEvaluator(BaseEvaluator):
             self.pool = None
         t_pool = perf_counter() - t
 
-        graph_dicts, volume_list, worker_timings = zip(*results)
+        graph_dicts, volume_list, worker_timings, mesh_list = zip(*results)
         t = perf_counter()
         graph_list = [
             Data(**{k: torch.from_numpy(v) for k, v in d.items()})
@@ -271,6 +285,7 @@ class GNNEvaluator(BaseEvaluator):
 
         # Build DataLoader
         all_stress = []
+        sample_offset = 0  # running count of graphs consumed, to index into indexes/mesh_list
 
         t = perf_counter()
         loader = DataLoader(graph_list, batch_size=self.batch_size, shuffle=False)
@@ -308,7 +323,7 @@ class GNNEvaluator(BaseEvaluator):
                 node_id = node_id.to(self.device)
 
             with torch.inference_mode():
-                graph_pred, _ = self.model(
+                graph_pred, node_pred = self.model(
                     x, edge_index, edge_attr, batch,
                     tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
                     tile_x=tile_x, node_id=node_id,
@@ -318,6 +333,27 @@ class GNNEvaluator(BaseEvaluator):
             stress = graph_pred * self.target_std + self.target_mean
             stress = stress.squeeze()
             all_stress.extend(stress.detach().cpu().numpy().tolist())
+
+            if self.heatmap:
+                # node_pred lives in the same normalized space as graph_pred
+                # (graph_pred = max(node_pred)), so it denormalizes the same way.
+                node_stress = (node_pred * self.target_std + self.target_mean).squeeze(-1).detach().cpu()
+                batch_cpu = batch.detach().cpu()
+                num_graphs = int(batch_data.num_graphs)
+                counts = torch.bincount(batch_cpu, minlength=num_graphs).tolist()
+                start = 0
+                for g in range(num_graphs):
+                    n = counts[g]
+                    local_stress = node_stress[start:start + n]
+                    start += n
+                    sample_idx = indexes[sample_offset + g]
+                    mesh = mesh_list[sample_offset + g]
+                    # Node i in the graph (0-based) is mesh node id i+1 — see
+                    # to_graph_with_labels / to_graph_fixed node ordering.
+                    stress_dict = {i + 1: float(local_stress[i]) for i in range(n)}
+                    save_path = os.path.join(self.heatmap_dir, f"heatmap_{sample_idx + 1}.png")
+                    mesh.plot_stress_heatmap(stress_dict, save_path=save_path)
+                sample_offset += num_graphs
         t_inference = perf_counter() - t
 
         # ---- timing report ----
