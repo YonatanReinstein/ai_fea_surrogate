@@ -85,11 +85,13 @@ class HierarchicalGNN(nn.Module):
 
     def __init__(self, node_in_dim, edge_in_dim=1, hidden_dim=128, num_layers=6, tile_in_dim=1,
                  use_checkpoint=False, checkpoint_fine_only=False,
-                 num_pos_nodes=0):
+                 num_pos_nodes=0, transformer_heads=4, transformer_ff_mult=2,
+                 transformer_dropout=0.1):
         super().__init__()
+        assert num_layers >= 2, "need >=2 layers: fine encode + fine decode around the coarse transformer"
         self.use_checkpoint = use_checkpoint
         # When True, only the encode/decode (fine-mesh) layers are checkpointed.
-        # The coarse middle layers run without checkpoint because their
+        # The coarse transformer stage runs without checkpoint because its
         # activations are tiny anyway. Requires use_checkpoint=True to have effect.
         self.checkpoint_fine_only = checkpoint_fine_only
 
@@ -102,16 +104,35 @@ class HierarchicalGNN(nn.Module):
             nn.init.normal_(self.node_emb.weight, std=0.02)
 
         self.encoder = MLP([node_in_dim, hidden_dim, hidden_dim], norm=None)
-        self.convs = nn.ModuleList(
-            [EdgeAttrConv(hidden_dim, edge_in_dim) for _ in range(num_layers)]
-        )
         self.head = MLP([hidden_dim, hidden_dim, 1], norm=None)
+
+        # Fine stage: two local convs (encode real->tile, decode tile->real).
+        self.convs = nn.ModuleList(
+            [EdgeAttrConv(hidden_dim, edge_in_dim) for _ in range(2)]
+        )
+
+        # Coarse stage: full self-attention over the tile + global tokens.
+        # The tile grid is small (tens to low-thousands of tokens), so full
+        # attention is cheap and gives every tile a direct path to every
+        # other tile in one layer, instead of relying on many 6-connected
+        # message-passing hops to cover the whole grid.
+        num_coarse_layers = max(num_layers - 2, 1)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=transformer_heads,
+            dim_feedforward=hidden_dim * transformer_ff_mult,
+            dropout=transformer_dropout,
+            batch_first=True, norm_first=True, activation="gelu",
+        )
+        self.coarse_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_coarse_layers)
+        # Attention has no notion of the 6-connected grid the local convs
+        # relied on, so this tells tiles apart spatially: grid coords
+        # (ix, iy, iz) normalized to [0, 1], pushed through a small MLP.
+        self.tile_pos_encoder = MLP([3, hidden_dim, hidden_dim], norm=None)
 
         # Level 1 — tile virtual nodes
         self.tile_emb            = nn.Parameter(torch.zeros(hidden_dim))
         self.tile_input_encoder  = MLP([tile_in_dim, hidden_dim, hidden_dim], norm=None)
         self.real_tile_edge_attr = nn.Parameter(torch.zeros(edge_in_dim))
-        self.tile_tile_edge_attr = nn.Parameter(torch.zeros(edge_in_dim))
         nn.init.normal_(self.tile_emb, std=0.02)
 
         # Level 2 — global virtual node
@@ -119,43 +140,28 @@ class HierarchicalGNN(nn.Module):
         self.tile_global_edge_attr  = nn.Parameter(torch.zeros(edge_in_dim))
         nn.init.normal_(self.global_emb, std=0.02)
 
-        # Cache for local tile adjacency pairs, keyed by (NX, NY, NZ).
+        # Cache for tile grid positions, keyed by (NX, NY, NZ, device).
         # Plain dict — not serialized in state_dict, rebuilt on first forward.
-        self._tile_adj_cache: dict = {}
+        self._tile_pos_cache: dict = {}
 
     @staticmethod
-    def _build_local_tile_adj(NX, NY, NZ):
-        """Build local (intra-graph) 6-connected tile pairs. Called once per grid shape."""
-        pairs = []
-        for ix in range(NX):
-            for iy in range(NY):
-                for iz in range(NZ):
-                    flat = ix * NY * NZ + iy * NZ + iz
-                    for dix, diy, diz in [(1, 0, 0), (0, 1, 0), (0, 0, 1)]:
-                        jx, jy, jz = ix + dix, iy + diy, iz + diz
-                        if jx < NX and jy < NY and jz < NZ:
-                            nb = jx * NY * NZ + jy * NZ + jz
-                            pairs += [(flat, nb), (nb, flat)]
-        if not pairs:
-            return None
-        return torch.tensor(pairs, dtype=torch.long).t()  # [2, E_local]
+    def _build_tile_positions(NX, NY, NZ, device):
+        """Normalized (ix, iy, iz) grid coords, one row per tile, in the same
+        flat order as tile_idx (ix*NY*NZ + iy*NZ + iz)."""
+        ix = torch.arange(NX, device=device).view(NX, 1, 1).expand(NX, NY, NZ)
+        iy = torch.arange(NY, device=device).view(1, NY, 1).expand(NX, NY, NZ)
+        iz = torch.arange(NZ, device=device).view(1, 1, NZ).expand(NX, NY, NZ)
+        pos = torch.stack([ix, iy, iz], dim=-1).reshape(-1, 3).float()
+        norm = torch.tensor(
+            [max(NX - 1, 1), max(NY - 1, 1), max(NZ - 1, 1)], device=device, dtype=torch.float
+        )
+        return pos / norm
 
-    def _tile_adjacency(self, NX, NY, NZ, num_graphs, tile_start, device):
-        """Bidirectional 6-connected grid edges between tile virtual nodes."""
+    def _tile_positions(self, NX, NY, NZ, device):
         key = (NX, NY, NZ, device)
-        if key not in self._tile_adj_cache:
-            local = self._build_local_tile_adj(NX, NY, NZ)
-            self._tile_adj_cache[key] = local.to(device) if local is not None else None
-        local = self._tile_adj_cache[key]
-
-        if local is None:
-            return torch.empty((2, 0), dtype=torch.long, device=device)
-
-        K = NX * NY * NZ
-        offsets = torch.arange(num_graphs, device=device) * K             # [G]
-        src = (local[0].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1) + tile_start
-        dst = (local[1].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1) + tile_start
-        return torch.stack([src, dst], dim=0)
+        if key not in self._tile_pos_cache:
+            self._tile_pos_cache[key] = self._build_tile_positions(NX, NY, NZ, device)
+        return self._tile_pos_cache[key]
 
     def forward(self, x, edge_index, edge_attr, batch,
                 tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
@@ -180,7 +186,8 @@ class HierarchicalGNN(nn.Module):
             global_start = N + num_graphs * K
 
             # --- Build augmented node set ---
-            tile_h = self.tile_emb.unsqueeze(0).expand(num_graphs * K, -1)
+            pos_h = self.tile_pos_encoder(self._tile_positions(NX, NY, NZ, device))  # [K, H]
+            tile_h = self.tile_emb.unsqueeze(0).expand(num_graphs * K, -1) + pos_h.repeat(num_graphs, 1)
             if tile_x is not None:
                 tile_h = tile_h + self.tile_input_encoder(tile_x.float())
             global_h = self.global_emb.unsqueeze(0).expand(num_graphs, -1)
@@ -192,53 +199,43 @@ class HierarchicalGNN(nn.Module):
                 torch.stack([real_idx, tile_node_abs], dim=0),
                 torch.stack([tile_node_abs, real_idx], dim=0),
             ], dim=1)
-
-            # Tile ↔ Tile  (6-connected spatial adjacency)
-            tt_edges = self._tile_adjacency(NX, NY, NZ, num_graphs, tile_start, device)
-
-            # Tile ↔ Global  (every tile node → its graph's global node)
-            all_tile_nodes = torch.arange(num_graphs * K, device=device)
-            graph_of_tile  = all_tile_nodes // K
-            tg_src = tile_start   + all_tile_nodes
-            tg_dst = global_start + graph_of_tile
-            tg_edges = torch.cat([
-                torch.stack([tg_src, tg_dst], dim=0),
-                torch.stack([tg_dst, tg_src], dim=0),
-            ], dim=1)
-
             rt_ea = self.real_tile_edge_attr.unsqueeze(0).expand(rt_edges.size(1), -1)
-            tt_ea = self.tile_tile_edge_attr.unsqueeze(0).expand(tt_edges.size(1), -1)
-            tg_ea = self.tile_global_edge_attr.unsqueeze(0).expand(tg_edges.size(1), -1)
 
-            # Multi-scale schedule: first + last layer touch the fine mesh
-            # (real↔real + real↔tile); middle layers operate only on the coarse
-            # graph (tile↔tile + tile↔global), which has vastly fewer edges.
+            # Encode/decode schedule: the fine convs touch the real mesh
+            # (real↔real + real↔tile); the coarse transformer in between
+            # attends over every tile + the global token in one shot.
             # Encode: gather local geometry and push it up to tiles.
-            # Process: cheap global reasoning at the coarse scale.
+            # Process: full attention across all tiles — cheap global reasoning.
             # Decode: pull tile info back to real nodes + final local refinement.
             fine_ei = torch.cat([edge_index, rt_edges], dim=1)
             fine_ea = torch.cat([edge_attr, rt_ea], dim=0)
 
-            coarse_ei = torch.cat([tt_edges, tg_edges], dim=1)
-            coarse_ea = torch.cat([tt_ea, tg_ea], dim=0)
+            conv_encode, conv_decode = self.convs
 
-            num_layers = len(self.convs)
-            for i, conv in enumerate(self.convs):
-                is_fine = (i == 0 or i == num_layers - 1 or num_layers <= 2)
-                if is_fine:
-                    ei, ea = fine_ei, fine_ea
-                else:
-                    ei, ea = coarse_ei, coarse_ea
+            ckpt_fine = self.training and self.use_checkpoint
+            if ckpt_fine:
+                h_aug = h_aug + checkpoint(conv_encode, h_aug, fine_ei, fine_ea, use_reentrant=False)
+            else:
+                h_aug = h_aug + conv_encode(h_aug, fine_ei, fine_ea)
 
-                ckpt_this = (
-                    self.training
-                    and self.use_checkpoint
-                    and (is_fine or not self.checkpoint_fine_only)
-                )
-                if ckpt_this:
-                    h_aug = h_aug + checkpoint(conv, h_aug, ei, ea, use_reentrant=False)
-                else:
-                    h_aug = h_aug + conv(h_aug, ei, ea)
+            tile_tok = h_aug[tile_start:tile_start + num_graphs * K].view(num_graphs, K, -1)
+            global_tok = h_aug[global_start:global_start + num_graphs].unsqueeze(1)
+            tokens = torch.cat([tile_tok, global_tok], dim=1)  # [G, K+1, H]
+
+            ckpt_coarse = self.training and self.use_checkpoint and not self.checkpoint_fine_only
+            if ckpt_coarse:
+                tokens = checkpoint(self.coarse_transformer, tokens, use_reentrant=False)
+            else:
+                tokens = self.coarse_transformer(tokens)
+
+            tile_new   = tokens[:, :K, :].reshape(num_graphs * K, -1)
+            global_new = tokens[:, K, :]
+            h_aug = torch.cat([h_aug[:tile_start], tile_new, global_new], dim=0)
+
+            if ckpt_fine:
+                h_aug = h_aug + checkpoint(conv_decode, h_aug, fine_ei, fine_ea, use_reentrant=False)
+            else:
+                h_aug = h_aug + conv_decode(h_aug, fine_ei, fine_ea)
 
         else:
             # Fallback: single global virtual node (original GNN behaviour)

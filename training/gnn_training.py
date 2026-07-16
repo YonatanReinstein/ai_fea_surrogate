@@ -66,6 +66,9 @@ def train_gnn_model(
     use_checkpoint: bool = False,
     checkpoint_fine_only: bool = False,
     use_node_emb: bool = True,
+    transformer_heads: int = 4,
+    transformer_ff_mult: int = 2,
+    transformer_dropout: float = 0.1,
 ):
     torch.manual_seed(42)
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
@@ -245,6 +248,9 @@ def train_gnn_model(
     )
     if hierarchical:
         model_kwargs["checkpoint_fine_only"] = checkpoint_fine_only
+        model_kwargs["transformer_heads"] = transformer_heads
+        model_kwargs["transformer_ff_mult"] = transformer_ff_mult
+        model_kwargs["transformer_dropout"] = transformer_dropout
     model = ModelClass(**model_kwargs).to(device)
     print(f"[model] use_checkpoint={use_checkpoint} "
           f"checkpoint_fine_only={checkpoint_fine_only if hierarchical else 'N/A'}")
@@ -480,9 +486,12 @@ def train_gnn_model(
                 "node_in_dim": node_in_dim,
                 "edge_in_dim": edge_in_dim,
                 "hidden_dim": hidden_dim,
+                "conv_layers": conv_layers,
                 "out_dim": out_dim,
                 "hierarchical": hierarchical,
                 "num_pos_nodes": num_pos_nodes,
+                "transformer_heads": transformer_heads,
+                "transformer_ff_mult": transformer_ff_mult,
                 "target_mean": target_mean.detach().cpu(),
                 "target_std": target_std.detach().cpu(),
                 "node_target_mean": node_target_mean.detach().cpu(),
@@ -547,6 +556,12 @@ if __name__ == "__main__":
     parser.add_argument("--use_node_emb", type=_bool, default=True,
                         help="Enable the per-node learned embedding table for fixed-topology "
                              "geometries. Pass false to ablate it (e.g. --use_node_emb false).")
+    parser.add_argument("--transformer_heads", default=4, type=int,
+                        help="Attention heads in the coarse tile transformer (HierarchicalGNN only).")
+    parser.add_argument("--transformer_ff_mult", default=2, type=int,
+                        help="Feedforward width multiplier in the coarse tile transformer.")
+    parser.add_argument("--transformer_dropout", default=0.1, type=float,
+                        help="Dropout in the coarse tile transformer (attention + FF).")
     args = parser.parse_args()
 
     train_gnn_model(
@@ -564,4 +579,7 @@ if __name__ == "__main__":
         use_node_emb=args.use_node_emb,
         use_checkpoint=args.use_checkpoint,
         checkpoint_fine_only=args.checkpoint_fine_only,
+        transformer_heads=args.transformer_heads,
+        transformer_ff_mult=args.transformer_ff_mult,
+        transformer_dropout=args.transformer_dropout,
     )

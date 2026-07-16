@@ -147,23 +147,24 @@ class GNNEvaluator(BaseEvaluator):
 
         self.node_in_dim = ckpt["node_in_dim"]
         self.edge_in_dim = ckpt.get("edge_in_dim", 1)
-        num_layers = max(
-            int(k.split(".")[1]) for k in ckpt["model_state"] if k.startswith("convs")
-        ) + 1
+        num_layers = ckpt["conv_layers"]
         hidden_dim = ckpt.get("hidden_dim") or ckpt["model_state"]["encoder.lins.0.bias"].shape[0]
 
         # Fixed-topology exploit: per-node embedding (0 -> disabled).
         num_pos_nodes = ckpt.get("num_pos_nodes", 0)
 
-        ModelClass = HierarchicalGNN if ckpt.get("hierarchical", False) else GNN
+        hierarchical = ckpt.get("hierarchical", False)
+        ModelClass = HierarchicalGNN if hierarchical else GNN
         model_kwargs = dict(
             node_in_dim=self.node_in_dim,
             edge_in_dim=self.edge_in_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
         )
-        if ckpt.get("hierarchical", False):
+        if hierarchical:
             model_kwargs["num_pos_nodes"] = num_pos_nodes
+            model_kwargs["transformer_heads"] = ckpt["transformer_heads"]
+            model_kwargs["transformer_ff_mult"] = ckpt["transformer_ff_mult"]
         self.model = ModelClass(**model_kwargs).to(self.device)
 
         self.model.load_state_dict(ckpt["model_state"])
