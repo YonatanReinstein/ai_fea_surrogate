@@ -7,6 +7,7 @@ import time
 from torch_geometric.loader import DataLoader
 from torch_geometric.utils import scatter
 from utils.gnn_surrogate import GNN, HierarchicalGNN
+from utils.gnn_hierarchical_mp import HierarchicalGNNMP
 
 
 # ======================================================
@@ -33,15 +34,22 @@ def gnn_node_target_fn(data):
     return data.node_stress.view(-1, 1)
 
 
-def weighted_node_mse(node_pred, node_targ_norm, node_targ_raw, batch_idx):
+def weighted_node_mse(node_pred, node_targ_norm, node_targ_raw, batch_idx, stress_weight_power=1.0):
     # Weighted MSE: each node's squared error is scaled by
-    # weight_i = raw_von_mises_stress_i / sum(raw_von_mises_stress over the same graph),
+    # weight_i = raw_von_mises_stress_i^power / sum(raw_von_mises_stress^power over the same graph),
     # so higher-stress nodes count more toward that graph's loss. Weights are
     # computed per graph (not over the whole batch) so samples with more nodes
     # or an overall higher stress level don't dominate other samples in the batch.
-    raw = node_targ_raw.squeeze(-1)
-    graph_totals = scatter(raw, batch_idx, dim=0, reduce="sum")
-    weights = raw / (graph_totals[batch_idx] + 1e-8)
+    #
+    # stress_weight_power (alpha) controls how much high-stress nodes dominate:
+    #   alpha = 0   -> all nodes weighted equally (reduces to plain node-mean MSE)
+    #   alpha = 1   -> weight proportional to raw stress (previous default behavior)
+    #   alpha > 1   -> high-stress nodes dominate more strongly
+    #   0 < alpha < 1 -> softened weighting, less domination than raw stress
+    raw = node_targ_raw.squeeze(-1).clamp_min(0.0)
+    raw_pow = raw.pow(stress_weight_power)
+    graph_totals = scatter(raw_pow, batch_idx, dim=0, reduce="sum")
+    weights = raw_pow / (graph_totals[batch_idx] + 1e-8)
 
     sq_err = (node_pred.squeeze(-1) - node_targ_norm.squeeze(-1)) ** 2
     per_graph_loss = scatter(weights * sq_err, batch_idx, dim=0, reduce="sum")
@@ -61,14 +69,18 @@ def train_gnn_model(
     conv_layers: int = 6,
     node_loss_weight: float = 1.0,
     graph_loss_weight: float = 1.0,
+    stress_weight_power: float = 1.0,
     weight_decay: float = 1e-4,
     dataset_path: str = None,
     use_checkpoint: bool = False,
     checkpoint_fine_only: bool = False,
     use_node_emb: bool = True,
+    coarse_arch: str = "transformer",
     transformer_heads: int = 4,
     transformer_ff_mult: int = 2,
     transformer_dropout: float = 0.1,
+    checkpoint_dir: str = None,
+    run_dir: str = "training/runs/train",
 ):
     torch.manual_seed(42)
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
@@ -78,8 +90,9 @@ def train_gnn_model(
     # ----------------------------------------------------
     dataset_path = dataset_path or f"data/{geometry}/dataset/dataset.pt"
 
-    save_dir       = f"data/{geometry}/checkpoints/"
+    save_dir       = checkpoint_dir or f"data/{geometry}/checkpoints/"
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(run_dir, exist_ok=True)
 
     # ----------------------------------------------------
     # Device
@@ -234,10 +247,13 @@ def train_gnn_model(
     out_dim     = gnn_target_fn(example).shape[1]
 
     hierarchical = hasattr(train_set[0], 'tile_idx')
-    #ModelClass = HierarchicalGNN if hierarchical else GNN
-    ModelClass = HierarchicalGNN
+    assert coarse_arch in ("transformer", "gnn"), coarse_arch
+    if hierarchical:
+        ModelClass = HierarchicalGNN if coarse_arch == "transformer" else HierarchicalGNNMP
+    else:
+        ModelClass = GNN
     num_pos_nodes = num_pos_nodes if use_node_emb else 0
-    print(f"[model] use_node_emb={use_node_emb} num_pos_nodes={num_pos_nodes}")
+    print(f"[model] use_node_emb={use_node_emb} num_pos_nodes={num_pos_nodes} coarse_arch={coarse_arch if hierarchical else 'N/A'}")
     model_kwargs = dict(
         node_in_dim=node_in_dim,
         edge_in_dim=edge_in_dim,
@@ -248,9 +264,10 @@ def train_gnn_model(
     )
     if hierarchical:
         model_kwargs["checkpoint_fine_only"] = checkpoint_fine_only
-        model_kwargs["transformer_heads"] = transformer_heads
-        model_kwargs["transformer_ff_mult"] = transformer_ff_mult
-        model_kwargs["transformer_dropout"] = transformer_dropout
+        if coarse_arch == "transformer":
+            model_kwargs["transformer_heads"] = transformer_heads
+            model_kwargs["transformer_ff_mult"] = transformer_ff_mult
+            model_kwargs["transformer_dropout"] = transformer_dropout
     model = ModelClass(**model_kwargs).to(device)
     print(f"[model] use_checkpoint={use_checkpoint} "
           f"checkpoint_fine_only={checkpoint_fine_only if hierarchical else 'N/A'}")
@@ -278,7 +295,7 @@ def train_gnn_model(
         ckpt = torch.load(latest_ckpt, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state"])
 
-        losses_path = os.path.join(save_dir, "losses.json")
+        losses_path = os.path.join(run_dir, "losses.json")
         if os.path.exists(losses_path):
             with open(losses_path, "r") as f:
                 prev = json.load(f)
@@ -374,7 +391,7 @@ def train_gnn_model(
             # space, so convert it to graph-target-normalized space before comparing.
             graph_pred_target_norm = (graph_pred * node_target_std + node_target_mean - target_mean) / target_std
             graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
-            node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx)
+            node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx, stress_weight_power)
             loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
             if profile_this_epoch:
                 _sync(); t_now = time.perf_counter(); t_fwd += t_now - t_mark; t_mark = t_now
@@ -460,7 +477,7 @@ def train_gnn_model(
                 )
                 graph_pred_target_norm = (graph_pred * node_target_std + node_target_mean - target_mean) / target_std
                 graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
-                node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx)
+                node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx, stress_weight_power)
                 loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
 
                 total_val       += loss.item()
@@ -490,6 +507,7 @@ def train_gnn_model(
                 "out_dim": out_dim,
                 "hierarchical": hierarchical,
                 "num_pos_nodes": num_pos_nodes,
+                "coarse_arch": coarse_arch,
                 "transformer_heads": transformer_heads,
                 "transformer_ff_mult": transformer_ff_mult,
                 "target_mean": target_mean.detach().cpu(),
@@ -503,7 +521,7 @@ def train_gnn_model(
             }
             torch.save(ckpt, os.path.join(save_dir, f"{epoch}_epochs.pt"))
 
-            with open(os.path.join("training/runs/train", "losses.json"), "w") as f:
+            with open(os.path.join(run_dir, "losses.json"), "w") as f:
                 json.dump({
                     "train_losses": train_losses,
                     "val_losses": val_losses,
@@ -540,6 +558,11 @@ if __name__ == "__main__":
     parser.add_argument("--conv_layers", default=6, type=int)
     parser.add_argument("--node_loss_weight", default=1.0, type=float)
     parser.add_argument("--graph_loss_weight", default=1.0, type=float)
+    parser.add_argument("--stress_weight_power", default=1.0, type=float,
+                        help="Exponent applied to raw node stress before normalizing into "
+                             "per-node loss weights (alpha). 0=uniform weighting (plain MSE), "
+                             "1=weight proportional to stress (previous default), "
+                             ">1=high-stress nodes dominate more.")
     parser.add_argument("--weight_decay", default=1e-3, type=float)
     parser.add_argument("--dataset", default=None, type=str)
     def _bool(s):
@@ -556,12 +579,22 @@ if __name__ == "__main__":
     parser.add_argument("--use_node_emb", type=_bool, default=True,
                         help="Enable the per-node learned embedding table for fixed-topology "
                              "geometries. Pass false to ablate it (e.g. --use_node_emb false).")
+    parser.add_argument("--coarse_arch", default="transformer", choices=["transformer", "gnn"],
+                        help="Coarse-stage architecture for the hierarchical model: "
+                             "'transformer' = full self-attention over tile+global tokens "
+                             "(HierarchicalGNN), 'gnn' = multi-hop message passing over the "
+                             "6-connected tile grid (HierarchicalGNNMP, pre-transformer arch).")
     parser.add_argument("--transformer_heads", default=4, type=int,
                         help="Attention heads in the coarse tile transformer (HierarchicalGNN only).")
     parser.add_argument("--transformer_ff_mult", default=2, type=int,
                         help="Feedforward width multiplier in the coarse tile transformer.")
     parser.add_argument("--transformer_dropout", default=0.1, type=float,
                         help="Dropout in the coarse tile transformer (attention + FF).")
+    parser.add_argument("--checkpoint_dir", default=None, type=str,
+                        help="Override the checkpoint save/resume directory "
+                             "(default: data/{geometry}/checkpoints/).")
+    parser.add_argument("--run_dir", default="training/runs/train", type=str,
+                        help="Directory to write losses.json (and read it back on resume).")
     args = parser.parse_args()
 
     train_gnn_model(
@@ -574,12 +607,16 @@ if __name__ == "__main__":
         conv_layers=args.conv_layers,
         node_loss_weight=args.node_loss_weight,
         graph_loss_weight=args.graph_loss_weight,
+        stress_weight_power=args.stress_weight_power,
         weight_decay=args.weight_decay,
         dataset_path=args.dataset,
         use_node_emb=args.use_node_emb,
         use_checkpoint=args.use_checkpoint,
         checkpoint_fine_only=args.checkpoint_fine_only,
+        coarse_arch=args.coarse_arch,
         transformer_heads=args.transformer_heads,
         transformer_ff_mult=args.transformer_ff_mult,
         transformer_dropout=args.transformer_dropout,
+        checkpoint_dir=args.checkpoint_dir,
+        run_dir=args.run_dir,
     )

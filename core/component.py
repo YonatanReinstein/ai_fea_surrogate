@@ -31,7 +31,12 @@ class Component:
     def ansys_sim(self,  mapdl = None, screenshot_path: str = None):
         if self.mesh is None:
             raise ValueError("Mesh has not been generated yet.")
-        self.mesh.solve(self.young, self.poisson, mapdl = mapdl, screenshot_path=screenshot_path) 
+        self.mesh.solve(self.young, self.poisson, mapdl = mapdl, screenshot_path=screenshot_path)
+
+    def ccx_sim(self, ccx_path: str = "ccx", nproc: int = 1, work_dir: str = None):
+        if self.mesh is None:
+            raise ValueError("Mesh has not been generated yet.")
+        self.mesh.solve_ccx(self.young, self.poisson, ccx_path=ccx_path, nproc=nproc, work_dir=work_dir)
 
     def get_volume(self):
         return self.CAD_model.get_volume()

@@ -26,4 +26,5 @@ python -u -m training.gnn_training \
     --conv_layers 6 \
     --node_loss_weight 1.0 \
     --graph_loss_weight 0.0 \
+    --stress_weight_power 0.5 \
     > ${PBS_O_WORKDIR}/hc_train_${PBS_JOBID}.log 2>&1

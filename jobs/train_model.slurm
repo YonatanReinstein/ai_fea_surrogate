@@ -26,8 +26,8 @@ ulimit -n 65536
 
 python -u -m training.gnn_training \
     --geometry hollow_cube \
-    --dataset data/hollow_cube/dataset/dataset.pt \
-    --num_samples 1000 \
+    --dataset data/hollow_cube/dataset/dataset_200.pt \
+    --num_samples 100 \
     --epochs 500 \
     --lr 1e-3 \
     --batch_size 6 \
@@ -35,7 +35,9 @@ python -u -m training.gnn_training \
     --conv_layers 6 \
     --node_loss_weight 1.0 \
     --graph_loss_weight 0.0 \
-    --weight_decay 2e-4 \
+    --stress_weight_power 0.1 \
+    --weight_decay 1e-3 \
     --use_checkpoint false \
     --checkpoint_fine_only false \
     --use_node_emb false \
+    --coarse_arch gnn

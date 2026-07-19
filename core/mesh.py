@@ -147,6 +147,119 @@ class Mesh:
             raise e
             
 
+    def solve_ccx(self, young: float, poisson: float, ccx_path: str = "ccx",
+                  nproc: int = 1, work_dir: str = None, keep_files: bool = False):
+        """Linear static solve via CalculiX (ccx), as a free/open-source
+        alternative to solve()'s MAPDL path. Writes an Abaqus-style .inp deck,
+        runs ccx, and parses the .frd result file into the same node
+        displacement/stress attributes solve() populates, so
+        get_max_stress()/get_max_displacement() work unchanged.
+
+        The rigid-region force distribution MAPDL does with a MASS21 pilot
+        node + CERIG (solve()'s ET,2,21 / CERIG,...,UXYZ block) is
+        reproduced here with CalculiX's *RIGID BODY: a reference node
+        (translation) plus a rotational node give the force nodes a true
+        6-DOF rigid coupling (translate + rotate together), with the
+        resultant force applied at the reference node. A naive
+        *EQUATION tie of translational DOFs only (no rotation) was tried
+        first and measured ~4x too stiff against a closed-form cantilever
+        check, since it prevents the attached face from rotating at all.
+        """
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+        from utils.frd_parser import parse_frd
+
+        cleanup = False
+        if work_dir is None:
+            work_dir = tempfile.mkdtemp(prefix="ccx_")
+            cleanup = True
+        else:
+            os.makedirs(work_dir, exist_ok=True)
+
+        job_name = "job"
+        inp_path = os.path.join(work_dir, f"{job_name}.inp")
+
+        lines = ["*NODE"]
+        lines += [f"{n.id}, {n.coords[0]!r}, {n.coords[1]!r}, {n.coords[2]!r}"
+                  for n in self.all_nodes()]
+
+        lines.append("*ELEMENT, TYPE=C3D8, ELSET=EALL")
+        lines += [f"{e.id}, " + ", ".join(str(n.id) for n in e.nodes)
+                  for e in self.all_elements()]
+
+        lines += [
+            "*MATERIAL, NAME=MAT1",
+            "*ELASTIC",
+            f"{young!r}, {poisson!r}",
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT1",
+        ]
+
+        anchored = [n for n in self.all_nodes() if n.anchored]
+        if anchored:
+            lines.append("*BOUNDARY")
+            lines += [f"{n.id}, 1, 3" for n in anchored]
+
+        force_nodes = [n for n in self.all_nodes() if any(n.forces)]
+        pilot_id = None
+        total_force = (0.0, 0.0, 0.0)
+        if force_nodes:
+            total_force = (
+                sum(n.forces[0] for n in force_nodes),
+                sum(n.forces[1] for n in force_nodes),
+                sum(n.forces[2] for n in force_nodes),
+            )
+            cx = sum(n.coords[0] for n in force_nodes) / len(force_nodes)
+            cy = sum(n.coords[1] for n in force_nodes) / len(force_nodes)
+            cz = sum(n.coords[2] for n in force_nodes) / len(force_nodes)
+            pilot_id = max(self.nodes.keys()) + 1
+            rot_id = pilot_id + 1
+
+            lines += [
+                "*NODE",
+                f"{pilot_id}, {cx!r}, {cy!r}, {cz!r}",
+                f"{rot_id}, {cx!r}, {cy!r}, {cz!r}",
+                "*NSET, NSET=FORCESET",
+                ", ".join(str(n.id) for n in force_nodes),
+                f"*RIGID BODY, NSET=FORCESET, REF NODE={pilot_id}, ROT NODE={rot_id}",
+            ]
+
+        lines += ["*STEP", "*STATIC"]
+        if pilot_id is not None:
+            lines.append("*CLOAD")
+            for dof, val in zip((1, 2, 3), total_force):
+                if val != 0.0:
+                    lines.append(f"{pilot_id}, {dof}, {val!r}")
+        lines += ["*NODE FILE", "U", "*EL FILE", "S", "*END STEP"]
+
+        with open(inp_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = str(nproc)
+        result = subprocess.run(
+            [ccx_path, "-i", job_name],
+            cwd=work_dir, env=env, capture_output=True, text=True, timeout=1200,
+        )
+
+        frd_path = os.path.join(work_dir, f"{job_name}.frd")
+        if result.returncode != 0 or not os.path.isfile(frd_path):
+            tail = (result.stdout or "")[-4000:] + "\n" + (result.stderr or "")[-2000:]
+            if cleanup:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            raise RuntimeError(f"CalculiX run failed (rc={result.returncode}):\n{tail}")
+
+        displacement, stress = parse_frd(frd_path)
+
+        for node_id, node in self.nodes.items():
+            node.displacement = displacement.get(node_id, [0.0, 0.0, 0.0])
+            node.stress = stress.get(node_id, 0.0)
+        self.solution_valid = True
+
+        if cleanup and not keep_files:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
     def anchor_node(self, node_id: int):
         node = self.get_node(node_id)
         node.anchored = True

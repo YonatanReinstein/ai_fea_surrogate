@@ -4,6 +4,7 @@ import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
 from abc import ABC
 from utils.gnn_surrogate import GNN, HierarchicalGNN
+from utils.gnn_hierarchical_mp import HierarchicalGNNMP
 from evaluators.base_evaluator import BaseEvaluator
 from core.IritModel import IritCModel
 from core.component import Component
@@ -154,7 +155,11 @@ class GNNEvaluator(BaseEvaluator):
         num_pos_nodes = ckpt.get("num_pos_nodes", 0)
 
         hierarchical = ckpt.get("hierarchical", False)
-        ModelClass = HierarchicalGNN if hierarchical else GNN
+        coarse_arch = ckpt.get("coarse_arch", "transformer")
+        if hierarchical:
+            ModelClass = HierarchicalGNN if coarse_arch == "transformer" else HierarchicalGNNMP
+        else:
+            ModelClass = GNN
         model_kwargs = dict(
             node_in_dim=self.node_in_dim,
             edge_in_dim=self.edge_in_dim,
@@ -163,8 +168,9 @@ class GNNEvaluator(BaseEvaluator):
         )
         if hierarchical:
             model_kwargs["num_pos_nodes"] = num_pos_nodes
-            model_kwargs["transformer_heads"] = ckpt["transformer_heads"]
-            model_kwargs["transformer_ff_mult"] = ckpt["transformer_ff_mult"]
+            if coarse_arch == "transformer":
+                model_kwargs["transformer_heads"] = ckpt["transformer_heads"]
+                model_kwargs["transformer_ff_mult"] = ckpt["transformer_ff_mult"]
         self.model = ModelClass(**model_kwargs).to(self.device)
 
         self.model.load_state_dict(ckpt["model_state"])
