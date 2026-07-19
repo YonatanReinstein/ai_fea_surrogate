@@ -185,7 +185,11 @@ class Mesh:
         lines += [f"{n.id}, {n.coords[0]!r}, {n.coords[1]!r}, {n.coords[2]!r}"
                   for n in self.all_nodes()]
 
-        lines.append("*ELEMENT, TYPE=C3D8, ELSET=EALL")
+        # C3D8I (incompatible modes), not plain C3D8: measured against MAPDL's
+        # SOLID185 (full integration + incompatible modes, ANSYS's default) on
+        # hollow_cube, plain C3D8 under-predicted max stress by 6-9% and max
+        # displacement by ~4% from shear locking. C3D8I closes stress to ~1-2%.
+        lines.append("*ELEMENT, TYPE=C3D8I, ELSET=EALL")
         lines += [f"{e.id}, " + ", ".join(str(n.id) for n in e.nodes)
                   for e in self.all_elements()]
 
