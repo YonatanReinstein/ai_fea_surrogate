@@ -59,10 +59,8 @@ static IrtRType GMMergeComputePointsDistSqr(int Dim,
 					    GMMergeSimilarPointsStruct *PE2);
 #if defined(ultrix) && defined(mips)
 static int GMMergeCompareEntities(void *GE1, void *GE2);
-static int GMMergeComparePointEntities(void *PE1, void *PE2);
 #else
 static int GMMergeCompareEntities(const void *GE1, const void *GE2);
-static int GMMergeComparePointEntities(const void *PE1, const void *PE2);
 #endif /* ultrix && mips (no const support) */
 
 /*****************************************************************************
@@ -831,30 +829,6 @@ IritPrsrPolygonStruct *IritGeomMergeClosedLoopHoles(
 
 /*****************************************************************************
 * DESCRIPTION:								     *
-*   Routine to compare two similar point entities' for sorting purposes,     *
-* based on the X axis.							     *
-*									     *
-* PARAMETERS:								     *
-*   PE1, PE2:  Two pointers to GMMergeSimilarPointsStruct structs.	     *
-*									     *
-* RETURN VALUE:								     *
-*   int:   >0, 0, or <0	as the relation	between	the two	distances.	     *
-*****************************************************************************/
-#if defined(ultrix) && defined(mips)
-static int GMMergeComparePointEntities(void *PE1, void *PE2)
-#else
-static int GMMergeComparePointEntities(const void *PE1, const void *PE2)
-#endif /* ultrix && mips (no const support) */
-{
-    IrtRType
-        Diff = (*((GMMergeSimilarPointsStruct **) PE1)) -> Pt[0] -
-	       (*((GMMergeSimilarPointsStruct **) PE2)) -> Pt[0];
-
-    return IRIT_SIGN(Diff);
-}
-
-/*****************************************************************************
-* DESCRIPTION:								     *
 *   Routine to compute the distance square between two point entities.	     *
 *									     *
 * PARAMETERS:								     *
@@ -901,15 +875,30 @@ static IrtRType GMMergeComputePointsDistSqr(int Dim,
 * KEYWORDS:								     M
 *   IritGeomMergeFindSimilarPoints, merge				     M
 *****************************************************************************/
+static unsigned int GMMergeHashCell(const int *Cell, int Dim)
+{
+    unsigned int
+        h = 2166136261u;
+    int d;
+
+    for (d = 0; d < Dim; d++) {
+        h ^= (unsigned int) Cell[d];
+        h *= 16777619u;
+    }
+
+    return h;
+}
+
 int *IritGeomMergeFindSimilarPoints(IrtRType *VecPts,
 				    int	PtLen,
 				    int	VecLen,
 				    IrtRType Tolerance)
 {
-    int i, j, k, *RetVecIdx;
+    int i, j, *RetVecIdx, *BucketHead, *NextInBucket,
+        HashSize = 16;
     IrtRType *R,
 	TolSqr = IRIT_SQR(Tolerance);
-    GMMergeSimilarPointsStruct *VecPtsData, **VecPtsRefs;
+    GMMergeSimilarPointsStruct *VecPtsData;
 
 #ifdef IRIT_DEBUG_GM_PTS
     fprintf(stderr, "Before point merge:\n");
@@ -922,90 +911,114 @@ int *IritGeomMergeFindSimilarPoints(IrtRType *VecPts,
     }
 #endif /* IRIT_DEBUG_GM_PTS */
 
-    /* Constructs a reference vector with pointers to the points & indices. */
     VecPtsData = (GMMergeSimilarPointsStruct *)
                       IritMalloc(sizeof(GMMergeSimilarPointsStruct) * VecLen);
-    VecPtsRefs = (GMMergeSimilarPointsStruct **)
-                    IritMalloc(sizeof(GMMergeSimilarPointsStruct *) * VecLen);
     RetVecIdx = (int *) IritMalloc(sizeof(int) * VecLen);
 
     for (i = 0, R = VecPts; i < VecLen; i++, R += PtLen) {
         VecPtsData[i].Idx = i;
         VecPtsData[i].Pt = R;
 
-	VecPtsRefs[i] = &VecPtsData[i];
-
 	RetVecIdx[i] = -1;
     }
 
-    /* Sort based on the X axis. */
-    qsort(VecPtsRefs, VecLen, sizeof(GMMergeSimilarPointsStruct *),
-	  GMMergeComparePointEntities);
+    /* Points are bucketed into a uniform spatial hash grid, with cells    */
+    /* sized to the merge tolerance.  This keeps the expected bucket       */
+    /* occupancy O(1) even when many points share an axis value (e.g. on  */
+    /* the shared, axis aligned faces of a tiled/lattice structure), which */
+    /* is exactly the case that made the old X-sorted sweep degrade to    */
+    /* O(n^2). */
+    if (VecLen > 0 && Tolerance > 0.0) {
+        IrtRType
+	    InvTol = 1.0 / Tolerance;
+        int NumNeighbors = 1;
 
-#ifdef IRIT_DEBUG_GM_PTS
-    fprintf(stderr, "After sort point:\n");
-    for (i = 0; i < VecLen; i++) {
-	GMMergeSimilarPointsStruct
-	    *Ref = VecPtsRefs[i];
+        while (HashSize < VecLen * 2)
+	    HashSize <<= 1;
 
-	R = Ref -> Pt;
-	fprintf(stderr, "Pt %d = %f  %f  %f (Idx = %d)\n",
-		i, R[0], R[1], R[2], Ref -> Idx);
-    }
-#endif /* IRIT_DEBUG_GM_PTS */
+        BucketHead = (int *) IritMalloc(sizeof(int) * HashSize);
+        NextInBucket = (int *) IritMalloc(sizeof(int) * VecLen);
+        for (i = 0; i < HashSize; i++)
+	    BucketHead[i] = -1;
 
-    /* Now go over all entries and update them. */
-    for (i = 0; i < VecLen; i++) {
-	for (j = i + 1;				      /* Do not check self. */
-	     j < VecLen &&
-	     VecPtsRefs[j] -> Pt[0] -
-	         VecPtsRefs[i] -> Pt[0] < Tolerance * 10; )
-	    j++;
+        for (i = 0; i < PtLen; i++)
+	    NumNeighbors *= 3;
 
-	/* Process all entries between i and j-1 with similar X value. */
-	if (j > i + 1) {
-	    int i0;
+        for (i = 0; i < VecLen; i++) {
+	    int Cell[PtLen], d;
 
-	    while (TRUE) {
-		int MinIdx,
-		    NumIndenticalPts = 1;
+	    for (d = 0; d < PtLen; d++)
+	        Cell[d] = (int) floor(VecPtsData[i].Pt[d] * InvTol);
 
-	        /* Find a first non processed item between i and j-1. */
-	        for (i0 = i; i0 < j; i0++) {
-		    if (RetVecIdx[i0] == -1)	      /* Not processed yet. */
-		        break;
+	    j = (int) (GMMergeHashCell(Cell, PtLen) & (unsigned int) (HashSize - 1));
+	    NextInBucket[i] = BucketHead[j];
+	    BucketHead[j] = i;
+	}
+
+        for (i = 0; i < VecLen; i++) {
+	    int BaseCell[PtLen],
+	        NeighborCell[PtLen],
+	        MinIdx, NumIdenticalPts, n, d;
+
+	    if (RetVecIdx[i] != -1)
+	        continue;			      /* Already merged in. */
+
+	    RetVecIdx[i] = i;
+	    MinIdx = VecPtsData[i].Idx;
+	    NumIdenticalPts = 1;
+
+	    for (d = 0; d < PtLen; d++)
+	        BaseCell[d] = (int) floor(VecPtsData[i].Pt[d] * InvTol);
+
+	    for (n = 0; n < NumNeighbors; n++) {
+	        int t = n, k;
+
+	        for (d = 0; d < PtLen; d++) {
+		    NeighborCell[d] = BaseCell[d] + (t % 3) - 1;
+		    t /= 3;
 		}
-		if (i0 >= j) { /* Done with this block of similar X points. */
-		    i = j - 1;
-		    break;
-		}
-		RetVecIdx[i0] = i0;
-		MinIdx = VecPtsRefs[i0] -> Idx;
 
-		/* First find minimal index in this set of similar points. */
-		for (k = i0 + 1; k < j; k++) {
-		    if (GMMergeComputePointsDistSqr(PtLen, VecPtsRefs[i0],
-					            VecPtsRefs[k]) < TolSqr) {
-		        MinIdx = IRIT_MIN(MinIdx, VecPtsRefs[k] -> Idx);
-			RetVecIdx[k] = i0;
-			NumIndenticalPts++;
+	        j = (int) (GMMergeHashCell(NeighborCell, PtLen) &
+			   (unsigned int) (HashSize - 1));
+
+	        for (k = BucketHead[j]; k != -1; k = NextInBucket[k]) {
+		    if (k == i || RetVecIdx[k] != -1)
+		        continue;
+
+		    if (GMMergeComputePointsDistSqr(PtLen, &VecPtsData[i],
+						     &VecPtsData[k]) < TolSqr) {
+		        RetVecIdx[k] = i;
+		        if (VecPtsData[k].Idx < MinIdx)
+			    MinIdx = VecPtsData[k].Idx;
+		        NumIdenticalPts++;
 		    }
 		}
+	    }
 
-		/* Now mark the set of similar points with minimum index. */
-		if (NumIndenticalPts > 1) {
-		    for (k = i; k < j; k++) {
-		    /* Check for same idx but also for same location. */
-		        if (RetVecIdx[k] == i0 &&
-			    GMMergeComputePointsDistSqr(PtLen, VecPtsRefs[i0],
-							VecPtsRefs[k]) <
-								     TolSqr) {
-			    VecPtsRefs[k] -> Idx = RetVecIdx[k] = MinIdx;
-			}
+	    if (NumIdenticalPts > 1) {
+	        VecPtsData[i].Idx = MinIdx;
+
+	        for (n = 0; n < NumNeighbors; n++) {
+		    int t = n, k;
+
+		    for (d = 0; d < PtLen; d++) {
+		        NeighborCell[d] = BaseCell[d] + (t % 3) - 1;
+			t /= 3;
+		    }
+
+		    j = (int) (GMMergeHashCell(NeighborCell, PtLen) &
+			       (unsigned int) (HashSize - 1));
+
+		    for (k = BucketHead[j]; k != -1; k = NextInBucket[k]) {
+		        if (k != i && RetVecIdx[k] == i)
+			    VecPtsData[k].Idx = MinIdx;
 		    }
 		}
 	    }
 	}
+
+        IritFree(BucketHead);
+        IritFree(NextInBucket);
     }
 
     /* Copy the indices. */
@@ -1061,8 +1074,8 @@ int *IritGeomMergeFindSimilarPoints(IrtRType *VecPts,
 #endif /* DEBUG */
 
     IritFree(VecPtsData);
-    IritFree(VecPtsRefs);
 
     return RetVecIdx;
 }
+
 
