@@ -171,6 +171,8 @@ class GNNEvaluator(BaseEvaluator):
             if coarse_arch == "transformer":
                 model_kwargs["transformer_heads"] = ckpt["transformer_heads"]
                 model_kwargs["transformer_ff_mult"] = ckpt["transformer_ff_mult"]
+            else:
+                model_kwargs["coarse_dim"] = ckpt.get("coarse_dim")
         self.model = ModelClass(**model_kwargs).to(self.device)
 
         self.model.load_state_dict(ckpt["model_state"])

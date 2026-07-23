@@ -8,6 +8,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.utils import scatter
 from utils.gnn_surrogate import GNN, HierarchicalGNN
 from utils.gnn_hierarchical_mp import HierarchicalGNNMP
+from training.dataset_io import load_dataset
 
 
 # ======================================================
@@ -18,6 +19,13 @@ def gnn_input_fn(data):
     tile_NX   = getattr(data, 'tile_NX',   None)
     tile_NY   = getattr(data, 'tile_NY',   None)
     tile_NZ   = getattr(data, 'tile_NZ',   None)
+    # Fixed-topology: NX/NY/NZ are identical for every sample of a geometry,
+    # so pull them out to plain Python ints here (once, on CPU) instead of
+    # passing GPU tensors into model.forward() -- int(tensor[0]) inside the
+    # (compiled) forward is a torch.compile graph break / recompile source.
+    tile_NX = int(tile_NX[0]) if tile_NX is not None else None
+    tile_NY = int(tile_NY[0]) if tile_NY is not None else None
+    tile_NZ = int(tile_NZ[0]) if tile_NZ is not None else None
     tile_x    = getattr(data, 'tile_x',    None)
     node_id   = getattr(data, 'node_id',   None)  # stable per-node index
     return (data.x, data.edge_index, data.edge_attr, data.batch,
@@ -25,8 +33,11 @@ def gnn_input_fn(data):
 
 
 def gnn_target_fn(data):
-    # returns [batch_size, 1] tensor (graph-level)
-    return torch.cat([data.max_stress], dim=-1)
+    # returns [batch_size, 1] tensor (graph-level). KS-aggregated stress
+    # (core/mesh.py:get_aggregated_stress), not the hard max -- see
+    # utils/gnn_surrogate.py:ks_pool for why the model's graph_pred matches
+    # this instead of a plain global_max_pool.
+    return torch.cat([data.ks_stress], dim=-1)
 
 
 def gnn_node_target_fn(data):
@@ -79,8 +90,12 @@ def train_gnn_model(
     transformer_heads: int = 4,
     transformer_ff_mult: int = 2,
     transformer_dropout: float = 0.1,
+    mp_dropout: float = 0.0,
+    coarse_dim: int = None,
     checkpoint_dir: str = None,
     run_dir: str = "training/runs/train",
+    stress_ks_rho_mpa: float = 0.15,
+    use_compile: bool = True,
 ):
     torch.manual_seed(42)
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
@@ -98,7 +113,9 @@ def train_gnn_model(
     # Device
     # ----------------------------------------------------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = torch.cuda.is_available()
     print(f"Using device: {device}")
+    print(f"[amp] bf16 autocast enabled={use_amp}")
     print(f"[gpu] torch={torch.__version__} cuda_available={torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"[gpu] device_name={torch.cuda.get_device_name(0)}")
@@ -110,7 +127,7 @@ def train_gnn_model(
     # Load dataset
     # ----------------------------------------------------
     # If you want to use dataset_a + dataset_b instead:
-    dataset = torch.load(dataset_path, weights_only=False)
+    dataset = load_dataset(dataset_path)
 
     # Where the per-tile strut thicknesses start in the dims vector depends on
     # how the geometry encodes its grid topology:
@@ -127,6 +144,8 @@ def train_gnn_model(
         sample.x[:, 3:6] = sample.x[:, 3:6] / 1e+6
         #convert max_stress to MPa
         sample.max_stress = sample.max_stress / 1e+6
+        #convert ks_stress to MPa
+        sample.ks_stress = sample.ks_stress / 1e+6
         #convert node_stress to MPa
         sample.node_stress = sample.node_stress / 1e+6
         # inject per-node strut dimension: dims[strut_offset + tile_idx]
@@ -174,8 +193,8 @@ def train_gnn_model(
     all_graph_targets_full = torch.cat([gnn_target_fn(d) for d in dataset], dim=0).float()
     graph_target_mean_full = all_graph_targets_full.mean()
     graph_target_std_full  = all_graph_targets_full.std() + 1e-8
-    print(f"Dataset max_stress mean: {graph_target_mean_full.item():.4f} MPa")
-    print(f"Dataset max_stress std:  {graph_target_std_full.item():.4f} MPa")
+    print(f"Dataset ks_stress mean: {graph_target_mean_full.item():.4f} MPa")
+    print(f"Dataset ks_stress std:  {graph_target_std_full.item():.4f} MPa")
 
     total_samples = len(dataset)
     if num_samples is None or num_samples > total_samples:
@@ -261,6 +280,9 @@ def train_gnn_model(
         num_layers=conv_layers,
         use_checkpoint=use_checkpoint,
         num_pos_nodes=num_pos_nodes,
+        node_target_mean=node_target_mean,
+        node_target_std=node_target_std,
+        stress_ks_rho_mpa=stress_ks_rho_mpa,
     )
     if hierarchical:
         model_kwargs["checkpoint_fine_only"] = checkpoint_fine_only
@@ -268,11 +290,30 @@ def train_gnn_model(
             model_kwargs["transformer_heads"] = transformer_heads
             model_kwargs["transformer_ff_mult"] = transformer_ff_mult
             model_kwargs["transformer_dropout"] = transformer_dropout
-    model = ModelClass(**model_kwargs).to(device)
+        else:
+            model_kwargs["dropout"] = mp_dropout
+            model_kwargs["coarse_dim"] = coarse_dim
+    raw_model = ModelClass(**model_kwargs).to(device)
+    if hierarchical:
+        # Fixed-topology: the tile grid never changes during a training run,
+        # so precompute it once here rather than lazily inside forward().
+        raw_model.set_tile_grid(
+            int(example.tile_NX), int(example.tile_NY), int(example.tile_NZ)
+        )
     print(f"[model] use_checkpoint={use_checkpoint} "
           f"checkpoint_fine_only={checkpoint_fine_only if hierarchical else 'N/A'}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # torch.compile: fuses the many small gather/cat/elementwise ops around
+    # each EdgeAttrConv into fewer kernels. Compiled through `model` (used for
+    # the forward calls below); checkpoint/resume always save and load via
+    # raw_model.state_dict(), since OptimizedModule.state_dict() prefixes keys
+    # with "_orig_mod." and would otherwise break gnn_evaluator.py / resume,
+    # which load into a plain (uncompiled) module.
+    compiled = use_compile and torch.cuda.is_available()
+    model = torch.compile(raw_model) if compiled else raw_model
+    print(f"[compile] torch.compile enabled={compiled}")
+
+    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn   = torch.nn.MSELoss()
 
     train_losses = []
@@ -293,7 +334,7 @@ def train_gnn_model(
         start_epoch, latest_ckpt = max(parsed, key=lambda t: t[0])
         print(f"Resuming from checkpoint: {latest_ckpt} (epoch {start_epoch})")
         ckpt = torch.load(latest_ckpt, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state"])
+        raw_model.load_state_dict(ckpt["model_state"])
 
         losses_path = os.path.join(run_dir, "losses.json")
         if os.path.exists(losses_path):
@@ -305,6 +346,37 @@ def train_gnn_model(
             val_graph_losses   = prev.get("val_graph_losses", [])[:start_epoch]
             train_node_losses  = prev.get("train_node_losses", [])[:start_epoch]
             val_node_losses    = prev.get("val_node_losses", [])[:start_epoch]
+
+    # Best-checkpoint tracking (by val ks_stress/graph loss) -- recovered from
+    # the resumed loss history so a resumed run doesn't reset "best" and
+    # clobber gnn_surrogate.pt with a worse checkpoint before catching back up.
+    best_val_graph_loss = min(val_graph_losses) if val_graph_losses else float("inf")
+    surrogate_path = f"data/{geometry}/gnn_surrogate.pt"
+
+    def _build_ckpt():
+        return {
+            "model_state": raw_model.state_dict(),
+            "node_in_dim": node_in_dim,
+            "edge_in_dim": edge_in_dim,
+            "hidden_dim": hidden_dim,
+            "coarse_dim": raw_model.coarse_dim if hierarchical and coarse_arch == "gnn" else None,
+            "conv_layers": conv_layers,
+            "out_dim": out_dim,
+            "hierarchical": hierarchical,
+            "num_pos_nodes": num_pos_nodes,
+            "coarse_arch": coarse_arch,
+            "transformer_heads": transformer_heads,
+            "transformer_ff_mult": transformer_ff_mult,
+            "stress_ks_rho_mpa": stress_ks_rho_mpa,
+            "target_mean": target_mean.detach().cpu(),
+            "target_std": target_std.detach().cpu(),
+            "node_target_mean": node_target_mean.detach().cpu(),
+            "node_target_std": node_target_std.detach().cpu(),
+            "x_mean": x_mean.detach().cpu(),
+            "x_std": x_std.detach().cpu(),
+            "edge_mean": edge_mean.detach().cpu(),
+            "edge_std": edge_std.detach().cpu(),
+        }
 
     if start_epoch > 0:
         for pg in optimizer.param_groups:
@@ -363,9 +435,7 @@ def train_gnn_model(
             batch_idx  = batch_idx.to(device, non_blocking=True)
             if tile_idx is not None:
                 tile_idx = tile_idx.to(device, non_blocking=True)
-                tile_NX  = tile_NX.to(device,  non_blocking=True)
-                tile_NY  = tile_NY.to(device,  non_blocking=True)
-                tile_NZ  = tile_NZ.to(device,  non_blocking=True)
+                # tile_NX/NY/NZ are already plain Python ints (see gnn_input_fn)
             if tile_x is not None:
                 tile_x = tile_x.float().to(device, non_blocking=True)
             if node_id is not None:
@@ -382,17 +452,18 @@ def train_gnn_model(
             if profile_this_epoch:
                 _sync(); t_now = time.perf_counter(); t_h2d += t_now - t_mark; t_mark = t_now
 
-            graph_pred, node_pred = model(
-                x_norm, edge_index, edge_attr_norm, batch_idx,
-                tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
-                tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
-            )
-            # graph_pred = global_max_pool(node_pred, batch) lives in node-normalized
-            # space, so convert it to graph-target-normalized space before comparing.
-            graph_pred_target_norm = (graph_pred * node_target_std + node_target_mean - target_mean) / target_std
-            graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
-            node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx, stress_weight_power)
-            loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                graph_pred, node_pred = model(
+                    x_norm, edge_index, edge_attr_norm, batch_idx,
+                    tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
+                    tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
+                )
+                # graph_pred = global_max_pool(node_pred, batch) lives in node-normalized
+                # space, so convert it to graph-target-normalized space before comparing.
+                graph_pred_target_norm = (graph_pred * node_target_std + node_target_mean - target_mean) / target_std
+                graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
+                node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx, stress_weight_power)
+                loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
             if profile_this_epoch:
                 _sync(); t_now = time.perf_counter(); t_fwd += t_now - t_mark; t_mark = t_now
 
@@ -453,9 +524,7 @@ def train_gnn_model(
                 batch_idx  = batch_idx.to(device, non_blocking=True)
                 if tile_idx is not None:
                     tile_idx = tile_idx.to(device, non_blocking=True)
-                    tile_NX  = tile_NX.to(device,  non_blocking=True)
-                    tile_NY  = tile_NY.to(device,  non_blocking=True)
-                    tile_NZ  = tile_NZ.to(device,  non_blocking=True)
+                    # tile_NX/NY/NZ are already plain Python ints (see gnn_input_fn)
                 if tile_x is not None:
                     tile_x = tile_x.float().to(device, non_blocking=True)
                 if node_id is not None:
@@ -470,15 +539,16 @@ def train_gnn_model(
                 node_targ = gnn_node_target_fn(batch_data).float().to(device, non_blocking=True)
                 node_targ_norm = (node_targ - node_target_mean) / node_target_std
 
-                graph_pred, node_pred = model(
-                    x_norm, edge_index, edge_attr_norm, batch_idx,
-                    tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
-                    tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
-                )
-                graph_pred_target_norm = (graph_pred * node_target_std + node_target_mean - target_mean) / target_std
-                graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
-                node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx, stress_weight_power)
-                loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    graph_pred, node_pred = model(
+                        x_norm, edge_index, edge_attr_norm, batch_idx,
+                        tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
+                        tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
+                    )
+                    graph_pred_target_norm = (graph_pred * node_target_std + node_target_mean - target_mean) / target_std
+                    graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
+                    node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx, stress_weight_power)
+                    loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
 
                 total_val       += loss.item()
                 total_val_graph += graph_loss.item()
@@ -495,30 +565,27 @@ def train_gnn_model(
         scheduler.step()
 
         # -----------------------------
+        # Best-checkpoint tracking: whenever val ks_stress/graph loss improves,
+        # save straight to data/{geometry}/gnn_surrogate.pt -- the exact path
+        # evaluators/gnn_evaluator.py loads -- so "the surrogate" always is
+        # the best-val checkpoint, independent of the every-10-epoch cadence
+        # below (best epoch isn't necessarily a multiple of 10).
+        # -----------------------------
+        if avg_val_graph < best_val_graph_loss:
+            best_val_graph_loss = avg_val_graph
+            best_val_graph_rmse_mpa = best_val_graph_loss ** 0.5 * graph_target_std_full.item()
+            best_ckpt = _build_ckpt()
+            best_ckpt["best_epoch"] = epoch
+            best_ckpt["best_val_graph_loss"] = best_val_graph_loss
+            torch.save(best_ckpt, surrogate_path)
+            print(f"[best] new best val ks loss {best_val_graph_loss:.6f} "
+                  f"[{best_val_graph_rmse_mpa:.4f} MPa] at epoch {epoch} -> {surrogate_path}")
+
+        # -----------------------------
         # Save checkpoint every 10 epochs
         # -----------------------------
         if epoch % 10 == 0 or epoch == epochs:
-            ckpt = {
-                "model_state": model.state_dict(),
-                "node_in_dim": node_in_dim,
-                "edge_in_dim": edge_in_dim,
-                "hidden_dim": hidden_dim,
-                "conv_layers": conv_layers,
-                "out_dim": out_dim,
-                "hierarchical": hierarchical,
-                "num_pos_nodes": num_pos_nodes,
-                "coarse_arch": coarse_arch,
-                "transformer_heads": transformer_heads,
-                "transformer_ff_mult": transformer_ff_mult,
-                "target_mean": target_mean.detach().cpu(),
-                "target_std": target_std.detach().cpu(),
-                "node_target_mean": node_target_mean.detach().cpu(),
-                "node_target_std": node_target_std.detach().cpu(),
-                "x_mean": x_mean.detach().cpu(),
-                "x_std": x_std.detach().cpu(),
-                "edge_mean": edge_mean.detach().cpu(),
-                "edge_std": edge_std.detach().cpu(),
-            }
+            ckpt = _build_ckpt()
             torch.save(ckpt, os.path.join(save_dir, f"{epoch}_epochs.pt"))
 
             with open(os.path.join(run_dir, "losses.json"), "w") as f:
@@ -590,11 +657,29 @@ if __name__ == "__main__":
                         help="Feedforward width multiplier in the coarse tile transformer.")
     parser.add_argument("--transformer_dropout", default=0.1, type=float,
                         help="Dropout in the coarse tile transformer (attention + FF).")
+    parser.add_argument("--mp_dropout", default=0.0, type=float,
+                        help="Dropout applied after encoder, each message-passing conv "
+                             "(before the residual add), and in the head MLP "
+                             "(HierarchicalGNNMP / --coarse_arch gnn only).")
+    parser.add_argument("--coarse_dim", default=None, type=int,
+                        help="Width of the tile/global virtual-node embeddings "
+                             "(HierarchicalGNNMP / --coarse_arch gnn only). Decoupled from "
+                             "--hidden_dim so sweeping hidden_dim doesn't shrink coarse-scale "
+                             "capacity; projected to hidden_dim at the fine/coarse boundary. "
+                             "Defaults to --hidden_dim when unset.")
     parser.add_argument("--checkpoint_dir", default=None, type=str,
                         help="Override the checkpoint save/resume directory "
                              "(default: data/{geometry}/checkpoints/).")
     parser.add_argument("--run_dir", default="training/runs/train", type=str,
                         help="Directory to write losses.json (and read it back on resume).")
+    parser.add_argument("--stress_ks_rho_mpa", default=0.15, type=float,
+                        help="KS aggregation sharpness (1/MPa) for the graph target/prediction. "
+                             "Must match the rho the dataset's ks_stress was built with "
+                             "(see training/dataset_builder.py --stress_ks_rho_mpa).")
+    parser.add_argument("--use_compile", type=_bool, default=True,
+                        help="Wrap the model in torch.compile (fuses the gather/cat/elementwise "
+                             "ops around each EdgeAttrConv). No-op on CPU. Pass false to disable "
+                             "if compilation fails or is slower for a given config.")
     args = parser.parse_args()
 
     train_gnn_model(
@@ -617,6 +702,10 @@ if __name__ == "__main__":
         transformer_heads=args.transformer_heads,
         transformer_ff_mult=args.transformer_ff_mult,
         transformer_dropout=args.transformer_dropout,
+        mp_dropout=args.mp_dropout,
+        coarse_dim=args.coarse_dim,
         checkpoint_dir=args.checkpoint_dir,
         run_dir=args.run_dir,
+        stress_ks_rho_mpa=args.stress_ks_rho_mpa,
+        use_compile=args.use_compile,
     )
