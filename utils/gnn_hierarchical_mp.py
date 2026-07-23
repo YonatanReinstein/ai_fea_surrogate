@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.nn.models import MLP
 
-from utils.gnn_surrogate import EdgeAttrConv, ks_pool
+from utils.gnn_surrogate import EdgeAttrConv, BipartiteEdgeAttrConv, ks_pool
 
 
 class HierarchicalGNNMP(nn.Module):
@@ -16,6 +16,13 @@ class HierarchicalGNNMP(nn.Module):
     Coarse stage is plain message passing over the tile grid (as opposed to
     the full-attention coarse transformer in HierarchicalGNN) — kept as the
     pre-transformer architecture for comparison.
+
+    Fine (real-node) and coarse (tile/global) message passing run at their
+    own widths -- hidden_dim and coarse_dim respectively -- rather than
+    sharing one residual stream. Two bipartite convs (encode: real->tile,
+    decode: tile->real) are the only bridge between the two, each doing its
+    own dimension projection internally; nothing else is ever downcast to
+    hidden_dim or upcast to coarse_dim.
     """
 
     def __init__(self, node_in_dim, edge_in_dim=1, hidden_dim=128, num_layers=6, tile_in_dim=1,
@@ -23,17 +30,17 @@ class HierarchicalGNNMP(nn.Module):
                  num_pos_nodes=0, dropout=0.0, node_target_mean=0.0, node_target_std=1.0,
                  stress_ks_rho_mpa=0.15, coarse_dim=None):
         super().__init__()
-        # coarse_dim decouples the tile/global virtual-node embedding width from
+        # coarse_dim decouples the tile/global message-passing width from
         # hidden_dim (the fine real-node width), so sweeping hidden_dim down for
         # speed doesn't also shrink coarse-scale capacity. Defaults to hidden_dim
-        # (old behaviour) when unset. Fine<->coarse boundaries stay hidden_dim
-        # wide (that's what the shared, residual-connected EdgeAttrConv layers
-        # operate on) via a projection right after the tile/global embeddings.
+        # (old behaviour) when unset.
         self.coarse_dim = coarse_dim = coarse_dim if coarse_dim is not None else hidden_dim
+        assert num_layers >= 2, "HierarchicalGNNMP needs at least 2 conv layers (encode + decode pass)"
         self.use_checkpoint = use_checkpoint
-        # When True, only the encode/decode (fine-mesh) layers are checkpointed.
-        # The coarse middle layers run without checkpoint because their
-        # activations are tiny anyway. Requires use_checkpoint=True to have effect.
+        # When True, only the fine-mesh layers (fine_convs + encode_conv/decode_conv)
+        # are checkpointed. The coarse middle layers run without checkpoint because
+        # their activations are tiny anyway (few tile/global nodes). Requires
+        # use_checkpoint=True to have effect.
         self.checkpoint_fine_only = checkpoint_fine_only
         self.stress_ks_rho_mpa = stress_ks_rho_mpa
         self.register_buffer("node_target_mean", torch.as_tensor(node_target_mean, dtype=torch.float), persistent=False)
@@ -48,25 +55,36 @@ class HierarchicalGNNMP(nn.Module):
             nn.init.normal_(self.node_emb.weight, std=0.02)
 
         self.encoder = MLP([node_in_dim, hidden_dim, hidden_dim], norm=None, dropout=dropout)
-        self.convs = nn.ModuleList(
-            [EdgeAttrConv(hidden_dim, edge_in_dim) for _ in range(num_layers)]
-        )
-        self.conv_dropout = nn.Dropout(dropout)
         self.head = MLP([hidden_dim, hidden_dim, 1], norm=None, dropout=dropout)
+        self.conv_dropout = nn.Dropout(dropout)
 
-        # Level 1 — tile virtual nodes
+        # Fine mesh (real<->real): one pass right after encoding (paired with
+        # the encode bridge below), one final pass right after decoding.
+        self.fine_convs = nn.ModuleList([EdgeAttrConv(hidden_dim, edge_in_dim) for _ in range(2)])
+        # Coarse mesh (tile<->tile, tile<->global): native coarse_dim throughout,
+        # never downcast to hidden_dim.
+        self.coarse_convs = nn.ModuleList(
+            [EdgeAttrConv(coarse_dim, edge_in_dim) for _ in range(num_layers - 2)]
+        )
+        # Fine/coarse bridges -- the only two places a projection happens.
+        self.encode_conv = BipartiteEdgeAttrConv(hidden_dim, coarse_dim, edge_in_dim)  # real -> tile
+        self.decode_conv = BipartiteEdgeAttrConv(coarse_dim, hidden_dim, edge_in_dim)  # tile -> real
+
+        # Level 1 — tile virtual nodes (native coarse_dim)
         self.tile_emb            = nn.Parameter(torch.zeros(coarse_dim))
         self.tile_input_encoder  = MLP([tile_in_dim, coarse_dim, coarse_dim], norm=None)
-        self.tile_proj           = nn.Linear(coarse_dim, hidden_dim) if coarse_dim != hidden_dim else nn.Identity()
         self.real_tile_edge_attr = nn.Parameter(torch.zeros(edge_in_dim))
         self.tile_tile_edge_attr = nn.Parameter(torch.zeros(edge_in_dim))
         nn.init.normal_(self.tile_emb, std=0.02)
 
-        # Level 2 — global virtual node
+        # Level 2 — global virtual node (native coarse_dim)
         self.global_emb             = nn.Parameter(torch.zeros(coarse_dim))
-        self.global_proj            = nn.Linear(coarse_dim, hidden_dim) if coarse_dim != hidden_dim else nn.Identity()
         self.tile_global_edge_attr  = nn.Parameter(torch.zeros(edge_in_dim))
         nn.init.normal_(self.global_emb, std=0.02)
+        # Degenerate fallback path (no tile grid at all -- see forward()): there's
+        # no coarse mesh to give its own width, so the global node just projects
+        # straight into hidden_dim as it always did.
+        self.global_proj_fallback = nn.Linear(coarse_dim, hidden_dim) if coarse_dim != hidden_dim else nn.Identity()
 
         # Local tile-tile adjacency, fixed for the lifetime of a training run
         # (grid shape never changes for a given geometry). Populated once by
@@ -141,28 +159,37 @@ class HierarchicalGNNMP(nn.Module):
             NX, NY, NZ = tile_NX, tile_NY, tile_NZ
             K  = NX * NY * NZ
 
-            tile_start  = N
-            global_start = N + num_graphs * K
-
-            # --- Build augmented node set ---
             tile_h = self.tile_emb.unsqueeze(0).expand(num_graphs * K, -1)
             if tile_x is not None:
                 tile_h = tile_h + self.tile_input_encoder(tile_x.float())
-            tile_h = self.tile_proj(tile_h)
-            global_h = self.global_proj(self.global_emb.unsqueeze(0).expand(num_graphs, -1))
-            h_aug = torch.cat([h, tile_h, global_h], dim=0)
+            global_h = self.global_emb.unsqueeze(0).expand(num_graphs, -1)
 
-            # Real ↔ Tile  (each real node → its tile's virtual node)
-            tile_node_abs = tile_start + batch * K + tile_idx
-            rt_edges = torch.cat([
-                torch.stack([real_idx, tile_node_abs], dim=0),
-                torch.stack([tile_node_abs, real_idx], dim=0),
-            ], dim=1)
+            # Real <-> tile bipartite edges, as two directed edge sets (each
+            # local to its own pair of tensors -- no shared augmented tensor,
+            # so no index offset needed).
+            tile_local = batch * K + tile_idx
+            rt_encode_ei = torch.stack([real_idx, tile_local], dim=0)   # real -> tile
+            rt_decode_ei = torch.stack([tile_local, real_idx], dim=0)   # tile -> real
+            rt_ea = self.real_tile_edge_attr.unsqueeze(0).expand(N, -1)
 
-            # Tile ↔ Tile  (6-connected spatial adjacency)
+            fine_ckpt = self.training and self.use_checkpoint
+
+            # --- Encode: first real-real refinement + push real info up to tiles ---
+            if fine_ckpt:
+                h = h + self.conv_dropout(
+                    checkpoint(self.fine_convs[0], h, edge_index, edge_attr, use_reentrant=False))
+                tile_h = tile_h + self.conv_dropout(
+                    checkpoint(self.encode_conv, h, tile_h, rt_encode_ei, rt_ea, use_reentrant=False))
+            else:
+                h = h + self.conv_dropout(self.fine_convs[0](h, edge_index, edge_attr))
+                tile_h = tile_h + self.conv_dropout(self.encode_conv(h, tile_h, rt_encode_ei, rt_ea))
+
+            # --- Process: coarse mesh (tile<->tile, tile<->global), native coarse_dim ---
+            tile_start = 0
+            global_start = num_graphs * K
+            coarse_h = torch.cat([tile_h, global_h], dim=0)
+
             tt_edges = self._tile_adjacency(NX, NY, NZ, num_graphs, tile_start, device)
-
-            # Tile ↔ Global  (every tile node → its graph's global node)
             all_tile_nodes = torch.arange(num_graphs * K, device=device)
             graph_of_tile  = all_tile_nodes // K
             tg_src = tile_start   + all_tile_nodes
@@ -171,45 +198,38 @@ class HierarchicalGNNMP(nn.Module):
                 torch.stack([tg_src, tg_dst], dim=0),
                 torch.stack([tg_dst, tg_src], dim=0),
             ], dim=1)
-
-            rt_ea = self.real_tile_edge_attr.unsqueeze(0).expand(rt_edges.size(1), -1)
             tt_ea = self.tile_tile_edge_attr.unsqueeze(0).expand(tt_edges.size(1), -1)
             tg_ea = self.tile_global_edge_attr.unsqueeze(0).expand(tg_edges.size(1), -1)
-
-            # Multi-scale schedule: first + last layer touch the fine mesh
-            # (real↔real + real↔tile); middle layers operate only on the coarse
-            # graph (tile↔tile + tile↔global), which has vastly fewer edges.
-            # Encode: gather local geometry and push it up to tiles.
-            # Process: cheap global reasoning at the coarse scale.
-            # Decode: pull tile info back to real nodes + final local refinement.
-            fine_ei = torch.cat([edge_index, rt_edges], dim=1)
-            fine_ea = torch.cat([edge_attr, rt_ea], dim=0)
-
             coarse_ei = torch.cat([tt_edges, tg_edges], dim=1)
             coarse_ea = torch.cat([tt_ea, tg_ea], dim=0)
 
-            num_layers = len(self.convs)
-            for i, conv in enumerate(self.convs):
-                is_fine = (i == 0 or i == num_layers - 1 or num_layers <= 2)
-                if is_fine:
-                    ei, ea = fine_ei, fine_ea
+            coarse_ckpt = fine_ckpt and not self.checkpoint_fine_only
+            for conv in self.coarse_convs:
+                if coarse_ckpt:
+                    coarse_h = coarse_h + self.conv_dropout(
+                        checkpoint(conv, coarse_h, coarse_ei, coarse_ea, use_reentrant=False))
                 else:
-                    ei, ea = coarse_ei, coarse_ea
+                    coarse_h = coarse_h + self.conv_dropout(conv(coarse_h, coarse_ei, coarse_ea))
 
-                ckpt_this = (
-                    self.training
-                    and self.use_checkpoint
-                    and (is_fine or not self.checkpoint_fine_only)
-                )
-                if ckpt_this:
-                    h_aug = h_aug + self.conv_dropout(checkpoint(conv, h_aug, ei, ea, use_reentrant=False))
-                else:
-                    h_aug = h_aug + self.conv_dropout(conv(h_aug, ei, ea))
+            tile_h = coarse_h[:num_graphs * K]
+
+            # --- Decode: pull tile info back to real nodes + final local refinement ---
+            if fine_ckpt:
+                h = h + self.conv_dropout(
+                    checkpoint(self.decode_conv, tile_h, h, rt_decode_ei, rt_ea, use_reentrant=False))
+                h = h + self.conv_dropout(
+                    checkpoint(self.fine_convs[1], h, edge_index, edge_attr, use_reentrant=False))
+            else:
+                h = h + self.conv_dropout(self.decode_conv(tile_h, h, rt_decode_ei, rt_ea))
+                h = h + self.conv_dropout(self.fine_convs[1](h, edge_index, edge_attr))
 
         else:
-            # Fallback: single global virtual node (original GNN behaviour)
+            # Fallback: single global virtual node, no tile grid (original GNN
+            # behaviour). No coarse mesh exists here, so there's nothing to give
+            # its own width -- the global node just projects into hidden_dim and
+            # rides along with the fine_convs.
             global_start = N
-            global_h = self.global_proj(self.global_emb.unsqueeze(0).expand(num_graphs, -1))
+            global_h = self.global_proj_fallback(self.global_emb.unsqueeze(0).expand(num_graphs, -1))
             h_aug = torch.cat([h, global_h], dim=0)
 
             global_node_abs = global_start + batch
@@ -221,14 +241,14 @@ class HierarchicalGNNMP(nn.Module):
             tg_ea = self.tile_global_edge_attr.unsqueeze(0).expand(virt_edges.size(1), -1)
             edge_attr_aug = torch.cat([edge_attr, tg_ea], dim=0)
 
-            for conv in self.convs:
+            for conv in self.fine_convs:
                 if self.training and self.use_checkpoint:
                     h_aug = h_aug + self.conv_dropout(checkpoint(conv, h_aug, edge_index_aug, edge_attr_aug,
                                                use_reentrant=False))
                 else:
                     h_aug = h_aug + self.conv_dropout(conv(h_aug, edge_index_aug, edge_attr_aug))
+            h = h_aug[:N]
 
-        h = h_aug[:N]
         node_pred = self.head(h)
         graph_pred = ks_pool(node_pred, batch, num_graphs, self.node_target_mean,
                               self.node_target_std, self.stress_ks_rho_mpa)

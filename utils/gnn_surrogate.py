@@ -2,8 +2,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from torch_geometric.nn import MessagePassing , global_max_pool
+from torch_geometric.nn import MessagePassing
 from torch_geometric.nn.models import MLP
+from torch_geometric.utils import scatter
+
+
+def ks_pool(node_pred, batch, num_graphs, node_target_mean, node_target_std, rho_mpa):
+    """KS (Kreisselmeier-Steinhauser) smooth-max pool over per-graph node
+    predictions, matching core/mesh.py:get_aggregated_stress.
+
+    node_pred lives in node-normalized space, but unlike a hard max, KS
+    aggregation is nonlinear and does not commute with that normalization --
+    pooling it directly would apply the wrong effective smoothing bandwidth
+    (off by a factor of node_target_std). So: denormalize to raw MPa, KS
+    aggregate with rho_mpa (the same sharpness the dataset's ks_stress
+    target was built with), then renormalize the scalar result back to
+    node-normalized space, so downstream denorm logic (gnn_training.py,
+    gnn_evaluator.py) is unaffected -- it just sees a different graph_pred.
+    """
+    raw = node_pred.squeeze(-1) * node_target_std.squeeze() + node_target_mean.squeeze()
+    per_graph_max = scatter(raw, batch, dim=0, dim_size=num_graphs, reduce="max")
+    shifted = raw - per_graph_max[batch]
+    sum_exp = scatter(torch.exp(rho_mpa * shifted), batch, dim=0, dim_size=num_graphs, reduce="sum")
+    ks_raw = per_graph_max + torch.log(sum_exp) / rho_mpa
+    return ((ks_raw - node_target_mean.squeeze()) / node_target_std.squeeze()).unsqueeze(-1)
 
 
 class EdgeAttrConv(MessagePassing):
@@ -18,11 +40,35 @@ class EdgeAttrConv(MessagePassing):
         return self.mlp(torch.cat([x_i, x_j - x_i, edge_attr], dim=-1))
 
 
+class BipartiteEdgeAttrConv(MessagePassing):
+    """EdgeAttrConv variant for edges crossing two differently-sized node
+    spaces (e.g. the fine/coarse boundary of a hierarchical GNN). Source
+    features are projected to the target width before the message MLP, so
+    the MLP itself -- and the target update -- live entirely at dst_dim;
+    src_dim is never upsampled beyond this one projection."""
+    def __init__(self, src_dim, dst_dim, edge_dim):
+        super().__init__(aggr="mean")
+        self.src_proj = nn.Linear(src_dim, dst_dim)
+        self.mlp = MLP([2 * dst_dim + edge_dim, dst_dim, dst_dim], norm="layer_norm")
+
+    def forward(self, x_src, x_dst, edge_index, edge_attr):
+        return self.propagate(edge_index, x=(x_src, x_dst), edge_attr=edge_attr,
+                               size=(x_src.size(0), x_dst.size(0)))
+
+    def message(self, x_i, x_j, edge_attr):
+        x_j = self.src_proj(x_j)
+        return self.mlp(torch.cat([x_i, x_j - x_i, edge_attr], dim=-1))
+
+
 class GNN(nn.Module):
     def __init__(self, node_in_dim, edge_in_dim=1, hidden_dim=128, num_layers=6,
-                 use_checkpoint=False):
+                 use_checkpoint=False, node_target_mean=0.0, node_target_std=1.0,
+                 stress_ks_rho_mpa=0.15):
         super().__init__()
         self.use_checkpoint = use_checkpoint
+        self.stress_ks_rho_mpa = stress_ks_rho_mpa
+        self.register_buffer("node_target_mean", torch.as_tensor(node_target_mean, dtype=torch.float), persistent=False)
+        self.register_buffer("node_target_std", torch.as_tensor(node_target_std, dtype=torch.float), persistent=False)
 
         self.encoder = MLP([node_in_dim, hidden_dim, hidden_dim], norm=None)
         self.convs = nn.ModuleList()
@@ -71,7 +117,8 @@ class GNN(nn.Module):
 
         h = h_aug[:N]
         node_pred = self.head(h)
-        graph_pred = global_max_pool(node_pred, batch)
+        graph_pred = ks_pool(node_pred, batch, num_graphs, self.node_target_mean,
+                              self.node_target_std, self.stress_ks_rho_mpa)
         return graph_pred, node_pred
 
 
@@ -86,7 +133,8 @@ class HierarchicalGNN(nn.Module):
     def __init__(self, node_in_dim, edge_in_dim=1, hidden_dim=128, num_layers=6, tile_in_dim=1,
                  use_checkpoint=False, checkpoint_fine_only=False,
                  num_pos_nodes=0, transformer_heads=4, transformer_ff_mult=2,
-                 transformer_dropout=0.1):
+                 transformer_dropout=0.1, node_target_mean=0.0, node_target_std=1.0,
+                 stress_ks_rho_mpa=0.15):
         super().__init__()
         assert num_layers >= 2, "need >=2 layers: fine encode + fine decode around the coarse transformer"
         self.use_checkpoint = use_checkpoint
@@ -94,6 +142,9 @@ class HierarchicalGNN(nn.Module):
         # The coarse transformer stage runs without checkpoint because its
         # activations are tiny anyway. Requires use_checkpoint=True to have effect.
         self.checkpoint_fine_only = checkpoint_fine_only
+        self.stress_ks_rho_mpa = stress_ks_rho_mpa
+        self.register_buffer("node_target_mean", torch.as_tensor(node_target_mean, dtype=torch.float), persistent=False)
+        self.register_buffer("node_target_std", torch.as_tensor(node_target_std, dtype=torch.float), persistent=False)
 
         # --- Fixed-topology exploit (hollow_cube etc.) ---------------------
         # The graph is frozen and node ordering is stable, so we can learn a
@@ -140,9 +191,15 @@ class HierarchicalGNN(nn.Module):
         self.tile_global_edge_attr  = nn.Parameter(torch.zeros(edge_in_dim))
         nn.init.normal_(self.global_emb, std=0.02)
 
-        # Cache for tile grid positions, keyed by (NX, NY, NZ, device).
-        # Plain dict — not serialized in state_dict, rebuilt on first forward.
-        self._tile_pos_cache: dict = {}
+        # Tile grid positions, fixed for the lifetime of a training run (grid
+        # shape never changes for a given geometry). Populated once by
+        # set_tile_grid() -- NOT lazily inside forward() via a dict keyed by
+        # (NX, NY, NZ, device): torch.compile/dynamo re-guards a plain dict's
+        # contents by object identity on every trace and eventually hits its
+        # recompile cache limit, silently falling back to eager mid-training
+        # (see the identical fix in utils/gnn_hierarchical_mp.py).
+        self.register_buffer("tile_pos_raw", None, persistent=False)
+        self._tile_grid = None  # (NX, NY, NZ) tile_pos_raw was built for
 
     @staticmethod
     def _build_tile_positions(NX, NY, NZ, device):
@@ -157,11 +214,18 @@ class HierarchicalGNN(nn.Module):
         )
         return pos / norm
 
+    def set_tile_grid(self, NX, NY, NZ):
+        """Precompute the fixed tile position encoding for this geometry's
+        grid. Call once, right after construction."""
+        self.tile_pos_raw = self._build_tile_positions(NX, NY, NZ, self.tile_emb.device)
+        self._tile_grid = (NX, NY, NZ)
+
     def _tile_positions(self, NX, NY, NZ, device):
-        key = (NX, NY, NZ, device)
-        if key not in self._tile_pos_cache:
-            self._tile_pos_cache[key] = self._build_tile_positions(NX, NY, NZ, device)
-        return self._tile_pos_cache[key]
+        assert self._tile_grid == (NX, NY, NZ), (
+            f"set_tile_grid{self._tile_grid} was called, but forward() saw "
+            f"grid {(NX, NY, NZ)} -- fixed-topology assumption violated."
+        )
+        return self.tile_pos_raw
 
     def forward(self, x, edge_index, edge_attr, batch,
                 tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
@@ -177,9 +241,12 @@ class HierarchicalGNN(nn.Module):
         real_idx = torch.arange(N, device=device)
 
         if tile_idx is not None:
-            NX = int(tile_NX[0])
-            NY = int(tile_NY[0])
-            NZ = int(tile_NZ[0])
+            # tile_NX/NY/NZ arrive as plain Python ints (extracted once in the
+            # caller, outside any compiled region) rather than GPU tensors --
+            # calling int(tensor[0]) here was a torch.compile graph break that
+            # triggered a recompilation storm, since these never actually vary
+            # across samples of a fixed-topology geometry.
+            NX, NY, NZ = tile_NX, tile_NY, tile_NZ
             K  = NX * NY * NZ
 
             tile_start  = N
@@ -261,5 +328,6 @@ class HierarchicalGNN(nn.Module):
 
         h = h_aug[:N]
         node_pred = self.head(h)
-        graph_pred = global_max_pool(node_pred, batch)
+        graph_pred = ks_pool(node_pred, batch, num_graphs, self.node_target_mean,
+                              self.node_target_std, self.stress_ks_rho_mpa)
         return graph_pred, node_pred
