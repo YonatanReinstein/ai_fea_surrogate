@@ -4,7 +4,18 @@ import importlib
 from pathlib import Path
 import json
 
-def screenshot(geometry: str, dims: dict, save_path: str, banner: str = None):
+def screenshot(geometry: str, dims: dict, save_path: str, banner: str = None,
+               heatmap: bool = False, ccx_path: str = "ccx", nproc: int = 1,
+               resolution=(5120, 2880)):
+    """Render a design to save_path.
+
+    heatmap=False (default): plain gray wireframe mesh (component geometry
+    only, no solve).
+    heatmap=True: runs a real CalculiX solve (requires `ccx` on PATH) and
+    colors the mesh by nodal von Mises stress, jet colormap, fixed to
+    [0, yield_strength] so color is comparable across frames of the same
+    geometry instead of auto-scaling per-frame.
+    """
     material_props_path = f"data/{geometry}/CAD_model/material_properties.json"
     material_properties = json.loads(Path(material_props_path).read_text())
     young = material_properties["young_modulus"]
@@ -22,7 +33,17 @@ def screenshot(geometry: str, dims: dict, save_path: str, banner: str = None):
     component.generate_mesh(U=U, V=V, W=W)
     component.mesh.anchor_nodes_by_condition(anchor_condition)
     component.mesh.apply_force_by_pattern(force_pattern)
-    component.mesh.plot_mesh(save_path=save_path , banner=banner)
+
+    if heatmap:
+        component.ccx_sim(ccx_path=ccx_path, nproc=nproc)
+        node_stress_mpa = {nid: node.stress / 1e6 for nid, node in component.mesh.nodes.items()}
+        component.mesh.plot_stress_heatmap(
+            node_stress_mpa, save_path=save_path, banner=banner,
+            resolution=resolution, aa_type="ssaa",
+            clim=(0.0, material_properties["yield_strength"]),
+        )
+    else:
+        component.mesh.plot_mesh(save_path=save_path, banner=banner, resolution=resolution)
 
 
 import numpy as np

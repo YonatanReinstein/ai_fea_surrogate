@@ -9,7 +9,7 @@ from core.IritModel import IritModel, IritCModel
 
 
 def _run_single(model_path, mesh_threads, fixed_dims, anchor_condition, force_pattern,
-                 U, V, W, young, poisson, ccx_path, nproc, dims):
+                 U, V, W, young, poisson, ccx_path, nproc, dims, stress_ks_rho_mpa):
     exe_path = os.path.join(model_path, "model")
     exe_win_path = os.path.join(model_path, "model.exe")
     try:
@@ -26,10 +26,15 @@ def _run_single(model_path, mesh_threads, fixed_dims, anchor_condition, force_pa
         comp.mesh.apply_force_by_pattern(force_pattern)
         comp.ccx_sim(ccx_path=ccx_path, nproc=nproc)
 
+        # KS aggregation instead of a hard max: smooth and non-zero for
+        # every node near the peak, not just whichever single node happens
+        # to hold it this iteration -- see core/mesh.py:get_aggregated_stress.
+        # rho is tuned in 1/MPa; get_aggregated_stress works in Pa (node.stress's
+        # native unit), hence the 1e-6 conversion.
         return {
             "volume": comp.get_volume(),
             # Consistent with MAPDLEvaluator/GNNEvaluator: stress in MPa.
-            "stress": comp.mesh.get_max_stress() / 1e6,
+            "stress": comp.mesh.get_aggregated_stress(rho=stress_ks_rho_mpa * 1e-6) / 1e6,
             "disp": comp.mesh.get_max_displacement(),
         }
     except Exception as e:
@@ -46,13 +51,19 @@ class CCXEvaluator(BaseEvaluator):
     or point ccx_path at a built binary).
     """
 
-    def __init__(self, geometry_name, max_workers=8, nproc=1, mesh_threads=4, ccx_path="ccx"):
+    def __init__(self, geometry_name, max_workers=8, nproc=1, mesh_threads=4, ccx_path="ccx",
+                 stress_ks_rho_mpa=0.15):
         super().__init__(geometry_name)
         self.geometry = geometry_name
         self.mesh_threads = mesh_threads
         self.nproc = nproc
         self.ccx_path = ccx_path
         self.max_workers = max_workers
+        # KS aggregation sharpness (1/MPa) for the "stress" reported to
+        # optimizers -- see get_aggregated_stress(). Larger = closer to the
+        # true hard max (noisier per-tile sensitivities); smaller = smoother
+        # sensitivities but more conservative (overestimates the true peak).
+        self.stress_ks_rho_mpa = stress_ks_rho_mpa
         self.model_path = f"data/{geometry_name}/CAD_model"
         module = importlib.import_module(f"data.{geometry_name}.boundary_conditions")
         self.anchor_condition = module.anchor_condition
@@ -71,7 +82,7 @@ class CCXEvaluator(BaseEvaluator):
                     _run_single, self.model_path, self.mesh_threads, self.fixed_dims,
                     self.anchor_condition, self.force_pattern, self.U, self.V, self.W,
                     self.material_properties["young_modulus"], self.material_properties["poisson_ratio"],
-                    self.ccx_path, self.nproc, dims,
+                    self.ccx_path, self.nproc, dims, self.stress_ks_rho_mpa,
                 ): i
                 for i, dims in enumerate(dims_list)
             }

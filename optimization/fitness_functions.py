@@ -12,7 +12,8 @@ def make_fitness(evaluator, yield_strength):
         return {
             "volume": volumes,
             "stress": stresses,
-            "yield_strength": float(yield_strength)
+            "yield_strength": float(yield_strength),
+            "base_heatmap": result.get("base_heatmap"),
         }
     return fitness
 

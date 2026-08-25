@@ -227,6 +227,15 @@ class HierarchicalGNN(nn.Module):
         )
         return self.tile_pos_raw
 
+    @torch.compiler.disable
+    def _coarse_forward(self, tokens):
+        # Kept out of the torch.compile graph: Triton's kernel autotuner
+        # (benchmark_all_configs) crashes with a CUDA illegal memory access
+        # when compiling this multi-head self-attention stage on this
+        # GPU/driver/torch stack, reproduced independent of hidden_dim/head
+        # count. The fine-mesh convs (the bulk of the compute) still compile.
+        return self.coarse_transformer(tokens)
+
     def forward(self, x, edge_index, edge_attr, batch,
                 tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
                 num_graphs=None, node_id=None):
@@ -291,9 +300,9 @@ class HierarchicalGNN(nn.Module):
 
             ckpt_coarse = self.training and self.use_checkpoint and not self.checkpoint_fine_only
             if ckpt_coarse:
-                tokens = checkpoint(self.coarse_transformer, tokens, use_reentrant=False)
+                tokens = checkpoint(self._coarse_forward, tokens, use_reentrant=False)
             else:
-                tokens = self.coarse_transformer(tokens)
+                tokens = self._coarse_forward(tokens)
 
             tile_new   = tokens[:, :K, :].reshape(num_graphs * K, -1)
             global_new = tokens[:, K, :]

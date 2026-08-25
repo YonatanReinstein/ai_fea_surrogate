@@ -21,3 +21,21 @@ presentation/
 .claude/
 optimization/artifacts/
 third_party/
+
+# Run outputs / large scratch artifacts (hollow_cube CCX/GNN work)
+data/hollow_cube/checkpoints_*/
+data/hollow_cube/dataset_ccx/
+data/hollow_cube/dataset_grad*/
+data/hollow_cube/dataset_field_test*/
+data/hollow_cube/gnn_surrogate.pt*
+data/hollow_cube_ddptest/
+optimization/artifacts_backup_*/
+optimization/artifacts_ccx_backup_*/
+optimization/artifacts_gnn_backup_*/
+optimization/screenshots_backup_*/
+optimization/screenshots_ccx*/
+optimization/screenshots_gnn_backup_*/
+optimization/*.pptx
+training/runs/
+training/*.png
+training/*.html

@@ -5,6 +5,7 @@ mp.set_start_method('spawn', force=True)
 from abc import ABC
 from utils.gnn_surrogate import GNN, HierarchicalGNN
 from utils.gnn_hierarchical_mp import HierarchicalGNNMP
+from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
 from evaluators.base_evaluator import BaseEvaluator
 from core.IritModel import IritCModel
 from core.component import Component
@@ -12,7 +13,7 @@ from training.gnn_training import gnn_input_fn, gnn_target_fn
 import json
 from multiprocessing import Pool
 from torch_geometric.loader import DataLoader
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 import importlib
 import threading
 from time import sleep, perf_counter
@@ -121,7 +122,8 @@ def _run_sample_worker(args):
 
 class GNNEvaluator(BaseEvaluator):
     def __init__(self, geometry_name: str, screenshots: bool = False, processes: int = None, batch_size: int = 128,
-                 heatmap: bool = False, heatmap_dir: str = "screenshots"):
+                 heatmap: bool = False, heatmap_dir: str = "screenshots", heatmap_base_only: bool = False,
+                 ckpt_path: str = None):
         super().__init__(geometry_name)
         self.processes = processes
         self.screenshots = screenshots
@@ -131,16 +133,33 @@ class GNNEvaluator(BaseEvaluator):
         # node-level predictions instead of a real FEA solve.
         self.heatmap = heatmap
         self.heatmap_dir = heatmap_dir
+        # When enabled (without the full per-sample `heatmap` above), evaluate()
+        # returns the mesh + node-stress dict for dims_list[0] only -- callers
+        # like TopologyOptimizer always put the current/base design at index 0,
+        # so this rides along on the evaluation that already happens every
+        # generation instead of triggering a second solve/inference just for a picture.
+        self.heatmap_base_only = heatmap_base_only
         if self.heatmap:
             os.makedirs(self.heatmap_dir, exist_ok=True)
 
-        ckpt_path = f"data/{geometry_name}/gnn_surrogate.pt"
+        ckpt_path = ckpt_path or f"data/{geometry_name}/gnn_surrogate.pt"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(ckpt_path, map_location=self.device)
 
-        # graph_pred = max(node_pred) lives in node-normalized space
+        if self.device.type == "cpu" and self.processes:
+            # OMP_NUM_THREADS=1 in the job env keeps each meshing worker
+            # single-threaded so `processes`-many of them don't oversubscribe
+            # the node. That same env var would otherwise also pin this (main)
+            # process's own torch calls to 1 thread -- but inference here runs
+            # after the worker pool is done for the generation, so the workers
+            # are idle and this process can safely claim their cores instead.
+            torch.set_num_threads(self.processes)
+
+        # graph_pred = KS-aggregate(node_pred) (see utils/gnn_surrogate.py:ks_pool),
+        # matching core/mesh.py:get_aggregated_stress -- not the hard max.
         self.target_mean = ckpt["node_target_mean"].to(self.device)
         self.target_std  = ckpt["node_target_std"].to(self.device)
+        self.stress_ks_rho_mpa = ckpt.get("stress_ks_rho_mpa", 0.15)
         self.x_mean = ckpt["x_mean"].to(self.device)
         self.x_std  = ckpt["x_std"].to(self.device)
         self.edge_mean = ckpt["edge_mean"].to(self.device)
@@ -157,7 +176,8 @@ class GNNEvaluator(BaseEvaluator):
         hierarchical = ckpt.get("hierarchical", False)
         coarse_arch = ckpt.get("coarse_arch", "transformer")
         if hierarchical:
-            ModelClass = HierarchicalGNN if coarse_arch == "transformer" else HierarchicalGNNMP
+            ModelClass = {"transformer": HierarchicalGNN, "gnn": HierarchicalGNNMP,
+                          "cnn": HierarchicalGNNCNN}[coarse_arch]
         else:
             ModelClass = GNN
         model_kwargs = dict(
@@ -165,18 +185,21 @@ class GNNEvaluator(BaseEvaluator):
             edge_in_dim=self.edge_in_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
+            node_target_mean=self.target_mean,
+            node_target_std=self.target_std,
+            stress_ks_rho_mpa=self.stress_ks_rho_mpa,
         )
         if hierarchical:
             model_kwargs["num_pos_nodes"] = num_pos_nodes
             if coarse_arch == "transformer":
                 model_kwargs["transformer_heads"] = ckpt["transformer_heads"]
                 model_kwargs["transformer_ff_mult"] = ckpt["transformer_ff_mult"]
-            else:
+            elif coarse_arch == "gnn":
                 model_kwargs["coarse_dim"] = ckpt.get("coarse_dim")
+            else:  # cnn
+                model_kwargs["coarse_dim"] = ckpt.get("coarse_dim")
+                model_kwargs["cnn_depth"] = ckpt.get("cnn_depth", 3)
         self.model = ModelClass(**model_kwargs).to(self.device)
-
-        self.model.load_state_dict(ckpt["model_state"])
-        self.model.eval()
 
         # Frozen-graph fast path: if graph.pt exists, workers reuse its constant
         # edge_index/tile_idx instead of rebuilding the graph per sample.
@@ -209,6 +232,19 @@ class GNNEvaluator(BaseEvaluator):
         self.U, self.V, self.W = self.mesh_resolution()
         self._get_tile_grid = getattr(module, "tile_grid", None)
         self.fixed_dims = getattr(module, "fixed_dims", lambda: {})()
+
+        if hierarchical:
+            # Fixed-topology: precompute the tile grid once (see gnn_training.py).
+            # Must happen before load_state_dict: HierarchicalGNNCNN lazily builds
+            # its U-Net down/bottleneck/up submodules inside set_tile_grid (their
+            # shapes depend on the grid dims), so those keys don't exist in the
+            # freshly-constructed model until this runs.
+            NX, NY, NZ = self._get_tile_grid(None)
+            self.model.set_tile_grid(NX, NY, NZ)
+
+        self.model.load_state_dict(ckpt["model_state"])
+        self.model.eval()
+
         self.listener_thread = threading.Thread(target=listener, daemon=True).start()
 
         # Persistent worker pool: spawn the workers (and pay the heavy torch/irit
@@ -239,7 +275,7 @@ class GNNEvaluator(BaseEvaluator):
                 self.poisson,
                 idx,
                 self.screenshots,
-                self.heatmap,
+                self.heatmap or (self.heatmap_base_only and i == 0),
                 self.anchor_condition,
                 self.force_pattern,
                 self.U,
@@ -248,58 +284,36 @@ class GNNEvaluator(BaseEvaluator):
                 self._get_tile_grid(dims) if self._get_tile_grid is not None else None,
                 self.graph_path,
             )
-            for dims, idx in zip(dims_list, indexes)
+            for i, (dims, idx) in enumerate(zip(dims_list, indexes))
         ]
         t_build_args = perf_counter() - t
-        results = []
 
+        # Pipelined pool+inference: fire GPU inference on each mini-batch of
+        # self.batch_size samples as soon as the pool has meshed that many,
+        # instead of waiting for all `batch_size` samples to finish meshing
+        # first. pool.imap keeps worker processes pulling the next task
+        # immediately after finishing the previous one regardless of how fast
+        # this loop drains completed results, so CPU meshing for the next
+        # mini-batch proceeds in the background while the GPU forward pass
+        # below runs on the current one -- wall time collapses toward
+        # max(mesh_time, inference_time) instead of their sum.
+        volume_list = [None] * batch_size
+        worker_timings = [None] * batch_size
+        all_stress = [None] * batch_size
+        base_heatmap = None
+        t_inference_total = 0.0
 
-        t = perf_counter()
-        it = self.pool.imap(_run_sample_worker, all_args)
-        try:
-            for result in it:
-                if STOP:
-                    print("Graceful stop requested.")
-
-                    # -------- KEY PART --------
-                    self.pool.close()
-                    sleep(3)      # do not accept new tasks
-                    self.pool.terminate()    # kill worker process
-                    # -------------------------
-                    print("Stopped during evaluation.")
-                    self.pool.join()
-                    self.pool = None
-
-                    break
-
-                results.append(result)
-        except KeyboardInterrupt:
-            print("KeyboardInterrupt detected. Terminating pool.")
-            self.pool.terminate()
-            self.pool = None
-        t_pool = perf_counter() - t
-
-        graph_dicts, volume_list, worker_timings, mesh_list = zip(*results)
-        t = perf_counter()
-        graph_list = [
-            Data(**{k: torch.from_numpy(v) for k, v in d.items()})
-            for d in graph_dicts
-        ]
-        # Attach shared frozen-graph stable node id (broadcast onto each sample).
-        if self.node_id is not None:
-            for g in graph_list:
-                if g.x.shape[0] == self.node_id.shape[0]:
+        def run_inference_chunk(chunk):
+            nonlocal base_heatmap, t_inference_total
+            t_chunk = perf_counter()
+            graph_list = []
+            for _local_idx, graph_dict, _mesh in chunk:
+                g = Data(**{k: torch.from_numpy(v) for k, v in graph_dict.items()})
+                if self.node_id is not None and g.x.shape[0] == self.node_id.shape[0]:
                     g.node_id = self.node_id
-        t_graph_build = perf_counter() - t
+                graph_list.append(g)
+            batch_data = Batch.from_data_list(graph_list)
 
-        # Build DataLoader
-        all_stress = []
-        sample_offset = 0  # running count of graphs consumed, to index into indexes/mesh_list
-
-        t = perf_counter()
-        loader = DataLoader(graph_list, batch_size=self.batch_size, shuffle=False)
-        for batch_data in loader:
-            # Prepare inputs
             x, edge_index, edge_attr, batch, _ti, _nx, _ny, _nz, _tx, node_id = gnn_input_fn(batch_data)
             x[:, 3:6] = x[:, 3:6] / 1e+6   # scale force vector (Fx,Fy,Fz) to match training (gnn_training.py:95)
 
@@ -320,12 +334,15 @@ class GNNEvaluator(BaseEvaluator):
             tile_NX  = getattr(batch_data, 'tile_NX',  None)
             tile_NY  = getattr(batch_data, 'tile_NY',  None)
             tile_NZ  = getattr(batch_data, 'tile_NZ',  None)
+            # Fixed-topology: NX/NY/NZ are identical for every sample, so pass
+            # plain Python ints rather than GPU tensors (see gnn_training.py's
+            # gnn_input_fn / gnn_hierarchical_mp.py for why).
+            tile_NX = int(tile_NX[0]) if tile_NX is not None else None
+            tile_NY = int(tile_NY[0]) if tile_NY is not None else None
+            tile_NZ = int(tile_NZ[0]) if tile_NZ is not None else None
             tile_x   = getattr(batch_data, 'tile_x',   None)
             if tile_idx is not None:
                 tile_idx = tile_idx.to(self.device)
-                tile_NX  = tile_NX.to(self.device)
-                tile_NY  = tile_NY.to(self.device)
-                tile_NZ  = tile_NZ.to(self.device)
             if tile_x is not None:
                 tile_x = tile_x.float().to(self.device)
             if node_id is not None:
@@ -340,12 +357,16 @@ class GNNEvaluator(BaseEvaluator):
 
             # Denormalize
             stress = graph_pred * self.target_std + self.target_mean
-            stress = stress.squeeze()
-            all_stress.extend(stress.detach().cpu().numpy().tolist())
+            stress = stress.squeeze(-1)
+            chunk_stress = stress.detach().cpu().numpy().tolist()
+            for (local_idx, _graph_dict, _mesh), s in zip(chunk, chunk_stress):
+                all_stress[local_idx] = s
 
-            if self.heatmap:
-                # node_pred lives in the same normalized space as graph_pred
-                # (graph_pred = max(node_pred)), so it denormalizes the same way.
+            if self.heatmap or self.heatmap_base_only:
+                # node_pred lives in node-normalized space (the same space
+                # graph_pred is computed FROM before ks_pool denormalizes
+                # internally -- see utils/gnn_surrogate.py:ks_pool), so it
+                # denormalizes the same way via target_mean/target_std here.
                 node_stress = (node_pred * self.target_std + self.target_mean).squeeze(-1).detach().cpu()
                 batch_cpu = batch.detach().cpu()
                 num_graphs = int(batch_data.num_graphs)
@@ -355,17 +376,57 @@ class GNNEvaluator(BaseEvaluator):
                     n = counts[g]
                     local_stress = node_stress[start:start + n]
                     start += n
-                    sample_idx = indexes[sample_offset + g]
-                    mesh = mesh_list[sample_offset + g]
+                    local_idx, _graph_dict, mesh = chunk[g]
+                    sample_idx = indexes[local_idx]
                     # Node i in the graph (0-based) is mesh node id i+1 — see
                     # to_graph_with_labels / to_graph_fixed node ordering.
                     stress_dict = {i + 1: float(local_stress[i]) for i in range(n)}
-                    save_path = os.path.join(self.heatmap_dir, f"heatmap_{sample_idx + 1}.png")
-                    mesh.plot_stress_heatmap(stress_dict, save_path=save_path)
-                sample_offset += num_graphs
-        t_inference = perf_counter() - t
+                    if self.heatmap:
+                        save_path = os.path.join(self.heatmap_dir, f"heatmap_{sample_idx + 1}.png")
+                        mesh.plot_stress_heatmap(stress_dict, save_path=save_path)
+                    if self.heatmap_base_only and local_idx == 0:
+                        base_heatmap = {"mesh": mesh, "stress": stress_dict}
+            t_inference_total += perf_counter() - t_chunk
+
+        t = perf_counter()
+        it = self.pool.imap(_run_sample_worker, all_args)
+        chunk = []
+        local_idx = 0
+        try:
+            for result in it:
+                if STOP:
+                    print("Graceful stop requested.")
+
+                    # -------- KEY PART --------
+                    self.pool.close()
+                    sleep(3)      # do not accept new tasks
+                    self.pool.terminate()    # kill worker process
+                    # -------------------------
+                    print("Stopped during evaluation.")
+                    self.pool.join()
+                    self.pool = None
+
+                    break
+
+                graph_dict, volume, worker_timing, mesh = result
+                volume_list[local_idx] = volume
+                worker_timings[local_idx] = worker_timing
+                chunk.append((local_idx, graph_dict, mesh))
+                local_idx += 1
+
+                if len(chunk) >= self.batch_size:
+                    run_inference_chunk(chunk)
+                    chunk = []
+            if chunk:
+                run_inference_chunk(chunk)
+        except KeyboardInterrupt:
+            print("KeyboardInterrupt detected. Terminating pool.")
+            self.pool.terminate()
+            self.pool = None
+        t_pipeline = perf_counter() - t
 
         # ---- timing report ----
+        worker_timings = [wt for wt in worker_timings if wt is not None]
         n = len(worker_timings)
         worker_avg = {
             k: sum(wt[k] for wt in worker_timings) / n
@@ -376,8 +437,8 @@ class GNNEvaluator(BaseEvaluator):
         print(
             f"[GNNEvaluator] batch={batch_size} processes={self.processes} "
             f"total={t_eval_total:.2f}s | "
-            f"build_args={t_build_args:.2f}s pool={t_pool:.2f}s "
-            f"graph_build={t_graph_build:.2f}s inference={t_inference:.2f}s",
+            f"build_args={t_build_args:.2f}s pipeline={t_pipeline:.2f}s "
+            f"(inference={t_inference_total:.2f}s of that, overlapped with meshing)",
             flush=True,
         )
         print(
@@ -390,7 +451,8 @@ class GNNEvaluator(BaseEvaluator):
         return {
             "stress": all_stress,        # shape [batch_size]
             "volume": volume_list,    # list of floats
-            "yield_strength": self.yield_strength
+            "yield_strength": self.yield_strength,
+            "base_heatmap": base_heatmap,  # {"mesh", "stress"} for dims_list[0], or None
         }
 
 

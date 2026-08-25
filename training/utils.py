@@ -2,7 +2,7 @@ import json
 import matplotlib.pyplot as plt
 import os
 
-def plot_losses(run_dir: str = "training/runs/train", save_path: str = None):
+def plot_losses(run_dir: str = "training/runs/train_ccx_cnn_2gpu", save_path: str = None):
 
     # ---- Load JSON ----
     with open(os.path.join(run_dir, "losses.json"), "r") as f:
@@ -11,7 +11,8 @@ def plot_losses(run_dir: str = "training/runs/train", save_path: str = None):
     # ---- Create Plot ----
     plt.figure(figsize=(10, 5))
     for key, values in data.items():
-        plt.plot(values, label=key.replace("_", " ").title())
+        if key in ["train_losses", "val_losses", 'train_graph_losses', 'val_graph_losses']:
+            plt.plot(values, label=key.replace("_", " ").title())
     plt.title("GNN Training vs Validation Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")

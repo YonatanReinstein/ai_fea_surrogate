@@ -9,8 +9,9 @@
 # scale width (one core per concurrent mesh worker), not GPU power. Target the
 # L4 nodes (plotinus1/2): low-demand inference GPU + 128 fast Zen4 EPYC cores +
 # 503GB RAM, usually idle => far shorter queue than the in-demand A40 nodes.
-#SBATCH --partition=public
-#SBATCH --gres=gpu:L4:1
+#SBATCH --partition=newton
+#SBATCH --account=cslab
+#SBATCH --gres=gpu:1
 #SBATCH --output=%x_%j.log
 #SBATCH --error=%x_%j.log
 

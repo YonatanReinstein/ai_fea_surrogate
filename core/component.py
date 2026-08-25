@@ -41,7 +41,7 @@ class Component:
     def get_volume(self):
         return self.CAD_model.get_volume()
 
-    def to_graph_with_labels(self, with_labels: bool = True, tile_grid=None) -> Data:
+    def to_graph_with_labels(self, with_labels: bool = True, tile_grid=None, stress_ks_rho_mpa: float = 0.15) -> Data:
         # tile_grid: (NX, NY, NZ) tuple to add per-node tile features, or None.
         # Requires self.elem_to_tile populated by generate_mesh().
 
@@ -117,9 +117,11 @@ class Component:
         young = torch.tensor([self.young], dtype=torch.float).unsqueeze(0)
         if with_labels:
             max_stress=torch.tensor([self.mesh.get_max_stress()], dtype=torch.float).unsqueeze(0)
+            ks_stress=torch.tensor([self.mesh.get_aggregated_stress(rho=stress_ks_rho_mpa * 1e-6)], dtype=torch.float).unsqueeze(0)
             max_displacement=torch.tensor([self.mesh.get_max_displacement()], dtype=torch.float).unsqueeze(0)
         else:
             max_stress=torch.tensor([0.0], dtype=torch.float).unsqueeze(0)
+            ks_stress=torch.tensor([0.0], dtype=torch.float).unsqueeze(0)
             max_displacement=torch.tensor([0.0], dtype=torch.float).unsqueeze(0)
 
         # --- Assemble Data object ---
@@ -132,6 +134,7 @@ class Component:
             volume=volume,
             dims=dims,
             max_stress=max_stress,
+            ks_stress=ks_stress,
             max_displacement=max_displacement,
             poisson=poisson,
             young=young,
@@ -144,8 +147,8 @@ class Component:
             data.tile_NZ = torch.tensor([NZ], dtype=torch.long)
         return data
 
-    def to_graph_fixed(self, edge_index, tile_idx, tile_grid) -> Data:
-        """Fast graph build for frozen-topology geometries (inference only).
+    def to_graph_fixed(self, edge_index, tile_idx, tile_grid, with_labels: bool = False, stress_ks_rho_mpa: float = 0.15) -> Data:
+        """Fast graph build for frozen-topology geometries.
 
         edge_index and tile_idx are constant across dim samples and supplied
         precomputed (data/<geometry>/dataset/graph.pt), so the expensive
@@ -154,6 +157,11 @@ class Component:
         node features and edge_attr (distances) are recomputed here. Node
         ordering matches to_graph_with_labels (mesh.nodes.values(), n.id-1),
         which is what edge_index/tile_idx were built against.
+
+        with_labels=True additionally attaches the FEA solve results
+        (node_disp, node_stress, volume, dims, max_stress, ks_stress,
+        max_displacement, young, poisson) needed for dataset generation;
+        inference call sites (no ground truth to attach) leave it False.
         """
         nodes = list(self.mesh.nodes.values())
 
@@ -182,6 +190,19 @@ class Component:
             data.tile_NX  = torch.tensor([NX], dtype=torch.long)
             data.tile_NY  = torch.tensor([NY], dtype=torch.long)
             data.tile_NZ  = torch.tensor([NZ], dtype=torch.long)
+
+        if with_labels:
+            node_disp = torch.tensor([list(n.displacement) for n in nodes], dtype=torch.float).unsqueeze(0)
+            node_stress = torch.tensor([[n.stress] for n in nodes], dtype=torch.float).unsqueeze(0)
+            data.node_disp = node_disp
+            data.node_stress = node_stress
+            data.volume = torch.tensor([self.get_volume()], dtype=torch.float).unsqueeze(0)
+            data.dims = torch.tensor(list(self.CAD_model.get_dim_list()), dtype=torch.float).unsqueeze(0)
+            data.poisson = torch.tensor([self.poisson], dtype=torch.float).unsqueeze(0)
+            data.young = torch.tensor([self.young], dtype=torch.float).unsqueeze(0)
+            data.max_stress = torch.tensor([self.mesh.get_max_stress()], dtype=torch.float).unsqueeze(0)
+            data.ks_stress = torch.tensor([self.mesh.get_aggregated_stress(rho=stress_ks_rho_mpa * 1e-6)], dtype=torch.float).unsqueeze(0)
+            data.max_displacement = torch.tensor([self.mesh.get_max_displacement()], dtype=torch.float).unsqueeze(0)
         return data
 
 

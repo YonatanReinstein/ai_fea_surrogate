@@ -281,7 +281,28 @@ class Mesh:
         if not self.solution_valid:
             raise ValueError("Solution is not valid. Please run the simulation first.")
         return max(node.stress for node in self.all_nodes() )    #if node.anchored is False
-    
+
+    def get_aggregated_stress(self, rho: float = 0.1):
+        """KS (Kreisselmeier-Steinhauser) upper bound on the nodal von Mises
+        stress field, in the same units as node.stress (Pa).
+
+        sigma_KS = sigma_max + (1/rho) * ln(sum_i exp(rho * (sigma_i - sigma_max)))
+
+        Unlike get_max_stress() (a hard, non-smooth max over a single node),
+        every node within ~1/rho of the peak contributes to the sum, so the
+        aggregated value responds smoothly to material added near -- but not
+        exactly at -- the current peak location. Always >= get_max_stress(),
+        approaching it as rho -> inf. rho is in 1/Pa here; pass rho scaled
+        for the stress units the caller works in (e.g. rho_MPa * 1e-6 if
+        node.stress is in Pa and rho was tuned in 1/MPa).
+        """
+        if not self.solution_valid:
+            raise ValueError("Solution is not valid. Please run the simulation first.")
+        import numpy as np
+        sigma = np.array([node.stress for node in self.all_nodes()], dtype=float)
+        sigma_max = sigma.max()
+        return float(sigma_max + np.log(np.sum(np.exp(rho * (sigma - sigma_max)))) / rho)
+
     def get_max_displacement(self):
         if not self.solution_valid:
             raise ValueError("Solution is not valid. Please run the simulation first.")

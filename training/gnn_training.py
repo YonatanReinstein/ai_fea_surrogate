@@ -4,11 +4,14 @@ import os
 import re
 import glob
 import time
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch_geometric.loader import DataLoader
 from torch_geometric.utils import scatter
 from utils.gnn_surrogate import GNN, HierarchicalGNN
 from utils.gnn_hierarchical_mp import HierarchicalGNNMP
-from training.dataset_io import load_dataset
+from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
+from training.dataset_io import load_dataset, shard_paths
 
 
 # ======================================================
@@ -38,6 +41,22 @@ def gnn_target_fn(data):
     # utils/gnn_surrogate.py:ks_pool for why the model's graph_pred matches
     # this instead of a plain global_max_pool.
     return torch.cat([data.ks_stress], dim=-1)
+
+
+# Graph-level ks_stress is heavily right-skewed (raw z-score: skew~2.6,
+# kurtosis~6.4 on a 10k-sample hollow_cube dataset) -- a few rare thin/weak
+# designs spike into the GPa range and dominate a linear std, squeezing the
+# other 99% of samples' normalized range. log-then-z-score fixes that
+# (skew~1.1, kurtosis~0.3, zero samples beyond +-3 vs ~3% for raw) without
+# discarding those samples. Deliberately graph-level only: node-level stress
+# (gnn_node_target_fn below) feeds ks_pool's KS-aggregation math, which is
+# calibrated in raw physical MPa (rho_mpa matches core/mesh.py's units) and
+# must stay linear for that physics to be correct -- see ks_pool's docstring.
+LOG_STRESS_EPS = 1e-6
+
+
+def gnn_log_target_fn(data):
+    return torch.log(gnn_target_fn(data).clamp_min(LOG_STRESS_EPS))
 
 
 def gnn_node_target_fn(data):
@@ -86,16 +105,25 @@ def train_gnn_model(
     use_checkpoint: bool = False,
     checkpoint_fine_only: bool = False,
     use_node_emb: bool = True,
-    coarse_arch: str = "transformer",
+    coarse_arch: str = "cnn",
     transformer_heads: int = 4,
     transformer_ff_mult: int = 2,
     transformer_dropout: float = 0.1,
     mp_dropout: float = 0.0,
     coarse_dim: int = None,
+    cnn_depth: int = 3,
     checkpoint_dir: str = None,
     run_dir: str = "training/runs/train",
     stress_ks_rho_mpa: float = 0.15,
     use_compile: bool = True,
+    resume_lr_scale: float = None,
+    lr_decay_per_epoch: float = 0.99,
+    lr_plateau_patience: int = 5,
+    lr_plateau_factor: float = 0.5,
+    seed_offset: int = 42,
+    grad_dataset_path: str = None,
+    grad_loss_weight: float = 0.1,
+    grad_batch_size: int = None,
 ):
     torch.manual_seed(42)
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 4)))
@@ -110,24 +138,47 @@ def train_gnn_model(
     os.makedirs(run_dir, exist_ok=True)
 
     # ----------------------------------------------------
-    # Device
+    # Device / DDP
     # ----------------------------------------------------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # torchrun sets WORLD_SIZE/RANK/LOCAL_RANK; plain `python -m` leaves them
+    # unset, so ddp=False and everything below is identical to single-GPU.
+    # Checked via LOCAL_RANK (not "WORLD_SIZE > 1"): a `torchrun
+    # --nproc_per_node=1` launch also sets WORLD_SIZE=1, and that single-process
+    # case still needs the ddp branch's shard-based dataset loader, which reads
+    # only the shard files --num_samples needs -- the non-ddp branch's
+    # load_dataset() loads the ENTIRE dataset unconditionally before subsetting,
+    # which OOM'd a real run against the ~295GB 50k-sample hollow_cube dataset
+    # even with --num_samples 4000 (see project_gradient_matching_loss.md).
+    ddp = "LOCAL_RANK" in os.environ
+    if ddp:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        local_rank = 0
+        rank = 0
+        world_size = 1
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    is_main = rank == 0
+    if not is_main:
+        # Silence non-main ranks -- both processes otherwise interleave
+        # identical dataset/model-setup logs into one unreadable stream.
+        import builtins
+        builtins.print = lambda *a, **kw: None
+
     use_amp = torch.cuda.is_available()
     print(f"Using device: {device}")
     print(f"[amp] bf16 autocast enabled={use_amp}")
     print(f"[gpu] torch={torch.__version__} cuda_available={torch.cuda.is_available()}")
+    print(f"[ddp] enabled={ddp} world_size={world_size}")
     if torch.cuda.is_available():
-        print(f"[gpu] device_name={torch.cuda.get_device_name(0)}")
-        print(f"[gpu] capability={torch.cuda.get_device_capability(0)}")
+        print(f"[gpu] device_name={torch.cuda.get_device_name(device)}")
+        print(f"[gpu] capability={torch.cuda.get_device_capability(device)}")
         print(f"[gpu] torch.version.cuda={torch.version.cuda}")
         print(f"[gpu] arch_list={torch.cuda.get_arch_list()}")
-
-    # ----------------------------------------------------
-    # Load dataset
-    # ----------------------------------------------------
-    # If you want to use dataset_a + dataset_b instead:
-    dataset = load_dataset(dataset_path)
 
     # Where the per-tile strut thicknesses start in the dims vector depends on
     # how the geometry encodes its grid topology:
@@ -139,123 +190,336 @@ def train_gnn_model(
     strut_offset = 0 if _fixed_dims else 3
     print(f"[strut] geometry={geometry} fixed_grid={bool(_fixed_dims)} strut_offset={strut_offset}")
 
-    for sample in dataset:
-        #convert force to MN
-        sample.x[:, 3:6] = sample.x[:, 3:6] / 1e+6
-        #convert max_stress to MPa
-        sample.max_stress = sample.max_stress / 1e+6
-        #convert ks_stress to MPa
-        sample.ks_stress = sample.ks_stress / 1e+6
-        #convert node_stress to MPa
-        sample.node_stress = sample.node_stress / 1e+6
-        # inject per-node strut dimension: dims[strut_offset + tile_idx]
-        #if hasattr(sample, 'tile_idx') and hasattr(sample, 'dims'):
-        if True:
-            K = int(sample.tile_NX) * int(sample.tile_NY) * int(sample.tile_NZ)
-            tile_struts = sample.dims[0, strut_offset:strut_offset+K].float()  # [K]
-            strut_param = tile_struts[sample.tile_idx].unsqueeze(1)
-            sample.x = torch.cat([sample.x, strut_param], dim=1)
-            # per-tile feature: one strut value per tile virtual node, shape [K, 1]
-            sample.tile_x = tile_struts.view(-1, 1)
-
-    # ----------------------------------------------------
-    # Fixed-topology exploit: attach shared graph artifacts
-    # ----------------------------------------------------
-    # For frozen-topology geometries (e.g. hollow_cube) the graph and node
-    # ordering are identical across samples, so a stable per-node id is
-    # shared. Loaded once from graph.pt and broadcast onto every sample.
-    # Absent file -> generic GNN behaviour.
     graph_path = os.path.join(os.path.dirname(dataset_path), "graph.pt")
-    num_pos_nodes = 0
+    _graph_node_id, _num_pos_nodes_from_graph = None, 0
     if os.path.exists(graph_path):
-        g = torch.load(graph_path, weights_only=False)
-        node_id = torch.arange(g["num_nodes"], dtype=torch.long)
-        num_pos_nodes = g["num_nodes"]
-        attached = 0
-        for sample in dataset:
-            if sample.x.shape[0] == num_pos_nodes:
-                sample.node_id = node_id
-                attached += 1
-        print(f"[fixed-graph] graph.pt loaded: nodes={num_pos_nodes}, "
-              f"attached to {attached}/{len(dataset)} samples")
+        _g = torch.load(graph_path, weights_only=False)
+        _graph_node_id = torch.arange(_g["num_nodes"], dtype=torch.long)
+        _num_pos_nodes_from_graph = _g["num_nodes"]
+
+    def _preprocess(sample):
+        # convert force to MN / stresses to MPa
+        sample.x[:, 3:6] = sample.x[:, 3:6] / 1e+6
+        sample.max_stress = sample.max_stress / 1e+6
+        sample.ks_stress = sample.ks_stress / 1e+6
+        sample.node_stress = sample.node_stress / 1e+6
+        if hasattr(sample, "grad_dks_dx"):
+            # Raw Pa/thickness-unit from training/dataset_builder.py's
+            # --grad_mode -> MPa/thickness-unit, matching every other stress
+            # field's unit convention in this function.
+            sample.grad_dks_dx = sample.grad_dks_dx / 1e+6
+        # inject per-node strut dimension: dims[strut_offset + tile_idx]
+        K = int(sample.tile_NX) * int(sample.tile_NY) * int(sample.tile_NZ)
+        tile_struts = sample.dims[0, strut_offset:strut_offset+K].float()
+        strut_param = tile_struts[sample.tile_idx].unsqueeze(1)
+        sample.x = torch.cat([sample.x, strut_param], dim=1)
+        sample.tile_x = tile_struts.view(-1, 1)
+        if _graph_node_id is not None and sample.x.shape[0] == _num_pos_nodes_from_graph:
+            sample.node_id = _graph_node_id
+        return sample
+
+    if ddp:
+        # ----------------------------------------------------
+        # DDP-safe loading: each rank reads only its OWN shard files off
+        # disk, never the full dataset. The naive approach (every rank calls
+        # load_dataset() then subsets in-memory) was measured at ~575GB RSS
+        # per process for the full 50k-sample hollow_cube set -- 3 ranks
+        # would need ~1.7TB, more than any node on this cluster has. Val
+        # stays on rank 0 only (matches the val_loader design above, which
+        # already only runs validation on rank 0).
+        # ----------------------------------------------------
+        dataset_dir = os.path.dirname(dataset_path)
+        all_shards = shard_paths(dataset_dir)
+        assert all_shards, f"no shards found under {dataset_dir}/shards -- DDP path requires a sharded dataset"
+
+        if num_samples is not None:
+            # Shards are named shard_{start:06d}_{end:06d}.pt, so the sample
+            # count per shard is readable from the filename without opening
+            # it. Trim the shard pool down to ~num_samples worth *before*
+            # the train/val split below, so --num_samples is honored here
+            # the same way the single-process path honors it (line ~293) --
+            # previously this branch always used every shard regardless of
+            # --num_samples, silently training on the full dataset.
+            s, e = os.path.basename(all_shards[0])[len("shard_"):-len(".pt")].split("_")
+            per_shard = int(e) - int(s) + 1
+            n_shards_needed = max(1, -(-num_samples // per_shard))  # ceil div
+            all_shards = all_shards[:n_shards_needed]
+
+        n_val_shards = max(1, int(len(all_shards) * 0.2))
+        val_shards = all_shards[-n_val_shards:]
+        train_shards_all = all_shards[:-n_val_shards]
+        my_train_shards = train_shards_all[rank::world_size]
+
+        train_set = []
+        for p in my_train_shards:
+            for sample in torch.load(p, weights_only=False):
+                _preprocess(sample)  # converts max_stress to MPa -- must run before the threshold check
+                if sample.max_stress < 3000:
+                    train_set.append(sample)
+
+        if is_main:
+            val_set = []
+            for p in val_shards:
+                for sample in torch.load(p, weights_only=False):
+                    _preprocess(sample)
+                    if sample.max_stress < 3000:
+                        val_set.append(sample)
+        else:
+            val_set = []
+
+        num_pos_nodes = _num_pos_nodes_from_graph
+        print(f"[ddp-shards] rank={rank} train_shards={len(my_train_shards)}/{len(train_shards_all)} "
+              f"local_train={len(train_set)} val_shards={len(val_shards) if is_main else 0}")
+
+        # Approx sample count across all ranks, for the printed summary only
+        # (exact global count would need an all_reduce; not worth it here).
+        num_samples = len(train_set) * world_size + len(val_shards) * 100
+        print(f"Total samples used (approx): {num_samples}")
+        print(f"Train (this rank): {len(train_set)}, Val (rank 0 only): {len(val_set) if is_main else 'n/a'}")
+
+        # Normalization stats: computed from rank 0's local train shard slice
+        # (a large, effectively-random ~1/world_size subsample -- shard order
+        # has no known correlation with sample characteristics) and broadcast
+        # to every rank, since all ranks must normalize identically.
+        if is_main:
+            import time as _time
+            _t_stats0 = _time.time()
+            stat_source = val_set if val_set else train_set
+            # Per-node/per-edge cats below are the memory-heaviest step in the
+            # whole pipeline -- concatenating ALL of train_set's x/edge_attr
+            # (48249 nodes / 865720 edges per sample) peaks at ~111GB temp
+            # RSS for a 19857-sample rank-local slice, on top of the ~287GB
+            # already held just loading train_set+val_set. That's what
+            # actually stalled job 1323092 for 4+ hours (confirmed via: zero
+            # new torch.compile cache files since job start, ruling out a
+            # compile hang; both DDP ranks in R state, consistent with rank0
+            # thrashing under memory pressure while rank1 NCCL-spins on the
+            # broadcast below waiting for it) -- this same code had only ever
+            # run before at smaller per-rank shard counts (3-way DDP splits),
+            # never at this 2-way split's ~50% larger per-rank slice. A
+            # bounded random subsample gives a statistically indistinguishable
+            # mean/std at a fraction of the memory.
+            _stats_cap = 2000
+            _stats_train = (
+                [train_set[i] for i in torch.randperm(len(train_set))[:_stats_cap].tolist()]
+                if len(train_set) > _stats_cap else train_set
+            )
+            print(f"[stats] computing normalization stats from {len(_stats_train)}/{len(train_set)} "
+                  f"train samples (capped at {_stats_cap})", flush=True)
+            # log-space now (see gnn_log_target_fn) -- graph_target_std_full
+            # feeds the "RMSE" reported below, which is therefore RMSE in
+            # log(MPa) units, not raw MPa.
+            graph_target_std_full = (torch.cat([gnn_log_target_fn(d) for d in stat_source], dim=0).float().std() + 1e-8)
+            all_targets = torch.cat([gnn_log_target_fn(d) for d in _stats_train], dim=0).float()
+            all_node_targets = torch.cat([gnn_node_target_fn(d) for d in _stats_train], dim=0).float()
+            all_x = torch.cat([d.x for d in _stats_train], dim=0).float()
+            all_edge_attr = torch.cat([d.edge_attr for d in _stats_train], dim=0).float()
+            print(f"[stats] done in {_time.time() - _t_stats0:.1f}s", flush=True)
+            stats = torch.cat([
+                all_targets.mean(dim=0), all_targets.std(dim=0) + 1e-8,
+                all_node_targets.mean(dim=0), all_node_targets.std(dim=0) + 1e-8,
+                all_x.mean(dim=0), all_x.std(dim=0) + 1e-8,
+                all_edge_attr.mean(dim=0), all_edge_attr.std(dim=0) + 1e-8,
+                graph_target_std_full.view(1),
+            ]).to(device)
+            stats_len = torch.tensor([stats.numel()], device=device)
+        else:
+            stats_len = torch.tensor([0], device=device)
+        dist.broadcast(stats_len, src=0)
+        if not is_main:
+            stats = torch.zeros(int(stats_len.item()), device=device)
+        dist.broadcast(stats, src=0)
+
+        # target_mean/std and node_target_mean/std are width-1 (both gnn_target_fn
+        # and gnn_node_target_fn always return a single scalar per node/graph).
+        # Every slice below is .clone()'d so each stat is its own independent
+        # tensor/storage/autograd-version-counter -- without this they're all
+        # views sharing `stats`'s single storage, so an in-place write to ANY
+        # of them (or to `stats` itself) bumps every other slice's version
+        # counter too. That's invisible with one forward/backward per step,
+        # but the grad-matching loss's second forward (see grad_iter below)
+        # reads x_mean/x_std in a second autograd graph before the first
+        # graph's backward runs, and DDP's own per-step buffer bookkeeping
+        # was enough to trip a "modified by an inplace operation" version
+        # mismatch on the shared storage (confirmed via a 2-GPU smoke test:
+        # error persisted even with static_graph=True, which rules out a
+        # pure DDP-bucketing explanation and points at this aliasing).
+        i = 0
+        target_mean = stats[i:i+1].clone(); i += 1
+        target_std  = stats[i:i+1].clone(); i += 1
+        node_target_mean = stats[i:i+1].clone(); i += 1
+        node_target_std  = stats[i:i+1].clone(); i += 1
+        node_in_dim_probe = train_set[0].x.shape[1] if train_set else val_set[0].x.shape[1]
+        x_mean = stats[i:i+node_in_dim_probe].clone(); i += node_in_dim_probe
+        x_std  = stats[i:i+node_in_dim_probe].clone(); i += node_in_dim_probe
+        edge_in_dim_probe = train_set[0].edge_attr.shape[1] if train_set else val_set[0].edge_attr.shape[1]
+        edge_mean = stats[i:i+edge_in_dim_probe].clone(); i += edge_in_dim_probe
+        edge_std  = stats[i:i+edge_in_dim_probe].clone(); i += edge_in_dim_probe
+        graph_target_std_full = stats[i:i+1].clone(); i += 1  # kept as a tensor -- .item() called at each use site, matching the non-ddp path
+
+        print("Target mean (log MPa):", target_mean.detach().cpu().numpy())
+        print("Target std (log MPa):", target_std.detach().cpu().numpy())
+        print("Node target mean (linear MPa):", node_target_mean.detach().cpu().numpy())
+        print("Node target std (linear MPa):", node_target_std.detach().cpu().numpy())
     else:
-        print(f"[fixed-graph] no graph.pt at {graph_path}; using generic GNN")
+        # ----------------------------------------------------
+        # Single-process loading: unchanged from before.
+        # ----------------------------------------------------
+        dataset = load_dataset(dataset_path)
+        for sample in dataset:
+            _preprocess(sample)
+        num_pos_nodes = _num_pos_nodes_from_graph
+        if num_pos_nodes:
+            attached = sum(1 for d in dataset if hasattr(d, "node_id"))
+            print(f"[fixed-graph] graph.pt loaded: nodes={num_pos_nodes}, "
+                  f"attached to {attached}/{len(dataset)} samples")
+        else:
+            print(f"[fixed-graph] no graph.pt at {graph_path}; using generic GNN")
 
-    cleaned_dataset = []
-    for data in dataset:
-        if data.max_stress < 100000:
-            cleaned_dataset.append(data)
-    dataset = cleaned_dataset
+        cleaned_dataset = [d for d in dataset if d.max_stress < 3000]
+        dataset = cleaned_dataset
 
-    num_samples = min(num_samples, len(dataset))
-    print(f"Dataset size after cleaning: {len(dataset)}")
+        num_samples = min(num_samples, len(dataset))
+        print(f"Dataset size after cleaning: {len(dataset)}")
 
-    all_graph_targets_full = torch.cat([gnn_target_fn(d) for d in dataset], dim=0).float()
-    graph_target_mean_full = all_graph_targets_full.mean()
-    graph_target_std_full  = all_graph_targets_full.std() + 1e-8
-    print(f"Dataset ks_stress mean: {graph_target_mean_full.item():.4f} MPa")
-    print(f"Dataset ks_stress std:  {graph_target_std_full.item():.4f} MPa")
+        # log-space (see gnn_log_target_fn) -- graph_target_std_full feeds the
+        # "RMSE" reported below, which is therefore RMSE in log(MPa), not raw MPa.
+        all_graph_targets_full = torch.cat([gnn_log_target_fn(d) for d in dataset], dim=0).float()
+        graph_target_mean_full = all_graph_targets_full.mean()
+        graph_target_std_full  = all_graph_targets_full.std() + 1e-8
+        print(f"Dataset ks_stress mean: {graph_target_mean_full.item():.4f} (log MPa)")
+        print(f"Dataset ks_stress std:  {graph_target_std_full.item():.4f} (log MPa)")
 
-    total_samples = len(dataset)
-    if num_samples is None or num_samples > total_samples:
-        num_samples = total_samples
+        total_samples = len(dataset)
+        if num_samples is None or num_samples > total_samples:
+            num_samples = total_samples
 
+        # Random train/val split (instead of slicing in order)
+        indices = torch.randperm(total_samples)[:num_samples]
+        n_train = int(num_samples * 0.8)
+        train_idx = indices[:n_train]
+        val_idx   = indices[n_train:]
+        train_set = [dataset[i] for i in train_idx]
+        val_set   = [dataset[i] for i in val_idx]
 
-    # ----------------------------------------------------
-    # Random train/val split (instead of slicing in order)
-    # ----------------------------------------------------
-    indices = torch.randperm(total_samples)[:num_samples]
-    n_train = int(num_samples * 0.8)
+        print(f"Total samples used: {num_samples}")
+        print(f"Train: {len(train_set)}, Val: {len(val_set)}")
 
-    train_idx = indices[:n_train]
-    val_idx   = indices[n_train:]    
+        # Compute normalization stats on TRAIN ONLY (log-space for the graph
+        # target -- see gnn_log_target_fn)
+        all_targets = torch.cat([gnn_log_target_fn(d) for d in train_set], dim=0).float()
+        target_mean = all_targets.mean(dim=0).to(device)
+        target_std  = (all_targets.std(dim=0) + 1e-8).to(device)
 
-    train_set = [dataset[i] for i in train_idx]
-    val_set   = [dataset[i] for i in val_idx]
+        all_node_targets = torch.cat([gnn_node_target_fn(d) for d in train_set], dim=0).float()
+        node_target_mean = all_node_targets.mean(dim=0).to(device)
+        node_target_std  = (all_node_targets.std(dim=0) + 1e-8).to(device)
 
-    print(f"Total samples used: {num_samples}")
-    print(f"Train: {len(train_set)}, Val: {len(val_set)}")
+        all_x = torch.cat([d.x for d in train_set], dim=0).float()
+        x_mean = all_x.mean(dim=0).to(device)
+        x_std  = (all_x.std(dim=0) + 1e-8).to(device)
 
-    # ----------------------------------------------------
-    # Compute normalization stats on TRAIN ONLY
-    # ----------------------------------------------------
-    all_targets = torch.cat([gnn_target_fn(d) for d in train_set], dim=0).float()
-    target_mean = all_targets.mean(dim=0).to(device)
-    target_std  = (all_targets.std(dim=0) + 1e-8).to(device)
+        all_edge_attr = torch.cat([d.edge_attr for d in train_set], dim=0).float()
+        edge_mean = all_edge_attr.mean(dim=0).to(device)
+        edge_std  = (all_edge_attr.std(dim=0) + 1e-8).to(device)
 
-    all_node_targets = torch.cat([gnn_node_target_fn(d) for d in train_set], dim=0).float()
-    node_target_mean = all_node_targets.mean(dim=0).to(device)
-    node_target_std  = (all_node_targets.std(dim=0) + 1e-8).to(device)
-
-
-    all_x = torch.cat([d.x for d in train_set], dim=0).float()
-    x_mean = all_x.mean(dim=0).to(device)
-    x_std  = (all_x.std(dim=0) + 1e-8).to(device)
-
-    all_edge_attr = torch.cat([d.edge_attr for d in train_set], dim=0).float()
-    edge_mean = all_edge_attr.mean(dim=0).to(device)
-    edge_std  = (all_edge_attr.std(dim=0) + 1e-8).to(device)
-
-    print("Target mean:", target_mean.detach().cpu().numpy())
-    print("Target std:", target_std.detach().cpu().numpy())
-    print("Node target mean:", node_target_mean.detach().cpu().numpy())
-    print("Node target std:", node_target_std.detach().cpu().numpy())
-    print("X mean:", x_mean.detach().cpu().numpy())
-    print("X std:", x_std.detach().cpu().numpy())
-    print("Edge mean:", edge_mean.detach().cpu().numpy())
-    print("Edge std:", edge_std.detach().cpu().numpy())
-
-    
+        print("Target mean (log MPa):", target_mean.detach().cpu().numpy())
+        print("Target std (log MPa):", target_std.detach().cpu().numpy())
+        print("Node target mean (linear MPa):", node_target_mean.detach().cpu().numpy())
+        print("Node target std (linear MPa):", node_target_std.detach().cpu().numpy())
+        print("X mean:", x_mean.detach().cpu().numpy())
+        print("X std:", x_std.detach().cpu().numpy())
+        print("Edge mean:", edge_mean.detach().cpu().numpy())
+        print("Edge std:", edge_std.detach().cpu().numpy())
 
     # ----------------------------------------------------
     # DataLoaders
     # ----------------------------------------------------
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                              num_workers=8, persistent_workers=True, pin_memory=True,
-                              prefetch_factor=4)
-    val_loader   = DataLoader(val_set, batch_size=batch_size, shuffle=False,
-                              num_workers=4, persistent_workers=True, pin_memory=True,
-                              prefetch_factor=4)
+    if ddp:
+        # train_set is already THIS rank's own shard slice (see the ddp
+        # loading branch above) -- no DistributedSampler here, that would
+        # re-partition an already-rank-local list by rank/world_size again
+        # (net effect: each rank training on ~1/world_size^2 of the data).
+        # Per-epoch reshuffling instead comes from shuffle=True picking up
+        # the torch.manual_seed(seed_offset+epoch) reseed already done at the
+        # top of the epoch loop, same mechanism the non-ddp path relies on.
+        #
+        # Shard counts don't divide evenly across ranks (e.g. 400 shards /
+        # 3 ranks = 134/133/133), so local sample counts can differ slightly.
+        # DDP's backward-time gradient all-reduce is a collective op -- if
+        # ranks ran different step counts, the rank that finishes first would
+        # block forever waiting on a collective the others never issue
+        # (deadlock). Truncate every rank to the global minimum so step
+        # counts match exactly.
+        local_n = torch.tensor([len(train_set)], device=device)
+        dist.all_reduce(local_n, op=dist.ReduceOp.MIN)
+        train_set = train_set[:int(local_n.item())]
+        train_sampler = None
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
+                                  num_workers=4, persistent_workers=True, pin_memory=True,
+                                  prefetch_factor=4)
+    else:
+        train_sampler = None
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
+                                  num_workers=8, persistent_workers=True, pin_memory=True,
+                                  prefetch_factor=4)
+    # Validation only runs on rank 0, against the full (unsharded) val_set --
+    # it's a forward-only pass (no .backward()), so DDP's collective gradient
+    # sync never triggers and other ranks don't need to participate at all.
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
+                            num_workers=4, persistent_workers=True, pin_memory=True,
+                            prefetch_factor=4) if is_main else None
+
+    # ----------------------------------------------------
+    # Gradient-matching dataset (optional) -- ground-truth per-tile FD
+    # sensitivity labels from training/dataset_builder.py's --grad_mode
+    # (base ccx run + N single-tile-perturbed reruns, FD'd against the real
+    # solver). Kept in its own dataset/DataLoader, never merged into
+    # train_set/val_set: PyG's Batch collation decides which attrs to batch
+    # from only the FIRST sample in a batch, so a shuffled loader mixing
+    # labeled/unlabeled samples either crashes or silently drops the field
+    # depending on shuffle order. Loaded in full on every rank (DDP or not)
+    # -- it's small by construction (each sample costs M+1 real FEA solves
+    # to build), so no sharding is needed the way the (much larger) main
+    # dataset requires under DDP.
+    # ----------------------------------------------------
+    grad_loader = None
+    grad_M = 0
+    grad_target_scale = None
+    K_tiles = 0
+    if grad_dataset_path:
+        grad_dataset = load_dataset(grad_dataset_path)
+        for sample in grad_dataset:
+            _preprocess(sample)
+        assert grad_dataset and hasattr(grad_dataset[0], "grad_tile_idx"), (
+            f"{grad_dataset_path} has no grad_tile_idx/grad_dks_dx samples -- build it with "
+            f"training/dataset_builder.py --grad_mode true (or jobs/build_grad_dataset_hollow_cube.slurm)"
+        )
+        grad_M = int(grad_dataset[0].grad_tile_idx.shape[0])
+        K_tiles = int(grad_dataset[0].tile_NX) * int(grad_dataset[0].tile_NY) * int(grad_dataset[0].tile_NZ)
+        all_grad_dks_dx = torch.cat([d.grad_dks_dx for d in grad_dataset]).float()
+        # Scale for the signed-log loss below -- mean |true sensitivity|,
+        # not std, since dg/dx is already known to be extremely heavy-tailed
+        # (see project_surrogate_sensitivity_vs_value_gap.md) and this value
+        # only sets where log1p's compression kicks in, not a normalization
+        # that needs to be unbiased.
+        grad_target_scale = (all_grad_dks_dx.abs().mean() + 1e-8).to(device)
+        print(f"[grad-loss] rank={rank} {len(grad_dataset)} samples, M={grad_M} tiles/sample, "
+              f"K_tiles={K_tiles}, mean|dks/dx| scale={grad_target_scale.item():.4f} MPa/unit")
+        grad_loader = DataLoader(grad_dataset, batch_size=(grad_batch_size or batch_size),
+                                 shuffle=True, num_workers=2, persistent_workers=True,
+                                 pin_memory=True)
+
+    def _cycle(loader):
+        # Plain re-iteration (fresh shuffle each pass since shuffle=True)
+        # instead of itertools.cycle, which would cache every yielded batch
+        # forever just to replay it -- needless duplication of an already
+        # in-memory dataset.
+        while True:
+            for b in loader:
+                yield b
+
+    grad_iter = _cycle(grad_loader) if grad_loader is not None else None
 
     # ----------------------------------------------------
     # Model setup
@@ -266,9 +530,10 @@ def train_gnn_model(
     out_dim     = gnn_target_fn(example).shape[1]
 
     hierarchical = hasattr(train_set[0], 'tile_idx')
-    assert coarse_arch in ("transformer", "gnn"), coarse_arch
+    assert coarse_arch in ("transformer", "gnn", "cnn"), coarse_arch
     if hierarchical:
-        ModelClass = HierarchicalGNN if coarse_arch == "transformer" else HierarchicalGNNMP
+        ModelClass = {"transformer": HierarchicalGNN, "gnn": HierarchicalGNNMP,
+                      "cnn": HierarchicalGNNCNN}[coarse_arch]
     else:
         ModelClass = GNN
     num_pos_nodes = num_pos_nodes if use_node_emb else 0
@@ -290,9 +555,13 @@ def train_gnn_model(
             model_kwargs["transformer_heads"] = transformer_heads
             model_kwargs["transformer_ff_mult"] = transformer_ff_mult
             model_kwargs["transformer_dropout"] = transformer_dropout
-        else:
+        elif coarse_arch == "gnn":
             model_kwargs["dropout"] = mp_dropout
             model_kwargs["coarse_dim"] = coarse_dim
+        else:  # cnn
+            model_kwargs["dropout"] = mp_dropout
+            model_kwargs["coarse_dim"] = coarse_dim
+            model_kwargs["cnn_depth"] = cnn_depth
     raw_model = ModelClass(**model_kwargs).to(device)
     if hierarchical:
         # Fixed-topology: the tile grid never changes during a training run,
@@ -309,9 +578,84 @@ def train_gnn_model(
     # raw_model.state_dict(), since OptimizedModule.state_dict() prefixes keys
     # with "_orig_mod." and would otherwise break gnn_evaluator.py / resume,
     # which load into a plain (uncompiled) module.
+    # Compile first, then DDP-wrap the compiled module (the reverse order
+    # doesn't work: DDP's parameter hooks need to see the real params, not a
+    # compiled wrapper). --use_compile true remains the operator's call on
+    # whether the coarse_arch in use is compile-safe (transformer's coarse
+    # self-attention crashes under torch.compile independent of ddp -- see
+    # jobs/train_model.slurm; gnn coarse arch is unaffected).
     compiled = use_compile and torch.cuda.is_available()
+    if compiled and ddp:
+        # Dynamo's DDPOptimizer graph-splitting pass can't handle the
+        # higher-order op torch.utils.checkpoint introduces (use_checkpoint
+        # True here) -- crashes every rank with "Found a higher order op in
+        # the graph". Falls back to one compiled bucket for the whole graph
+        # instead of DDP-bucket-aligned splitting; costs some overlap between
+        # backward and gradient all-reduce, but is required for compile to
+        # work at all under DDP+checkpointing.
+        #
+        # Tried instead: wrapping each checkpoint() *call site* in
+        # utils/gnn_hierarchical_mp.py with @torch._dynamo.disable, so the
+        # higher-order op never enters the traced graph and DDPOptimizer can
+        # bucket normally. Confirmed it doesn't crash and VRAM stays in
+        # budget (39/41GB peak/reserved on a 2-GPU probe) -- but it's a real
+        # throughput *regression*: ~4.3-4.4s/step vs ~1.2-1.5s/step baseline
+        # (2-GPU decoy probe, jobs/train_model_gnn_probe2gpu.slurm), roughly
+        # 3x slower. The graph breaks apparently cost far more (recompile/
+        # dispatch overhead at each of the 4 break points, every step, every
+        # rank) than the bucketing they were meant to restore. Reverted --
+        # don't retry this approach without a different mechanism.
+        torch._dynamo.config.optimize_ddp = False
     model = torch.compile(raw_model) if compiled else raw_model
+    if ddp:
+        # find_unused_parameters=True is needed for HierarchicalGNN
+        # (transformer coarse_arch): tile_input_encoder is only exercised
+        # when tile_x is not None, so it's not guaranteed to appear in every
+        # step's graph, which without this trips DDP's "did not receive
+        # grad" desync check. HierarchicalGNNMP (gnn coarse_arch) has no such
+        # conditionally-used params -- confirmed by DDP's own runtime check
+        # ("did not find any unused parameters") on every gnn-arch run so
+        # far -- so leaving it True there only pays for an extra full
+        # autograd-graph traversal every step with no benefit. HierarchicalGNNCNN
+        # (cnn coarse_arch) has its own always-dead params on fixed-tile-grid
+        # geometries (global_emb/tile_global_edge_attr/global_proj_fallback,
+        # only exercised on the no-tile-grid fallback path), which crashed a
+        # 2-GPU cnn run (job 1318900) with "Expected to have finished
+        # reduction..." until this was added -- also needs True.
+        model = DDP(model, device_ids=[local_rank],
+                    find_unused_parameters=(coarse_arch in ("transformer", "cnn")),
+                    # static_graph=True whenever grad_dataset_path is set: the
+                    # grad-loss block calls model(...) a SECOND time (grad
+                    # batch) before the single combined loss.backward(), and
+                    # PyTorch's own DDP docs list "multiple forward calls in
+                    # one iteration" as a static_graph use case (same ops run
+                    # every step here, so it's safe). Left off by default
+                    # (only one forward/step normally -- no need to pay the
+                    # first-few-iteration graph-capture cost).
+                    static_graph=(grad_dataset_path is not None),
+                    # broadcast_buffers=False whenever grad_dataset_path is
+                    # set: DDP's default (True) re-copies every registered
+                    # buffer -- including the model's node_target_mean/
+                    # node_target_std (utils/gnn_surrogate.py's
+                    # register_buffer(..., persistent=False)) -- in place, at
+                    # the START of every forward() call. Those buffers
+                    # participate in the model's own autograd graph (they
+                    # denormalize node_pred internally), so calling forward()
+                    # twice per iteration means the grad batch's forward
+                    # re-copies the buffer in place *after* the main batch's
+                    # forward already recorded a dependency on its
+                    # pre-copy version -- autograd then refuses the later
+                    # combined backward() with "modified by an inplace
+                    # operation" (confirmed via a 2-GPU smoke test: this,
+                    # not the multi-forward bucketing static_graph addresses,
+                    # was the actual cause). Safe to disable here: these
+                    # buffers are set once at model construction from stats
+                    # already broadcast-synced across ranks and never change
+                    # during training, so the redundant per-forward re-copy
+                    # was doing nothing useful even before this bug.
+                    broadcast_buffers=(grad_dataset_path is None))
     print(f"[compile] torch.compile enabled={compiled}")
+    print(f"[ddp] model wrapped={ddp}")
 
     optimizer = torch.optim.AdamW(raw_model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn   = torch.nn.MSELoss()
@@ -322,6 +666,7 @@ def train_gnn_model(
     val_graph_losses   = []
     train_node_losses  = []
     val_node_losses    = []
+    train_grad_losses  = []  # gradient-matching loss (train-only, see grad_iter above)
 
     # ----------------------------------------------------
     # Resume from latest checkpoint if available
@@ -335,6 +680,23 @@ def train_gnn_model(
         print(f"Resuming from checkpoint: {latest_ckpt} (epoch {start_epoch})")
         ckpt = torch.load(latest_ckpt, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model_state"])
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+        else:
+            print("[resume] checkpoint has no optimizer_state (pre-fix checkpoint) -- "
+                  "AdamW moments restart from zero, expect a small loss jump")
+
+        if resume_lr_scale is not None:
+            # optimizer.load_state_dict() above restored the checkpoint's own
+            # lr, so a plain --lr on the CLI would otherwise be silently
+            # discarded. This multiplies the restored lr by resume_lr_scale
+            # once, on top of which the per-epoch decay/plateau-halving below
+            # continues to apply as normal (no cosine schedule/T_max involved).
+            resumed_lr = optimizer.param_groups[0]["lr"]
+            for pg in optimizer.param_groups:
+                pg["lr"] = pg["lr"] * resume_lr_scale
+            print(f"[resume] lr scale requested -> x{resume_lr_scale}, "
+                  f"{resumed_lr:.2e} -> {optimizer.param_groups[0]['lr']:.2e}")
 
         losses_path = os.path.join(run_dir, "losses.json")
         if os.path.exists(losses_path):
@@ -346,20 +708,32 @@ def train_gnn_model(
             val_graph_losses   = prev.get("val_graph_losses", [])[:start_epoch]
             train_node_losses  = prev.get("train_node_losses", [])[:start_epoch]
             val_node_losses    = prev.get("val_node_losses", [])[:start_epoch]
+            train_grad_losses  = prev.get("train_grad_losses", [])[:start_epoch]
 
     # Best-checkpoint tracking (by val ks_stress/graph loss) -- recovered from
     # the resumed loss history so a resumed run doesn't reset "best" and
     # clobber gnn_surrogate.pt with a worse checkpoint before catching back up.
     best_val_graph_loss = min(val_graph_losses) if val_graph_losses else float("inf")
+    # LR-plateau signal uses *training* loss, not val graph loss -- the latter
+    # is noisy epoch-to-epoch (small val-batch KS/max-stress estimate), which
+    # made the plateau trigger fire on noise rather than genuine stalling.
+    best_train_loss = min(train_losses) if train_losses else float("inf")
+    # Epochs since the last training-loss improvement, recovered from history
+    # so a resumed run doesn't reset the plateau-halving countdown to 0.
+    epochs_since_improve = (
+        (len(train_losses) - 1 - train_losses.index(best_train_loss))
+        if train_losses else 0
+    )
     surrogate_path = f"data/{geometry}/gnn_surrogate.pt"
 
-    def _build_ckpt():
-        return {
+    def _build_ckpt(include_optimizer=False):
+        ckpt = {
             "model_state": raw_model.state_dict(),
             "node_in_dim": node_in_dim,
             "edge_in_dim": edge_in_dim,
             "hidden_dim": hidden_dim,
-            "coarse_dim": raw_model.coarse_dim if hierarchical and coarse_arch == "gnn" else None,
+            "coarse_dim": raw_model.coarse_dim if hierarchical and coarse_arch in ("gnn", "cnn") else None,
+            "cnn_depth": cnn_depth if hierarchical and coarse_arch == "cnn" else None,
             "conv_layers": conv_layers,
             "out_dim": out_dim,
             "hierarchical": hierarchical,
@@ -368,6 +742,18 @@ def train_gnn_model(
             "transformer_heads": transformer_heads,
             "transformer_ff_mult": transformer_ff_mult,
             "stress_ks_rho_mpa": stress_ks_rho_mpa,
+            # target_mean/std are log-space (see gnn_log_target_fn) -- used
+            # ONLY inside this file's graph_loss computation, to weight
+            # errors evenly across magnitude scales instead of a few extreme
+            # samples dominating a linear MSE. They do NOT change what
+            # graph_pred represents at inference: ks_pool always denormalizes
+            # graph_pred to raw linear MPa via node_target_mean/std (which
+            # stay linear -- required for ks_pool's physics), and log is
+            # monotonic, so the optimum graph_pred is still the true raw
+            # ks_stress either way. Evaluators (gnn_evaluator.py) correctly
+            # never read target_mean/std at all -- purely a training-time
+            # loss-weighting artifact, kept here just for inspection.
+            "graph_target_log_normalized": True,
             "target_mean": target_mean.detach().cpu(),
             "target_std": target_std.detach().cpu(),
             "node_target_mean": node_target_mean.detach().cpu(),
@@ -377,23 +763,19 @@ def train_gnn_model(
             "edge_mean": edge_mean.detach().cpu(),
             "edge_std": edge_std.detach().cpu(),
         }
+        if include_optimizer:
+            ckpt["optimizer_state"] = optimizer.state_dict()
+        return ckpt
 
-    if start_epoch > 0:
-        for pg in optimizer.param_groups:
-            pg.setdefault("initial_lr", pg["lr"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=epochs,
-        eta_min=lr * 0.01,
-        last_epoch=start_epoch - 1
-    )
 
     # ======================================================
     # Training Loop
     # ======================================================
     for epoch in range(start_epoch + 1, epochs + 1):
         # re-seed per epoch so resumed runs don't replay the same batch order
-        torch.manual_seed(42 + epoch)
+        # (also what reshuffles the ddp path's plain shuffle=True loader --
+        # no DistributedSampler.set_epoch() needed since there isn't one)
+        torch.manual_seed(seed_offset + epoch)
         epoch_t0 = time.time()
 
         # -----------------------------
@@ -403,6 +785,7 @@ def train_gnn_model(
         total_train = 0.0
         total_train_graph = 0.0
         total_train_node  = 0.0
+        total_train_grad  = 0.0
 
         # Per-section timing (only collected on epoch 1 to keep overhead off the steady state).
         profile_this_epoch = (epoch == start_epoch + 1)
@@ -445,8 +828,8 @@ def train_gnn_model(
             x_norm = (x - x_mean) / x_std
             edge_attr_norm = (edge_attr - edge_mean) / edge_std
 
-            targ = gnn_target_fn(batch_data).float().to(device, non_blocking=True)
-            targ_norm = (targ - target_mean) / target_std
+            targ_log = torch.log(gnn_target_fn(batch_data).float().to(device, non_blocking=True).clamp_min(LOG_STRESS_EPS))
+            targ_norm = (targ_log - target_mean) / target_std
             node_targ = gnn_node_target_fn(batch_data).float().to(device, non_blocking=True)
             node_targ_norm = (node_targ - node_target_mean) / node_target_std
             if profile_this_epoch:
@@ -458,12 +841,77 @@ def train_gnn_model(
                     tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
                     tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
                 )
-                # graph_pred = global_max_pool(node_pred, batch) lives in node-normalized
-                # space, so convert it to graph-target-normalized space before comparing.
-                graph_pred_target_norm = (graph_pred * node_target_std + node_target_mean - target_mean) / target_std
+                # graph_pred lives in node-normalized space (see ks_pool) --
+                # de-normalize to raw linear MPa (unchanged, must stay linear
+                # to match ks_pool's physics), then log+normalize to compare
+                # against targ_norm (graph target is log-normalized above).
+                graph_pred_raw_mpa = (graph_pred * node_target_std + node_target_mean).clamp_min(LOG_STRESS_EPS)
+                graph_pred_target_norm = (torch.log(graph_pred_raw_mpa) - target_mean) / target_std
                 graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
                 node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx, stress_weight_power)
                 loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
+
+            grad_loss = None
+            if grad_iter is not None:
+                # Gradient-matching (Sobolev) loss: penalize the surrogate's
+                # own autodiff sensitivity d(ks_stress)/d(tile thickness) for
+                # deviating from the ground-truth FD sensitivity computed on
+                # the real solver (see training/dataset_builder.py's
+                # --grad_mode). Folded into the SAME combined `loss` below,
+                # backed by a single outer loss.backward() call -- this
+                # "inner autograd.grad(create_graph=True), then one outer
+                # backward()" is the standard DDP-safe Sobolev/gradient-
+                # penalty pattern: DDP's gradient-sync hooks only fire on the
+                # actual .backward() call, not on the plain autograd.grad()
+                # call below, so no extra DDP handling is needed.
+                gbatch = next(grad_iter)
+                (g_x, g_edge_index, g_edge_attr, g_batch_idx, g_tile_idx, g_tile_NX,
+                 g_tile_NY, g_tile_NZ, g_tile_x, g_node_id) = gnn_input_fn(gbatch)
+                g_num_graphs = gbatch.num_graphs
+                g_x = g_x.float().to(device, non_blocking=True)
+                g_edge_index = g_edge_index.to(device, non_blocking=True)
+                g_edge_attr  = g_edge_attr.float().to(device, non_blocking=True)
+                g_batch_idx  = g_batch_idx.to(device, non_blocking=True)
+                g_tile_idx   = g_tile_idx.to(device, non_blocking=True)
+                g_tile_x     = g_tile_x.float().to(device, non_blocking=True)
+                if g_node_id is not None:
+                    g_node_id = g_node_id.to(device, non_blocking=True)
+                g_grad_tile_idx = gbatch.grad_tile_idx.to(device, non_blocking=True).view(g_num_graphs, grad_M)
+                g_grad_dks_dx = gbatch.grad_dks_dx.float().to(device, non_blocking=True).view(g_num_graphs, grad_M)
+
+                # Shared differentiable leaf: strut thickness enters the
+                # model via BOTH the appended x column (fine mesh, see
+                # _preprocess) and tile_x (coarse embedding) -- rebuilding
+                # both from one leaf is required so the sensitivity captures
+                # both paths, not just tile_x's.
+                t_leaf = g_tile_x.detach().clone().requires_grad_(True)  # [g_num_graphs*K_tiles, 1]
+                node_strut = t_leaf.view(g_num_graphs, K_tiles)[g_batch_idx, g_tile_idx].unsqueeze(1)
+                g_x_grad = torch.cat([g_x[:, :-1], node_strut], dim=1)
+                g_x_norm = (g_x_grad - x_mean) / x_std
+                g_edge_attr_norm = (g_edge_attr - edge_mean) / edge_std
+
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    g_graph_pred, _ = model(
+                        g_x_norm, g_edge_index, g_edge_attr_norm, g_batch_idx,
+                        tile_idx=g_tile_idx, tile_NX=g_tile_NX, tile_NY=g_tile_NY, tile_NZ=g_tile_NZ,
+                        tile_x=t_leaf, num_graphs=g_num_graphs, node_id=g_node_id,
+                    )
+                    g_graph_pred_raw_mpa = (g_graph_pred * node_target_std + node_target_mean).clamp_min(LOG_STRESS_EPS)
+
+                d_pred = torch.autograd.grad(
+                    g_graph_pred_raw_mpa.float().sum(), t_leaf, create_graph=True, retain_graph=True,
+                )[0].view(g_num_graphs, K_tiles)
+                pred_grad_at_tiles = torch.gather(d_pred, 1, g_grad_tile_idx)
+
+                # Signed-log MSE: robust to the extreme dynamic range and
+                # sign flips already observed in FD sensitivities (see
+                # project_surrogate_sensitivity_vs_value_gap.md) -- a plain
+                # MSE would be dominated by the largest-magnitude tiles.
+                def _slog(v):
+                    return torch.sign(v) * torch.log1p(v.abs() / grad_target_scale)
+                grad_loss = loss_fn(_slog(pred_grad_at_tiles), _slog(g_grad_dks_dx))
+                loss = loss + grad_loss_weight * grad_loss
+
             if profile_this_epoch:
                 _sync(); t_now = time.perf_counter(); t_fwd += t_now - t_mark; t_mark = t_now
 
@@ -479,6 +927,8 @@ def train_gnn_model(
             total_train       += loss.item()
             total_train_graph += graph_loss.item()
             total_train_node  += node_loss.item()
+            if grad_loss is not None:
+                total_train_grad += grad_loss.item()
             n_steps += 1
 
         if profile_this_epoch and n_steps > 0:
@@ -496,9 +946,11 @@ def train_gnn_model(
         avg_train       = total_train       / n_train_batches
         avg_train_graph = total_train_graph / n_train_batches
         avg_train_node  = total_train_node  / n_train_batches
+        avg_train_grad  = total_train_grad  / n_train_batches
         train_losses.append(avg_train)
         train_graph_losses.append(avg_train_graph)
         train_node_losses.append(avg_train_node)
+        train_grad_losses.append(avg_train_grad)
 
         if torch.cuda.is_available():
             peak = torch.cuda.max_memory_allocated() / 1e9
@@ -507,106 +959,163 @@ def train_gnn_model(
             torch.cuda.reset_peak_memory_stats()
 
         # -----------------------------
-        # VALIDATION
+        # VALIDATION (rank 0 only). Forward-only, so no *gradient* sync is
+        # needed -- but calling the DDP-wrapped `model` here would still be
+        # wrong: DDP.forward() unconditionally does its own internal buffer-
+        # sync broadcast collective whenever require_forward_param_sync is
+        # set (which it is, left True by the training loop's last step),
+        # regardless of torch.no_grad(). Since only rank 0 reaches this
+        # forward, that stray broadcast has no matching call on the other
+        # ranks and collides with whatever collective they call next (was
+        # silently corrupting the LR-decay broadcast below on ranks>0, then
+        # cascading into a real hang by epoch 2 -- see
+        # TORCH_DISTRIBUTED_DEBUG=DETAIL trace, job 1299063). Call the bare
+        # module (bypassing DDP.forward()) to avoid triggering it.
         # -----------------------------
-        model.eval()
-        total_val = 0.0
-        total_val_graph = 0.0
-        total_val_node  = 0.0
+        eval_model = model.module if ddp else model
+        if is_main:
+            eval_model.eval()
+            total_val = 0.0
+            total_val_graph = 0.0
+            total_val_node  = 0.0
 
-        with torch.no_grad():
-            for batch_data in val_loader:
-                x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, node_id = gnn_input_fn(batch_data)
-                num_graphs = batch_data.num_graphs
-                x = x.float().to(device, non_blocking=True)
-                edge_index = edge_index.to(device, non_blocking=True)
-                edge_attr  = edge_attr.float().to(device, non_blocking=True)
-                batch_idx  = batch_idx.to(device, non_blocking=True)
-                if tile_idx is not None:
-                    tile_idx = tile_idx.to(device, non_blocking=True)
-                    # tile_NX/NY/NZ are already plain Python ints (see gnn_input_fn)
-                if tile_x is not None:
-                    tile_x = tile_x.float().to(device, non_blocking=True)
-                if node_id is not None:
-                    node_id = node_id.to(device, non_blocking=True)
+            with torch.no_grad():
+                for batch_data in val_loader:
+                    x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, node_id = gnn_input_fn(batch_data)
+                    num_graphs = batch_data.num_graphs
+                    x = x.float().to(device, non_blocking=True)
+                    edge_index = edge_index.to(device, non_blocking=True)
+                    edge_attr  = edge_attr.float().to(device, non_blocking=True)
+                    batch_idx  = batch_idx.to(device, non_blocking=True)
+                    if tile_idx is not None:
+                        tile_idx = tile_idx.to(device, non_blocking=True)
+                        # tile_NX/NY/NZ are already plain Python ints (see gnn_input_fn)
+                    if tile_x is not None:
+                        tile_x = tile_x.float().to(device, non_blocking=True)
+                    if node_id is not None:
+                        node_id = node_id.to(device, non_blocking=True)
 
-                x_norm = (x - x_mean) / x_std
-                edge_attr_norm = (edge_attr - edge_mean) / edge_std
+                    x_norm = (x - x_mean) / x_std
+                    edge_attr_norm = (edge_attr - edge_mean) / edge_std
 
-                targ = gnn_target_fn(batch_data).float().to(device, non_blocking=True)
-                targ_norm = (targ - target_mean) / target_std
+                    targ_log = torch.log(gnn_target_fn(batch_data).float().to(device, non_blocking=True).clamp_min(LOG_STRESS_EPS))
+                    targ_norm = (targ_log - target_mean) / target_std
 
-                node_targ = gnn_node_target_fn(batch_data).float().to(device, non_blocking=True)
-                node_targ_norm = (node_targ - node_target_mean) / node_target_std
+                    node_targ = gnn_node_target_fn(batch_data).float().to(device, non_blocking=True)
+                    node_targ_norm = (node_targ - node_target_mean) / node_target_std
 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                    graph_pred, node_pred = model(
-                        x_norm, edge_index, edge_attr_norm, batch_idx,
-                        tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
-                        tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
-                    )
-                    graph_pred_target_norm = (graph_pred * node_target_std + node_target_mean - target_mean) / target_std
-                    graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
-                    node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx, stress_weight_power)
-                    loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                        graph_pred, node_pred = eval_model(
+                            x_norm, edge_index, edge_attr_norm, batch_idx,
+                            tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
+                            tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
+                        )
+                        graph_pred_raw_mpa = (graph_pred * node_target_std + node_target_mean).clamp_min(LOG_STRESS_EPS)
+                        graph_pred_target_norm = (torch.log(graph_pred_raw_mpa) - target_mean) / target_std
+                        graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
+                        node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx, stress_weight_power)
+                        loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
 
-                total_val       += loss.item()
-                total_val_graph += graph_loss.item()
-                total_val_node  += node_loss.item()
+                    total_val       += loss.item()
+                    total_val_graph += graph_loss.item()
+                    total_val_node  += node_loss.item()
 
-        n_val_batches = max(len(val_loader), 1)
-        avg_val       = total_val       / n_val_batches
-        avg_val_graph = total_val_graph / n_val_batches
-        avg_val_node  = total_val_node  / n_val_batches
-        val_losses.append(avg_val)
-        val_graph_losses.append(avg_val_graph)
-        val_node_losses.append(avg_val_node)
+            n_val_batches = max(len(val_loader), 1)
+            avg_val       = total_val       / n_val_batches
+            avg_val_graph = total_val_graph / n_val_batches
+            avg_val_node  = total_val_node  / n_val_batches
+            val_losses.append(avg_val)
+            val_graph_losses.append(avg_val_graph)
+            val_node_losses.append(avg_val_node)
+        else:
+            avg_val = avg_val_graph = avg_val_node = 0.0
 
-        scheduler.step()
+        # LR schedule: every epoch decays by lr_decay_per_epoch, plus an extra
+        # lr_plateau_factor on top once lr_plateau_patience epochs pass with no
+        # *training*-loss improvement (val graph loss is too noisy epoch-to-epoch
+        # to gate on -- see comment at best_train_loss init). Open-ended -- no
+        # T_max/epoch-horizon needed, so extending a run's --epochs and resuming
+        # never requires recomputing a fixed-length schedule. avg_train differs
+        # per rank (each rank trains on its own data shard), so the decision is
+        # made from rank 0's value and broadcast to the other ranks -- every
+        # rank's optimizer must apply the same lr or DDP's gradient sync no
+        # longer corresponds to identical updates.
+        if is_main:
+            if avg_train < best_train_loss:
+                best_train_loss = avg_train
+                epochs_since_improve = 0
+            else:
+                epochs_since_improve += 1
+            decay_mult = lr_decay_per_epoch
+            if epochs_since_improve >= lr_plateau_patience:
+                decay_mult *= lr_plateau_factor
+                epochs_since_improve = 0
+                print(f"[lr] no train-loss improvement for {lr_plateau_patience} epochs -> "
+                      f"extra x{lr_plateau_factor} on top of the x{lr_decay_per_epoch} decay")
+        else:
+            decay_mult = 0.0  # overwritten by the broadcast below
 
-        # -----------------------------
-        # Best-checkpoint tracking: whenever val ks_stress/graph loss improves,
-        # save straight to data/{geometry}/gnn_surrogate.pt -- the exact path
-        # evaluators/gnn_evaluator.py loads -- so "the surrogate" always is
-        # the best-val checkpoint, independent of the every-10-epoch cadence
-        # below (best epoch isn't necessarily a multiple of 10).
-        # -----------------------------
-        if avg_val_graph < best_val_graph_loss:
-            best_val_graph_loss = avg_val_graph
-            best_val_graph_rmse_mpa = best_val_graph_loss ** 0.5 * graph_target_std_full.item()
-            best_ckpt = _build_ckpt()
-            best_ckpt["best_epoch"] = epoch
-            best_ckpt["best_val_graph_loss"] = best_val_graph_loss
-            torch.save(best_ckpt, surrogate_path)
-            print(f"[best] new best val ks loss {best_val_graph_loss:.6f} "
-                  f"[{best_val_graph_rmse_mpa:.4f} MPa] at epoch {epoch} -> {surrogate_path}")
+        if ddp:
+            decay_t = torch.tensor([decay_mult], device=device, dtype=torch.float64)
+            dist.broadcast(decay_t, src=0)
+            decay_mult = decay_t.item()
 
-        # -----------------------------
-        # Save checkpoint every 10 epochs
-        # -----------------------------
-        if epoch % 10 == 0 or epoch == epochs:
-            ckpt = _build_ckpt()
-            torch.save(ckpt, os.path.join(save_dir, f"{epoch}_epochs.pt"))
+        for pg in optimizer.param_groups:
+            pg["lr"] *= decay_mult
 
-            with open(os.path.join(run_dir, "losses.json"), "w") as f:
-                json.dump({
-                    "train_losses": train_losses,
-                    "val_losses": val_losses,
-                    "train_graph_losses": train_graph_losses,
-                    "val_graph_losses": val_graph_losses,
-                    "train_node_losses": train_node_losses,
-                    "val_node_losses": val_node_losses,
-                }, f, indent=4)
+        # All checkpoint/metric writes are rank-0-only: avg_val_graph is a
+        # dummy 0.0 on other ranks (they skip validation entirely above), so
+        # letting them through here would both race on the same files and
+        # corrupt best-checkpoint tracking with a fake zero loss.
+        if is_main:
+            # -----------------------------
+            # Best-checkpoint tracking: whenever val ks_stress/graph loss improves,
+            # save straight to data/{geometry}/gnn_surrogate.pt -- the exact path
+            # evaluators/gnn_evaluator.py loads -- so "the surrogate" always is
+            # the best-val checkpoint, independent of the every-10-epoch cadence
+            # below (best epoch isn't necessarily a multiple of 10).
+            # -----------------------------
+            if avg_val_graph < best_val_graph_loss:
+                best_val_graph_loss = avg_val_graph
+                best_val_graph_rmse_mpa = best_val_graph_loss ** 0.5 * graph_target_std_full.item()
+                best_ckpt = _build_ckpt()
+                best_ckpt["best_epoch"] = epoch
+                best_ckpt["best_val_graph_loss"] = best_val_graph_loss
+                torch.save(best_ckpt, surrogate_path)
+                print(f"[best] new best val ks loss {best_val_graph_loss:.6f} "
+                      f"[{best_val_graph_rmse_mpa:.4f} log MPa] at epoch {epoch} -> {surrogate_path}")
 
-        epoch_secs = time.time() - epoch_t0
-        train_graph_rmse_mpa = avg_train_graph ** 0.5 * graph_target_std_full.item()
-        val_graph_rmse_mpa   = avg_val_graph   ** 0.5 * graph_target_std_full.item()
-        print(
-            f"Epoch {epoch:03d}/{epochs} | {epoch_secs:6.1f}s | "
-            f"Train: {avg_train:.6f} (g {avg_train_graph:.6f} [{train_graph_rmse_mpa:.4f} MPa] / n {avg_train_node:.6f}) | "
-            f"Val: {avg_val:.6f} (g {avg_val_graph:.6f} [{val_graph_rmse_mpa:.4f} MPa] / n {avg_val_node:.6f}) | "
-            f"LR: {optimizer.param_groups[0]['lr']:.2e}"
-        )
+            # -----------------------------
+            # Save checkpoint every 10 epochs
+            # -----------------------------
+            if epoch % 10 == 0 or epoch == epochs:
+                ckpt = _build_ckpt(include_optimizer=True)
+                torch.save(ckpt, os.path.join(save_dir, f"{epoch}_epochs.pt"))
+
+                with open(os.path.join(run_dir, "losses.json"), "w") as f:
+                    json.dump({
+                        "train_losses": train_losses,
+                        "val_losses": val_losses,
+                        "train_graph_losses": train_graph_losses,
+                        "val_graph_losses": val_graph_losses,
+                        "train_node_losses": train_node_losses,
+                        "val_node_losses": val_node_losses,
+                        "train_grad_losses": train_grad_losses,
+                    }, f, indent=4)
+
+            epoch_secs = time.time() - epoch_t0
+            train_graph_rmse_mpa = avg_train_graph ** 0.5 * graph_target_std_full.item()
+            val_graph_rmse_mpa   = avg_val_graph   ** 0.5 * graph_target_std_full.item()
+            grad_str = f" / grad {avg_train_grad:.6f}" if grad_iter is not None else ""
+            print(
+                f"Epoch {epoch:03d}/{epochs} | {epoch_secs:6.1f}s | "
+                f"Train: {avg_train:.6f} (g {avg_train_graph:.6f} [{train_graph_rmse_mpa:.4f} log MPa] / n {avg_train_node:.6f}{grad_str}) | "
+                f"Val: {avg_val:.6f} (g {avg_val_graph:.6f} [{val_graph_rmse_mpa:.4f} log MPa] / n {avg_val_node:.6f}) | "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
+
+    if ddp:
+        dist.destroy_process_group()
 
 
 # ======================================================
@@ -646,11 +1155,12 @@ if __name__ == "__main__":
     parser.add_argument("--use_node_emb", type=_bool, default=True,
                         help="Enable the per-node learned embedding table for fixed-topology "
                              "geometries. Pass false to ablate it (e.g. --use_node_emb false).")
-    parser.add_argument("--coarse_arch", default="transformer", choices=["transformer", "gnn"],
+    parser.add_argument("--coarse_arch", default="cnn", choices=["transformer", "gnn", "cnn"],
                         help="Coarse-stage architecture for the hierarchical model: "
                              "'transformer' = full self-attention over tile+global tokens "
                              "(HierarchicalGNN), 'gnn' = multi-hop message passing over the "
-                             "6-connected tile grid (HierarchicalGNNMP, pre-transformer arch).")
+                             "6-connected tile grid (HierarchicalGNNMP, pre-transformer arch), "
+                             "'cnn' = a 3D U-Net over the dense tile grid (HierarchicalGNNCNN).")
     parser.add_argument("--transformer_heads", default=4, type=int,
                         help="Attention heads in the coarse tile transformer (HierarchicalGNN only).")
     parser.add_argument("--transformer_ff_mult", default=2, type=int,
@@ -658,15 +1168,20 @@ if __name__ == "__main__":
     parser.add_argument("--transformer_dropout", default=0.1, type=float,
                         help="Dropout in the coarse tile transformer (attention + FF).")
     parser.add_argument("--mp_dropout", default=0.0, type=float,
-                        help="Dropout applied after encoder, each message-passing conv "
+                        help="Dropout applied after encoder, each coarse-stage conv "
                              "(before the residual add), and in the head MLP "
-                             "(HierarchicalGNNMP / --coarse_arch gnn only).")
+                             "(--coarse_arch gnn or cnn only).")
     parser.add_argument("--coarse_dim", default=None, type=int,
-                        help="Width of the tile/global virtual-node embeddings "
-                             "(HierarchicalGNNMP / --coarse_arch gnn only). Decoupled from "
+                        help="Width of the tile virtual-node embeddings / U-Net channels "
+                             "(--coarse_arch gnn or cnn only). Decoupled from "
                              "--hidden_dim so sweeping hidden_dim doesn't shrink coarse-scale "
                              "capacity; projected to hidden_dim at the fine/coarse boundary. "
                              "Defaults to --hidden_dim when unset.")
+    parser.add_argument("--cnn_depth", default=3, type=int,
+                        help="Number of U-Net down/up levels in the coarse stage "
+                             "(--coarse_arch cnn only). Each level halves any tile-grid axis "
+                             "that isn't already size 1 (e.g. hollow_cube's NZ=1 stays put), "
+                             "so this degrades gracefully to a 2D/1D U-Net on thin geometries.")
     parser.add_argument("--checkpoint_dir", default=None, type=str,
                         help="Override the checkpoint save/resume directory "
                              "(default: data/{geometry}/checkpoints/).")
@@ -680,7 +1195,50 @@ if __name__ == "__main__":
                         help="Wrap the model in torch.compile (fuses the gather/cat/elementwise "
                              "ops around each EdgeAttrConv). No-op on CPU. Pass false to disable "
                              "if compilation fails or is slower for a given config.")
+    parser.add_argument("--resume_lr_scale", default=None, type=float,
+                        help="Only takes effect when resuming from a checkpoint: multiplies the "
+                             "checkpoint's restored lr by this factor once, e.g. 0.5 to halve it. "
+                             "Plain --lr on resume otherwise has no effect, since "
+                             "optimizer.load_state_dict() restores the checkpoint's own lr. "
+                             "No effect on a fresh (non-resumed) run.")
+    parser.add_argument("--lr_decay_per_epoch", default=0.99, type=float,
+                        help="Multiplicative lr decay applied every epoch (no T_max/epoch-horizon "
+                             "needed, so extending --epochs on a resumed run just continues "
+                             "decaying from wherever lr left off).")
+    parser.add_argument("--lr_plateau_patience", default=5, type=int,
+                        help="Epochs of no training-loss improvement before an extra "
+                             "--lr_plateau_factor decay is applied on top of the per-epoch decay.")
+    parser.add_argument("--lr_plateau_factor", default=0.5, type=float,
+                        help="Extra multiplicative lr decay applied once --lr_plateau_patience "
+                             "epochs pass with no training-loss improvement.")
+    parser.add_argument("--seed_offset", default=42, type=int,
+                        help="Per-epoch reshuffle seed is seed_offset+epoch (torch.manual_seed). "
+                             "Change this to get a different deterministic batch order/shuffle "
+                             "sequence across all epochs -- e.g. to dodge a specific batch shape "
+                             "that trips a torch.compile guard/specialization bug at some epoch, "
+                             "without disabling --use_compile.")
+    parser.add_argument("--grad_dataset_path", default=None, type=str,
+                        help="Path to a gradient-matching dataset built with "
+                             "training/dataset_builder.py --grad_mode true, e.g. "
+                             "data/hollow_cube/dataset_grad/dataset.pt (nominal filename -- "
+                             "actual sharded data lives under .../dataset_grad/shards/, same "
+                             "convention as --dataset, see training/dataset_io.py). Adds a "
+                             "Sobolev-style loss term "
+                             "that matches the surrogate's own autodiff sensitivity "
+                             "d(ks_stress)/d(tile thickness) against ground-truth FD sensitivities "
+                             "from the real solver. Unset (default) -> feature fully disabled, "
+                             "no behavior change.")
+    parser.add_argument("--grad_loss_weight", default=0.1, type=float,
+                        help="Weight on the gradient-matching loss term (only used when "
+                             "--grad_dataset_path is set). Start conservative -- this is a new, "
+                             "previously-untrained signal.")
+    parser.add_argument("--grad_batch_size", default=None, type=int,
+                        help="Batch size for the gradient-matching dataset loader (only used when "
+                             "--grad_dataset_path is set). Defaults to --batch_size.")
     args = parser.parse_args()
+
+    if int(os.environ.get("RANK", "0")) == 0:
+        print("[args] " + json.dumps(vars(args), indent=2, sort_keys=True))
 
     train_gnn_model(
         geometry=args.geometry,
@@ -704,8 +1262,17 @@ if __name__ == "__main__":
         transformer_dropout=args.transformer_dropout,
         mp_dropout=args.mp_dropout,
         coarse_dim=args.coarse_dim,
+        cnn_depth=args.cnn_depth,
         checkpoint_dir=args.checkpoint_dir,
         run_dir=args.run_dir,
         stress_ks_rho_mpa=args.stress_ks_rho_mpa,
         use_compile=args.use_compile,
+        resume_lr_scale=args.resume_lr_scale,
+        lr_decay_per_epoch=args.lr_decay_per_epoch,
+        lr_plateau_patience=args.lr_plateau_patience,
+        lr_plateau_factor=args.lr_plateau_factor,
+        seed_offset=args.seed_offset,
+        grad_dataset_path=args.grad_dataset_path,
+        grad_loss_weight=args.grad_loss_weight,
+        grad_batch_size=args.grad_batch_size,
     )
