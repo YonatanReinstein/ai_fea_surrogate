@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import torch
 import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
@@ -9,6 +10,7 @@ from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
 from evaluators.base_evaluator import BaseEvaluator
 from core.IritModel import IritCModel
 from core.component import Component
+from core.tile_sensitivity import dims_key_order_permutation
 from training.gnn_training import gnn_input_fn, gnn_target_fn
 import json
 from multiprocessing import Pool
@@ -100,8 +102,15 @@ def _run_sample_worker(args):
     if tile_grid is not None and hasattr(data, 'tile_idx'):
         NX, NY, NZ = tile_grid
         K = NX * NY * NZ
+        # dims-key order (d1..dK) is NOT the same ordering as tile_idx
+        # (IRIT-native -- see core/tile_sensitivity.py's
+        # dims_key_order_permutation) whenever NX != NY, so reorder before
+        # indexing by tile_idx below -- otherwise most nodes get fed
+        # another tile's thickness.
+        strut_dims_key_order = [dims.get(f"d{i + 1}", 0.0) for i in range(K)]
+        perm = dims_key_order_permutation(NX, NY, NZ)
         strut_params = torch.tensor(
-            [dims.get(f"d{i + 1}", 0.0) for i in range(K)], dtype=torch.float
+            [strut_dims_key_order[p] for p in perm], dtype=torch.float
         )
         strut_feat = strut_params[data.tile_idx].unsqueeze(1)
         data.x = torch.cat([data.x, strut_feat], dim=1)
@@ -454,6 +463,130 @@ class GNNEvaluator(BaseEvaluator):
             "yield_strength": self.yield_strength,
             "base_heatmap": base_heatmap,  # {"mesh", "stress"} for dims_list[0], or None
         }
+
+    def compute_stress_and_gradient(self, dims: dict):
+        """Predicted stress AND the model's own d(stress)/d(tile thickness)
+        for every tile, from a single forward+backward pass -- no ccx
+        involved, replacing TopologyOptimizer's default N+1-evaluator-call
+        finite-difference sweep with an O(1) exact (w.r.t. the model)
+        gradient. Requires a hierarchical (coarse_arch) model with a
+        tile_grid, since it differentiates through the tile_x input the
+        coarse embedding consumes.
+
+        This is the same autodiff-through-stress mechanism
+        training/gnn_training.py's gradient-matching loss already uses at
+        training time (torch.autograd.grad of the model's own graph_pred
+        w.r.t. tile thickness) -- just run once here at inference/topopt
+        time instead of only during training.
+
+        Returns (stress, grad, volume): stress is a Python float in MPa
+        (the model was trained on MPa-scaled targets -- see
+        gnn_training.py's _preprocess -- so this is evaluate()'s "stress"
+        divided by 1e6, same as it would come out of that same
+        denormalization); grad is a dict mapping each dims key ("d1", ...)
+        to d(stress)/d(thickness) in MPa per thickness-unit; volume is the
+        real (non-surrogate) IRIT volume, same as evaluate()'s "volume".
+        Multiply stress/grad by 1e6 for Pa if comparing against
+        material_properties.json's yield_strength.
+        """
+        assert self._get_tile_grid is not None, \
+            "compute_stress_and_gradient needs a geometry with tile_grid()"
+        NX, NY, NZ = self._get_tile_grid(dims)
+        K = NX * NY * NZ
+
+        graph_dict, volume, _timings, _mesh = _run_sample_worker((
+            self.model_path, dims, self.fixed_dims, self.young, self.poisson,
+            0, False, False, self.anchor_condition, self.force_pattern,
+            self.U, self.V, self.W, (NX, NY, NZ), self.graph_path,
+        ))
+        g = Data(**{k: torch.from_numpy(v) for k, v in graph_dict.items()})
+        if self.node_id is not None and g.x.shape[0] == self.node_id.shape[0]:
+            g.node_id = self.node_id
+        batch_data = Batch.from_data_list([g])
+
+        x, edge_index, edge_attr, batch, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, node_id = \
+            gnn_input_fn(batch_data)
+        x = x.float().to(self.device)
+        x[:, 3:6] = x[:, 3:6] / 1e+6  # force vector -> MN, matches training's _preprocess
+        edge_index = edge_index.to(self.device)
+        edge_attr = edge_attr.float().to(self.device)
+        batch = batch.to(self.device)
+        tile_idx = tile_idx.to(self.device)
+        if node_id is not None:
+            node_id = node_id.to(self.device)
+        # gnn_input_fn already reduces these to plain Python ints.
+
+        # tile_x built by _run_sample_worker is already tile_idx-native order
+        # (see core/tile_sensitivity.py's dims_key_order_permutation and the
+        # fix in that worker) -- differentiate w.r.t. it directly, then
+        # rebuild x's own strut column from the SAME leaf so the gradient
+        # captures both paths thickness enters the model through (matches
+        # gnn_training.py's gradient-matching loss).
+        t_leaf = tile_x.float().to(self.device).clone().requires_grad_(True)
+        node_strut = t_leaf.view(-1)[tile_idx].unsqueeze(1)
+        x_grad = torch.cat([x[:, :-1], node_strut], dim=1)
+        x_norm = (x_grad - self.x_mean) / self.x_std
+        edge_attr_norm = (edge_attr - self.edge_mean) / self.edge_std
+
+        was_training = self.model.training
+        self.model.eval()
+        graph_pred, _ = self.model(
+            x_norm, edge_index, edge_attr_norm, batch,
+            tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
+            tile_x=t_leaf, node_id=node_id,
+        )
+        self.model.train(was_training)
+
+        stress = (graph_pred * self.target_std + self.target_mean).squeeze()
+        grad_native = torch.autograd.grad(stress, t_leaf)[0].view(-1)
+
+        # tile_x/grad_native are tile_idx-native order; convert back to
+        # dims-key order ("d1".."dK") for the caller, which speaks dims
+        # dicts throughout (topopt_optimizer.py's free_names convention).
+        perm = dims_key_order_permutation(NX, NY, NZ)  # perm[t] = dims_idx for native t
+        grad_dims_key_order = [0.0] * K
+        for t, dims_idx in enumerate(perm):
+            grad_dims_key_order[dims_idx] = float(grad_native[t])
+        grad = {f"d{i + 1}": grad_dims_key_order[i] for i in range(K)}
+
+        return float(stress.detach().cpu()), grad, volume
+
+    def compute_topopt_gradient(self, dims: dict):
+        """(volume, stress_mpa, yield_strength_mpa, dV_dx, dG_dx) in the
+        exact shape optimization.TopologyOptimizer's gradient_func expects
+        -- an O(1) drop-in replacement for its default N+1-evaluator-call
+        finite-difference sweep, using compute_stress_and_gradient's
+        autodiff for the (expensive, nonlinear) stress/constraint term.
+
+        Volume's sensitivity doesn't need the GNN, an FD sweep, or even an
+        extra IRIT call: hollow_cube's tile is a hollow square tube (see
+        model_lin.c's BuildHollowCubeTile), so in the tile's own local unit
+        cube, material area = outer(1x1) - inner((1-2t)^2) = 4t(1-t), and
+        every tile shares the same scale factor from local to physical
+        volume (a uniform tiling of one outline) -- calibrated here from
+        the ALREADY-COMPUTED total volume instead of a hardcoded geometry
+        constant, so this isn't tied to hollow_cube's specific 1-unit-per-
+        tile outline sizing. This is specific to hollow_cube's tile shape;
+        a different geometry's tile construction would need its own
+        formula here.
+        """
+        # self.yield_strength (from material_properties.json) is already in
+        # the same MPa convention as evaluate()'s/compute_stress_and_gradient's
+        # stress -- see GNNEvaluator.__init__ and evaluate()'s g0 = s0/yld-1
+        # usage in topopt_optimizer.py, neither of which rescales it.
+        stress, d_stress_dx_mpa, volume = self.compute_stress_and_gradient(dims)
+        dG_dx = {k: v / self.yield_strength for k, v in d_stress_dx_mpa.items()}
+
+        # dims here is a plain {key: float} dict (e.g. TopologyOptimizer's
+        # _vec_to_dims output) -- every key is a design variable.
+        free_names = list(dims.keys())
+        t = np.array([dims[k] for k in free_names])
+        local_volume = 4.0 * t * (1.0 - t)
+        scale = volume / local_volume.sum()
+        dV_dt = scale * 4.0 * (1.0 - 2.0 * t)
+        dV_dx = {k: float(v) for k, v in zip(free_names, dV_dt)}
+
+        return volume, stress, self.yield_strength, dV_dx, dG_dx
 
 
 

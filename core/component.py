@@ -71,9 +71,15 @@ class Component:
             if tile_grid is not None:
                 NX, NY, NZ = tile_grid
                 t = node_to_tile.get(node.id, 0)
-                iz = t % NZ
-                iy = (t // NZ) % NY
-                ix = t // (NY * NZ)
+                # elem_to_tile/t is IRIT's own tile numbering (X fastest,
+                # Z slowest -- see UserMicroEvalTilingIndex in
+                # irit/user_lib/micro_strct.c), the OPPOSITE nesting from
+                # dims.json's ShellThicknesses array (X-outermost, per
+                # model_lin.c's read_shell_thicknesses comment). Decode
+                # with the matching X-innermost convention here.
+                ix = t % NX
+                iy = (t // NX) % NY
+                iz = t // (NX * NY)
                 # Normalized tile coordinates in [0, 1]
                 feats.append(ix / max(NX - 1, 1))
                 feats.append(iy / max(NY - 1, 1))
@@ -174,9 +180,11 @@ class Component:
         if tile_grid is not None:
             NX, NY, NZ = tile_grid
             t  = tile_idx.long()
-            ix = (t // (NY * NZ)).float() / max(NX - 1, 1)
-            iy = ((t // NZ) % NY).float() / max(NY - 1, 1)
-            iz = (t % NZ).float() / max(NZ - 1, 1)
+            # See the matching comment in to_graph_with_labels: t is
+            # X-innermost (IRIT's own tiling order), not X-outermost.
+            ix = (t % NX).float() / max(NX - 1, 1)
+            iy = ((t // NX) % NY).float() / max(NY - 1, 1)
+            iz = (t // (NX * NY)).float() / max(NZ - 1, 1)
             feats.append(torch.stack([ix, iy, iz], dim=1))                                  # [N,3]
         x = torch.cat(feats, dim=1)
 

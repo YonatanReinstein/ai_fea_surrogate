@@ -204,10 +204,14 @@ class HierarchicalGNN(nn.Module):
     @staticmethod
     def _build_tile_positions(NX, NY, NZ, device):
         """Normalized (ix, iy, iz) grid coords, one row per tile, in the same
-        flat order as tile_idx (ix*NY*NZ + iy*NZ + iz)."""
-        ix = torch.arange(NX, device=device).view(NX, 1, 1).expand(NX, NY, NZ)
-        iy = torch.arange(NY, device=device).view(1, NY, 1).expand(NX, NY, NZ)
-        iz = torch.arange(NZ, device=device).view(1, 1, NZ).expand(NX, NY, NZ)
+        flat order as tile_idx. tile_idx comes from elem_to_tile, which is
+        IRIT's own tiling order (X fastest, Z slowest -- see
+        UserMicroEvalTilingIndex in irit/user_lib/micro_strct.c), i.e. flat
+        index = iz*NY*NX + iy*NX + ix -- the opposite nesting from
+        dims.json's ShellThicknesses array (X-outermost)."""
+        ix = torch.arange(NX, device=device).view(1, 1, NX).expand(NZ, NY, NX)
+        iy = torch.arange(NY, device=device).view(1, NY, 1).expand(NZ, NY, NX)
+        iz = torch.arange(NZ, device=device).view(NZ, 1, 1).expand(NZ, NY, NX)
         pos = torch.stack([ix, iy, iz], dim=-1).reshape(-1, 3).float()
         norm = torch.tensor(
             [max(NX - 1, 1), max(NY - 1, 1), max(NZ - 1, 1)], device=device, dtype=torch.float

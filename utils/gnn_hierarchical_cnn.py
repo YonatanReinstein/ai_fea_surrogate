@@ -141,10 +141,18 @@ class HierarchicalGNNCNN(nn.Module):
 
     def set_tile_grid(self, NX, NY, NZ):
         """Precompute the fixed U-Net down/up blocks for this geometry's
-        grid shape. Call once, right after construction."""
-        dims = [(NX, NY, NZ)]
+        grid shape. Call once, right after construction.
+
+        tile_idx (and hence the flat tile_h layout reshaped in forward())
+        is ordered X-fastest/Z-slowest -- IRIT's own tiling order (see
+        UserMicroEvalTilingIndex in irit/user_lib/micro_strct.c), the
+        opposite nesting from dims.json's ShellThicknesses array. The U-Net
+        is therefore built over a (NZ, NY, NX)-shaped volume so its axes
+        line up with a row-major reshape of that flat layout.
+        """
+        dims = [(NZ, NY, NX)]
         strides = []
-        cur = (NX, NY, NZ)
+        cur = (NZ, NY, NX)
         for _ in range(self.cnn_depth):
             stride = tuple(2 if d > 1 else 1 for d in cur)
             # Conv3d output size for kernel=3, padding=1: floor((d-1)/s)+1.
@@ -219,7 +227,9 @@ class HierarchicalGNNCNN(nn.Module):
                 tile_h = tile_h + self.conv_dropout(self.encode_conv(h, tile_h, rt_encode_ei, rt_ea))
 
             # --- Process: 3D U-Net over the dense tile grid, native coarse_dim ---
-            G = tile_h.view(num_graphs, NX, NY, NZ, -1).permute(0, 4, 1, 2, 3).contiguous()
+            # tile_h's K rows are ordered X-fastest/Z-slowest (tile_idx's
+            # native order, see set_tile_grid), so reshape to (NZ,NY,NX).
+            G = tile_h.view(num_graphs, NZ, NY, NX, -1).permute(0, 4, 1, 2, 3).contiguous()
             coarse_ckpt = fine_ckpt and not self.checkpoint_fine_only
             if coarse_ckpt:
                 G = G + checkpoint(self._unet_forward, G, use_reentrant=False)

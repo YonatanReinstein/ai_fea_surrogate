@@ -110,6 +110,11 @@ _mapdl_pool.version_from_path = _patched_version_from_path
 
 from core.component import Component
 from core.IritModel import IritModel, IritCModel
+from core.node import Node
+from core.element import Element
+from core.mesh import Mesh
+from core.geometric_jacobian import compute_thickness_jacobian
+from core.tile_sensitivity import assemble_tile_thickness_sensitivity
 from ansys.mapdl.core import MapdlPool
 from ansys.mapdl.core.errors import MapdlRuntimeError
 
@@ -451,6 +456,79 @@ def _ccx_run_grad_sample(model_path, mesh_threads, fixed_dims, anchor_condition,
     return dim_idx, data, meta
 
 
+def _ccx_run_grad_sample_adjoint(model_path, mesh_threads, fixed_dims, anchor_condition, force_pattern,
+                                  U, V, W, young, poisson, ccx_path, nproc, get_tile_grid, dim_idx, dims,
+                                  graph_path, stress_ks_rho_mpa, dims_bounds, grad_max_tiles):
+    """Adjoint alternative to _ccx_run_grad_sample: one base ccx run (for the
+    node/edge training features, unchanged) plus ONE extra mesh regeneration
+    and ONE ccx *SENSITIVITY solve -- covering every tile CCX will accept as
+    a design node (see core.mesh.Mesh.solve_ccx_sensitivity's docstring) in
+    a single pass, instead of grad_tiles_per_sample separate full ccx
+    reruns. See core/geometric_jacobian.py, core/tile_sensitivity.py, and
+    core/mesh.py's solve_ccx_sensitivity for the chain rule itself.
+
+    Which tiles get a valid sensitivity is a function of mesh topology only
+    (CCX's design-node acceptance depends on element connectivity and the
+    fixed anchor/force pattern, not on the sampled thickness values -- see
+    getdesiinfo3d.f) -- so for a fixed geometry/resolution, the same tile
+    set is accepted every sample, and every sample naturally carries the
+    same number of (tile, sensitivity) pairs without needing grad_mode's FD
+    path random per-sample tile choice.
+    """
+    base_idx, data, meta = _ccx_run_single(
+        model_path, mesh_threads, fixed_dims, anchor_condition, force_pattern,
+        U, V, W, young, poisson, ccx_path, nproc, get_tile_grid, dim_idx, dims,
+        graph_path, stress_ks_rho_mpa,
+    )
+    if data is None:
+        return dim_idx, None, None
+
+    try:
+        exe_path = os.path.join(model_path, "model")
+        NX, NY, NZ = get_tile_grid(dims)
+
+        dX_dt, nodes_dict, elements_dict, elem_to_tile = compute_thickness_jacobian(
+            exe_path, dims, U, V, W, fixed_dims=fixed_dims, eps=1e-4,
+        )
+        design_node_ids = [nid for nid, v in dX_dt.items() if any(abs(c) > 1e-9 for c in v)]
+
+        nodes = {nid: Node(nid, xyz) for nid, xyz in nodes_dict.items()}
+        elements = {eid: Element(eid, [nodes[nid] for nid in nlist]) for eid, nlist in elements_dict.items()}
+        sens_mesh = Mesh(nodes, elements)
+        sens_mesh.anchor_nodes_by_condition(anchor_condition)
+        sens_mesh.apply_force_by_pattern(force_pattern)
+
+        _, dfdn, normal = sens_mesh.solve_ccx_sensitivity(
+            young, poisson, design_node_ids, stress_ks_rho_mpa=stress_ks_rho_mpa,
+            ccx_path=ccx_path, nproc=nproc,
+        )
+
+        dims_keys = list(dims_bounds.keys())
+        per_tile = assemble_tile_thickness_sensitivity(
+            dX_dt, dfdn, normal, elements_dict, elem_to_tile, NX, NY, NZ, dims_keys,
+        )
+    except Exception as e:
+        print(f"dim_idx={dim_idx} adjoint sensitivity failed: {e}. Treating sample as failed.", flush=True)
+        return dim_idx, None, None
+
+    if not per_tile:
+        print(f"dim_idx={dim_idx} adjoint sensitivity accepted zero design nodes, "
+              f"treating as failed.", flush=True)
+        return dim_idx, None, None
+
+    # Deterministic (sorted by key) so every sample's grad_tile_idx lists the
+    # same tiles in the same order -- required since training reshapes the
+    # concatenated per-sample tensors to [batch_size, grad_M].
+    keys_sorted = sorted(per_tile.keys(), key=lambda k: int(k[1:]))
+    if grad_max_tiles is not None and grad_max_tiles > 0:
+        keys_sorted = keys_sorted[:grad_max_tiles]
+
+    key_to_idx = {k: i for i, k in enumerate(dims_keys)}
+    data.grad_tile_idx = torch.tensor([key_to_idx[k] for k in keys_sorted], dtype=torch.long)
+    data.grad_dks_dx = torch.tensor([per_tile[k] for k in keys_sorted], dtype=torch.float)
+    return dim_idx, data, meta
+
+
 def build_dataset(
     geometry: str,
     num_samples: int = 10,
@@ -470,6 +548,8 @@ def build_dataset(
     grad_mode: bool = False,
     grad_tiles_per_sample: int = 6,
     grad_fd_frac: float = 0.02,
+    grad_engine: str = "fd",
+    grad_max_tiles: int = None,
 ):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -742,14 +822,26 @@ def build_dataset(
                 # the rest of this process's life instead of preventing exit.
                 submission_timeout_sec = 180
                 submit_result = {}
-                # grad_mode swaps in _ccx_run_grad_sample (base ccx run +
-                # grad_tiles_per_sample single-tile-perturbed reruns,
-                # producing ground-truth FD sensitivity labels) instead of
-                # the plain _ccx_run_single -- same (dim_idx, data, meta)
-                # return contract, so the pool/retry/shard machinery below
-                # needs no other changes.
-                worker_fn = _ccx_run_grad_sample if grad_mode else _ccx_run_single
-                worker_extra_args = (grad_tiles_per_sample, grad_fd_frac, grad_dims_bounds) if grad_mode else ()
+                # grad_mode swaps in a worker that produces ground-truth
+                # per-tile sensitivity labels (grad_tile_idx/grad_dks_dx)
+                # instead of the plain _ccx_run_single -- same
+                # (dim_idx, data, meta) return contract either way, so the
+                # pool/retry/shard machinery below needs no other changes.
+                # grad_engine="fd" (default): _ccx_run_grad_sample, base ccx
+                # run + grad_tiles_per_sample single-tile-perturbed reruns.
+                # grad_engine="adjoint": _ccx_run_grad_sample_adjoint, base
+                # ccx run + one geometric-Jacobian mesh regen + one ccx
+                # *SENSITIVITY solve covering every CCX-accepted tile at
+                # once (see core/tile_sensitivity.py).
+                if not grad_mode:
+                    worker_fn = _ccx_run_single
+                    worker_extra_args = ()
+                elif grad_engine == "adjoint":
+                    worker_fn = _ccx_run_grad_sample_adjoint
+                    worker_extra_args = (grad_dims_bounds, grad_max_tiles)
+                else:
+                    worker_fn = _ccx_run_grad_sample
+                    worker_extra_args = (grad_tiles_per_sample, grad_fd_frac, grad_dims_bounds)
 
                 def _do_submit():
                     try:
@@ -1104,7 +1196,9 @@ if __name__ == "__main__":
     parser.add_argument("--field_random_base", type=_bool, default=False, help="Instead of one fixed anchor shared by every field-sampled example (dims.json's default, or --field_base_thickness), draw a fresh scalar anchor per sample uniformly over the tile's real [min, max] range, then add the correlated noise on top of that. Gives full coverage of thin/thick overall baselines instead of just noise around one baseline -- use this to cover the low-volume regime a fixed-default dataset misses (see project_gnn_anchor_sensitivity_bug.md).")
     parser.add_argument("--grad_mode", type=_bool, default=False, help="Build a gradient-matching-loss dataset instead of a plain one (engine=ccx only): each sample is a base ccx run plus --grad_tiles_per_sample single-tile-perturbed reruns, finite-differencing the real solver's ks_stress to attach ground-truth per-tile sensitivity labels (grad_tile_idx/grad_dks_dx) used by training/gnn_training.py's gradient-matching loss. Point --output_dir at a directory SEPARATE from the main dataset -- samples from this mode must not be mixed into the same shards as unlabeled samples (PyG's batch collation can't handle a mixed schema).")
     parser.add_argument("--grad_tiles_per_sample", type=int, default=6, help="Number of tiles to finite-difference per sample in --grad_mode (chosen uniformly at random, seeded by dim_idx for reproducibility).")
-    parser.add_argument("--grad_fd_frac", type=float, default=0.02, help="FD step size in --grad_mode, as a fraction of each tile's own [min,max] span -- matches optimization/topopt_optimizer.py's --fd_step convention so the two are comparable.")
+    parser.add_argument("--grad_fd_frac", type=float, default=0.02, help="FD step size in --grad_mode, as a fraction of each tile's own [min,max] span -- matches optimization/topopt_optimizer.py's --fd_step convention so the two are comparable. Ignored by --grad_engine adjoint.")
+    parser.add_argument("--grad_engine", type=str, default="fd", choices=["fd", "adjoint"], help="How --grad_mode computes ground-truth per-tile sensitivity. 'fd' (default): grad_tiles_per_sample separate single-tile-perturbed ccx reruns per sample. 'adjoint': one ccx *SENSITIVITY solve per sample (core/tile_sensitivity.py's chain rule) covering every CCX-accepted tile at once -- far cheaper, but only covers tiles CCX accepts as design nodes (see core/mesh.py's solve_ccx_sensitivity docstring), not every tile.")
+    parser.add_argument("--grad_max_tiles", type=int, default=None, help="--grad_engine adjoint only: cap on how many (tile, sensitivity) pairs to keep per sample (sorted by tile index, so the same subset every sample). Unset/<=0 keeps every CCX-accepted tile.")
     args = parser.parse_args()
     build_dataset(
         args.geometry, num_samples=args.num_samples, pool_size=args.pool_size, nproc=args.nproc,
@@ -1114,6 +1208,7 @@ if __name__ == "__main__":
         field_amplitude_frac_up=args.field_amplitude_frac_up, field_amplitude_frac_down=args.field_amplitude_frac_down,
         field_base_thickness=args.field_base_thickness, field_random_base=args.field_random_base,
         grad_mode=args.grad_mode, grad_tiles_per_sample=args.grad_tiles_per_sample, grad_fd_frac=args.grad_fd_frac,
+        grad_engine=args.grad_engine, grad_max_tiles=args.grad_max_tiles,
     )
     # By this point every result is already durably written to shards/ on
     # disk -- there's nothing left for normal interpreter shutdown to do.

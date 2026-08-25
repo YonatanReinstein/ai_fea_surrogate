@@ -29,6 +29,8 @@ data/hollow_cube/dataset_grad*/
 data/hollow_cube/dataset_field_test*/
 data/hollow_cube/gnn_surrogate.pt*
 data/hollow_cube_ddptest/
+data/hollow_cube_small/dataset*/
+data/hollow_cube_small/gnn_surrogate.pt*
 optimization/artifacts_backup_*/
 optimization/artifacts_ccx_backup_*/
 optimization/artifacts_gnn_backup_*/

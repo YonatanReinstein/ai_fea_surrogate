@@ -26,6 +26,7 @@ from training.gnn_training import gnn_input_fn, LOG_STRESS_EPS
 from utils.gnn_surrogate import GNN, HierarchicalGNN
 from utils.gnn_hierarchical_mp import HierarchicalGNNMP
 from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
+from core.tile_sensitivity import dims_key_order_permutation
 
 
 def load_model(ckpt_path, geometry, device):
@@ -79,12 +80,20 @@ def load_model(ckpt_path, geometry, device):
 def compute_sensitivities(model, stats, dataset, device, strut_offset):
     x_mean, x_std, edge_mean, edge_std, node_target_mean, node_target_std = stats
     preds, trues = [], []
+    # dims-key order (d1..dK) is NOT tile_idx's own (IRIT-native) order
+    # whenever NX != NY (see core/tile_sensitivity.py's
+    # dims_key_order_permutation) -- fixed topology across the dataset, so
+    # computed once from the first sample and reused.
+    _NX0, _NY0, _NZ0 = int(dataset[0].tile_NX), int(dataset[0].tile_NY), int(dataset[0].tile_NZ)
+    strut_perm = torch.tensor(dims_key_order_permutation(_NX0, _NY0, _NZ0), dtype=torch.long, device=device)
+    strut_perm_inv = torch.argsort(strut_perm)
     for sample in dataset:
         batch = Batch.from_data_list([sample])
         x, edge_index, edge_attr, batch_idx, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, node_id = gnn_input_fn(batch)
         K = int(sample.tile_NX) * int(sample.tile_NY) * int(sample.tile_NZ)
 
-        tile_struts = sample.dims[0, strut_offset:strut_offset + K].float().to(device)
+        tile_struts_dims_key_order = sample.dims[0, strut_offset:strut_offset + K].float().to(device)
+        tile_struts = tile_struts_dims_key_order[strut_perm]
         t_leaf = tile_struts.view(-1, 1).clone().requires_grad_(True)
         batch_idx = batch_idx.to(device)
         tile_idx = tile_idx.to(device)
@@ -106,7 +115,11 @@ def compute_sensitivities(model, stats, dataset, device, strut_offset):
 
         d_pred = torch.autograd.grad(graph_pred_raw_mpa.sum(), t_leaf)[0].view(-1)
 
-        grad_tile_idx = sample.grad_tile_idx.to(device)
+        # grad_tile_idx is stored in dims-key order (dataset_builder.py's
+        # _ccx_run_grad_sample/_ccx_run_grad_sample_adjoint build it from
+        # "d{t+1}" keys); d_pred's columns are tile_idx-native (t_leaf's
+        # own layout) -- convert before indexing.
+        grad_tile_idx = strut_perm_inv[sample.grad_tile_idx.to(device)]
         grad_dks_dx_true = sample.grad_dks_dx.float() / 1e6  # Pa/unit -> MPa/unit, matches _preprocess
 
         preds.append(d_pred[grad_tile_idx].detach().cpu())

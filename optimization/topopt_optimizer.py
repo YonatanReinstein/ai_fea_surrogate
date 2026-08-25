@@ -54,8 +54,17 @@ class TopologyOptimizer:
                  fd_step=0.02, move_limit=0.2, filter_radius=1.5,
                  oc_eta=0.5, trust_rel_tol=0.5, min_trust_frac=0.05,
                  untrusted_move_frac=0.1,
-                 fail_penalty=1e12, screenshot_heatmap=True):
+                 fail_penalty=1e12, screenshot_heatmap=True,
+                 gradient_func=None):
+        # gradient_func(dims_dict) -> (volume, stress, yield_strength,
+        # dV_dx_dict, dG_dx_dict), e.g. GNNEvaluator.compute_topopt_gradient
+        # -- when set, run() uses it instead of fitness_func's N+1-call
+        # finite-difference sweep for the per-generation sensitivities
+        # (exact w.r.t. the surrogate, via its own autodiff, one call
+        # instead of N+1). fitness_func is still used for screenshots/best-
+        # design bookkeeping elsewhere and must remain compatible with it.
         self.fitness_func = fitness_func
+        self.gradient_func = gradient_func
         self.dims_dict = dims_dict
         self.geometry = geometry
         self.generations = generations
@@ -372,49 +381,68 @@ class TopologyOptimizer:
 
         for gen in range(start_gen, start_gen + self.generations):
             t_gen_start = perf_counter()
-            # Forward differences; flip to backward near the upper bound so
-            # every perturbed point stays inside [lo, hi].
-            step = self.fd_step * self.span
-            deltas = np.where(x + step <= self.hi, step, -step)
 
-            pts = [x.copy()]
-            for i in range(N):
-                xp = x.copy()
-                xp[i] = x[i] + deltas[i]
-                pts.append(xp)
+            if self.gradient_func is not None:
+                # O(1) path: one call gets the base point plus its exact
+                # (w.r.t. the surrogate) per-tile sensitivities directly,
+                # replacing the N+1-evaluator-call FD sweep below.
+                dims_dicts = [self._vec_to_dims(x)]
+                t = perf_counter()
+                result = self.gradient_func(dims_dicts[0])
+                t_fitness = perf_counter() - t
+                if result is None:
+                    print(f"[TOPOPT] Gen {gen + 1}: base point failed evaluation, "
+                          f"skipping (no state change)", flush=True)
+                    continue
+                v0, s0, yld, dV_dx, dG_dx = result
+                v0, s0 = float(v0), float(s0)
+                g0 = s0 / yld - 1.0
+                df_raw = np.array([dV_dx[n] for n in self.free_names], dtype=float)
+                dg_raw = np.array([dG_dx[n] for n in self.free_names], dtype=float)
+            else:
+                # Forward differences; flip to backward near the upper bound
+                # so every perturbed point stays inside [lo, hi].
+                step = self.fd_step * self.span
+                deltas = np.where(x + step <= self.hi, step, -step)
 
-            dims_dicts = [self._vec_to_dims(p) for p in pts]
-            t = perf_counter()
-            res = self.fitness_func(dims_dicts)
-            t_fitness = perf_counter() - t
-            yld = res["yield_strength"]
-            vols = res["volume"]
-            strs = res["stress"]
+                pts = [x.copy()]
+                for i in range(N):
+                    xp = x.copy()
+                    xp[i] = x[i] + deltas[i]
+                    pts.append(xp)
 
-            if vols[0] is None or strs[0] is None:
-                print(f"[TOPOPT] Gen {gen + 1}: base point failed evaluation, "
-                      f"skipping (no state change)", flush=True)
-                continue
+                dims_dicts = [self._vec_to_dims(p) for p in pts]
+                t = perf_counter()
+                res = self.fitness_func(dims_dicts)
+                t_fitness = perf_counter() - t
+                yld = res["yield_strength"]
+                vols = res["volume"]
+                strs = res["stress"]
+
+                if vols[0] is None or strs[0] is None:
+                    print(f"[TOPOPT] Gen {gen + 1}: base point failed evaluation, "
+                          f"skipping (no state change)", flush=True)
+                    continue
+
+                v0 = float(vols[0])
+                s0 = float(strs[0])
+                g0 = s0 / yld - 1.0
+
+                df_raw = np.empty(N, dtype=float)
+                dg_raw = np.empty(N, dtype=float)
+                for i in range(N):
+                    vi, si = vols[i + 1], strs[i + 1]
+                    if vi is None or si is None:
+                        df_raw[i] = 0.0
+                        dg_raw[i] = 0.0
+                        continue
+                    gi = float(si) / yld - 1.0
+                    df_raw[i] = (float(vi) - v0) / deltas[i]
+                    dg_raw[i] = (gi - g0) / deltas[i]
 
             if self.V_ref is None:
-                self.V_ref = float(vols[0])
+                self.V_ref = v0
                 print(f"[TOPOPT] volume reference V_ref={self.V_ref:.4e}", flush=True)
-
-            v0 = float(vols[0])
-            s0 = float(strs[0])
-            g0 = s0 / yld - 1.0
-
-            df_raw = np.empty(N, dtype=float)
-            dg_raw = np.empty(N, dtype=float)
-            for i in range(N):
-                vi, si = vols[i + 1], strs[i + 1]
-                if vi is None or si is None:
-                    df_raw[i] = 0.0
-                    dg_raw[i] = 0.0
-                    continue
-                gi = float(si) / yld - 1.0
-                df_raw[i] = (float(vi) - v0) / deltas[i]
-                dg_raw[i] = (gi - g0) / deltas[i]
 
             t = perf_counter()
             df = self._filter_sensitivity(df_raw, x)
@@ -450,7 +478,10 @@ class TopologyOptimizer:
             banner = f"[TOPOPT gen {gen:03d}] vol: {v0:.4e}, stress: {s0:.4e}"
             save_path = f"optimization/screenshots/topopt_gen_{gen:03d}.png"
             t = perf_counter()
-            base_heatmap = res.get("base_heatmap")
+            # base_heatmap rides along on fitness_func's own evaluation when
+            # available; the gradient_func fast path doesn't produce one, so
+            # screenshot() below re-solves independently in that case.
+            base_heatmap = None if self.gradient_func is not None else res.get("base_heatmap")
             try:
                 if base_heatmap is not None:
                     # GNN's own node-stress prediction for the base design --

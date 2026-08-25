@@ -173,16 +173,22 @@ class HierarchicalGNN(PhysicsNeMoModule):
 
     @staticmethod
     def _build_local_tile_adj(NX, NY, NZ):
-        """Build local (intra-graph) 6-connected tile pairs. Called once per grid shape."""
+        """Build local (intra-graph) 6-connected tile pairs. Called once per grid shape.
+
+        Flat indices here must match tile_idx's own convention: IRIT's
+        tiling order is X-fastest/Z-slowest (see UserMicroEvalTilingIndex
+        in irit/user_lib/micro_strct.c), the opposite nesting from
+        dims.json's ShellThicknesses array (X-outermost).
+        """
         pairs = []
         for ix in range(NX):
             for iy in range(NY):
                 for iz in range(NZ):
-                    flat = ix * NY * NZ + iy * NZ + iz
+                    flat = iz * NY * NX + iy * NX + ix
                     for dix, diy, diz in [(1, 0, 0), (0, 1, 0), (0, 0, 1)]:
                         jx, jy, jz = ix + dix, iy + diy, iz + diz
                         if jx < NX and jy < NY and jz < NZ:
-                            nb = jx * NY * NZ + jy * NZ + jz
+                            nb = jz * NY * NX + jy * NX + jx
                             pairs += [(flat, nb), (nb, flat)]
         if not pairs:
             return None

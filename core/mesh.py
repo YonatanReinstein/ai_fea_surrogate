@@ -147,40 +147,18 @@ class Mesh:
             raise e
             
 
-    def solve_ccx(self, young: float, poisson: float, ccx_path: str = "ccx",
-                  nproc: int = 1, work_dir: str = None, keep_files: bool = False):
-        """Linear static solve via CalculiX (ccx), as a free/open-source
-        alternative to solve()'s MAPDL path. Writes an Abaqus-style .inp deck,
-        runs ccx, and parses the .frd result file into the same node
-        displacement/stress attributes solve() populates, so
-        get_max_stress()/get_max_displacement() work unchanged.
+    def _ccx_base_deck(self, young: float, poisson: float):
+        """Model-definition lines shared by solve_ccx() and
+        solve_ccx_sensitivity(): nodes, elements, material, boundary
+        conditions, and the rigid-body force coupling. Does not include any
+        *STEP -- callers append their own step(s) after this (and, for
+        solve_ccx_sensitivity, a *DESIGNVARIABLES card, which must precede
+        the first *STEP).
 
-        The rigid-region force distribution MAPDL does with a MASS21 pilot
-        node + CERIG (solve()'s ET,2,21 / CERIG,...,UXYZ block) is
-        reproduced here with CalculiX's *RIGID BODY: a reference node
-        (translation) plus a rotational node give the force nodes a true
-        6-DOF rigid coupling (translate + rotate together), with the
-        resultant force applied at the reference node. A naive
-        *EQUATION tie of translational DOFs only (no rotation) was tried
-        first and measured ~4x too stiff against a closed-form cantilever
-        check, since it prevents the attached face from rotating at all.
+        Returns (lines, pilot_id, total_force): pilot_id is the *RIGID BODY
+        reference node holding the resultant force (None if no forces are
+        applied), for use in a *CLOAD line in the caller's *STATIC step.
         """
-        import os
-        import shutil
-        import subprocess
-        import tempfile
-        from utils.frd_parser import parse_frd
-
-        cleanup = False
-        if work_dir is None:
-            work_dir = tempfile.mkdtemp(prefix="ccx_")
-            cleanup = True
-        else:
-            os.makedirs(work_dir, exist_ok=True)
-
-        job_name = "job"
-        inp_path = os.path.join(work_dir, f"{job_name}.inp")
-
         lines = ["*NODE"]
         lines += [f"{n.id}, {n.coords[0]!r}, {n.coords[1]!r}, {n.coords[2]!r}"
                   for n in self.all_nodes()]
@@ -220,14 +198,59 @@ class Mesh:
             pilot_id = max(self.nodes.keys()) + 1
             rot_id = pilot_id + 1
 
+            # ccx's fixed-field line parser rejects more than 16 entries per
+            # data line, so a large force-node set must be wrapped.
+            force_ids = [n.id for n in force_nodes]
+            force_lines = [
+                ", ".join(str(nid) for nid in force_ids[i:i + 16])
+                for i in range(0, len(force_ids), 16)
+            ]
             lines += [
                 "*NODE",
                 f"{pilot_id}, {cx!r}, {cy!r}, {cz!r}",
                 f"{rot_id}, {cx!r}, {cy!r}, {cz!r}",
                 "*NSET, NSET=FORCESET",
-                ", ".join(str(n.id) for n in force_nodes),
+                *force_lines,
                 f"*RIGID BODY, NSET=FORCESET, REF NODE={pilot_id}, ROT NODE={rot_id}",
             ]
+
+        return lines, pilot_id, total_force
+
+    def solve_ccx(self, young: float, poisson: float, ccx_path: str = "ccx",
+                  nproc: int = 1, work_dir: str = None, keep_files: bool = False):
+        """Linear static solve via CalculiX (ccx), as a free/open-source
+        alternative to solve()'s MAPDL path. Writes an Abaqus-style .inp deck,
+        runs ccx, and parses the .frd result file into the same node
+        displacement/stress attributes solve() populates, so
+        get_max_stress()/get_max_displacement() work unchanged.
+
+        The rigid-region force distribution MAPDL does with a MASS21 pilot
+        node + CERIG (solve()'s ET,2,21 / CERIG,...,UXYZ block) is
+        reproduced here with CalculiX's *RIGID BODY: a reference node
+        (translation) plus a rotational node give the force nodes a true
+        6-DOF rigid coupling (translate + rotate together), with the
+        resultant force applied at the reference node. A naive
+        *EQUATION tie of translational DOFs only (no rotation) was tried
+        first and measured ~4x too stiff against a closed-form cantilever
+        check, since it prevents the attached face from rotating at all.
+        """
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+        from utils.frd_parser import parse_frd
+
+        cleanup = False
+        if work_dir is None:
+            work_dir = tempfile.mkdtemp(prefix="ccx_")
+            cleanup = True
+        else:
+            os.makedirs(work_dir, exist_ok=True)
+
+        job_name = "job"
+        inp_path = os.path.join(work_dir, f"{job_name}.inp")
+
+        lines, pilot_id, total_force = self._ccx_base_deck(young, poisson)
 
         lines += ["*STEP", "*STATIC"]
         if pilot_id is not None:
@@ -263,6 +286,149 @@ class Mesh:
 
         if cleanup and not keep_files:
             shutil.rmtree(work_dir, ignore_errors=True)
+
+    def solve_ccx_sensitivity(self, young: float, poisson: float, design_node_ids,
+                               stress_ks_rho_mpa: float = 0.15, ccx_path: str = "ccx",
+                               nproc: int = 1, work_dir: str = None, keep_files: bool = False):
+        """Static solve + CalculiX adjoint shape-sensitivity of the KS-pooled
+        von Mises stress w.r.t. the coordinates of design_node_ids.
+
+        design_node_ids should be nodes on the model's free surface (CCX
+        requires this for *DESIGNVARIABLES,TYPE=COORDINATE -- interior-node
+        motion doesn't change the geometry) -- in practice, the nodes with a
+        nonzero row in core.geometric_jacobian.compute_thickness_jacobian's
+        dX_dt, since those are exactly the nodes any tile's thickness can
+        move. CCX reports one scalar per design node: d(ks_stress)/d(normal
+        displacement) -- chain-rule this against dX_dt (projected onto the
+        node's own normal) to get d(ks_stress)/d(thickness) per tile.
+
+        The KS response CalculiX computes is
+            sigma_ref * [ max(s/sigma_ref) + (1/rho) * ln(sum(exp(rho*(s/sigma_ref - max(s/sigma_ref))))) ]
+        (s = nodal von Mises stress, rho, sigma_ref from *OBJECTIVE's STRESS
+        line). Passing sigma_ref=1 here makes this numerically identical to
+        Mesh.get_aggregated_stress(rho=stress_ks_rho_mpa * 1e-6) -- same
+        metric, so the returned ks_value/sensitivities are directly
+        comparable to that method's output and to the training/topopt KS
+        target elsewhere in this codebase.
+
+        Returns (ks_value, dfdn, normal): dfdn is node_id -> d(ks_value)/d
+        (normal displacement); normal is node_id -> unit outward-normal
+        (nx, ny, nz), CCX's own mean-of-adjacent-face-normals at that node.
+        Both dicts are zero/absent for nodes CCX excluded from the design
+        set (see getdesiinfo3d.f: SPC'd nodes, MPC'd nodes, and nodes that
+        don't belong to any element face where design nodes are a majority
+        of the face's corners -- confirmed by direct reproduction against
+        ccx 2.17's own WarnNodeDesignReject.nam on hollow_cube). dfdn is
+        only meaningful projected onto normal: d(ks_value)/d(thickness) per
+        tile is sum_n dfdn[n] * dot(normal[n], dX_dt[n]) over each tile's
+        own nodes (core.geometric_jacobian.compute_thickness_jacobian).
+        """
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+        from utils.frd_parser import parse_frd_sensitivity, parse_frd_normals
+
+        cleanup = False
+        if work_dir is None:
+            work_dir = tempfile.mkdtemp(prefix="ccx_sens_")
+            cleanup = True
+        else:
+            os.makedirs(work_dir, exist_ok=True)
+
+        job_name = "job"
+        inp_path = os.path.join(work_dir, f"{job_name}.inp")
+
+        lines, pilot_id, total_force = self._ccx_base_deck(young, poisson)
+
+        max_node_id = max(self.nodes.keys())
+        # ccx's fixed-field line parser rejects more than 16 entries per
+        # data line, so a large design-node set must be wrapped.
+        design_ids = list(design_node_ids)
+        design_lines = [
+            ", ".join(str(nid) for nid in design_ids[i:i + 16])
+            for i in range(0, len(design_ids), 16)
+        ]
+        lines += [
+            "*NSET, NSET=NALL, GENERATE",
+            f"1, {max_node_id}",
+            "*NSET, NSET=DESIGNNODES",
+            *design_lines,
+            "*DESIGNVARIABLES, TYPE=COORDINATE",
+            "DESIGNNODES",
+        ]
+
+        lines += ["*STEP", "*STATIC"]
+        if pilot_id is not None:
+            lines.append("*CLOAD")
+            for dof, val in zip((1, 2, 3), total_force):
+                if val != 0.0:
+                    lines.append(f"{pilot_id}, {dof}, {val!r}")
+        lines += ["*NODE FILE", "U", "*EL FILE", "S", "*END STEP"]
+
+        # ccx's KS operates on stress normalized by sigma_ref, and rejects
+        # rho < 1 -- so rho_pa (get_aggregated_stress's raw-Pa convention)
+        # can't be passed directly. Pick the smallest allowed rho_ccx=1 and
+        # solve sigma_ref = rho_ccx / rho_pa so that rho_ccx*(s/sigma_ref)
+        # == rho_pa*s for every stress s: this makes ccx's normalized KS
+        # equal (1/sigma_ref) * get_aggregated_stress(rho_pa)'s raw-Pa KS,
+        # exactly and for any valid rho_ccx>=1. Rescale the outputs back by
+        # sigma_ref below to undo the normalization.
+        rho_pa = stress_ks_rho_mpa * 1e-6
+        rho_ccx = 1.0
+        sigma_ref = rho_ccx / rho_pa
+        lines += [
+            "*STEP",
+            "*SENSITIVITY",
+            "*OBJECTIVE",
+            f"STRESS, NALL, {rho_ccx!r}, {sigma_ref!r}",
+            "*NODE FILE",
+            "SEN",
+            "*END STEP",
+        ]
+
+        with open(inp_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = str(nproc)
+        # Sensitivity analysis runs several extra adjoint-style solves beyond
+        # a plain static step (internal/external force sensitivity, then
+        # stress w.r.t. coordinates and w.r.t. displacements) -- measured
+        # to exceed solve_ccx's 1200s budget well before finishing on a
+        # full hollow_cube mesh (386k DOF, 40320 design nodes).
+        result = subprocess.run(
+            [ccx_path, "-i", job_name],
+            cwd=work_dir, env=env, capture_output=True, text=True, timeout=7200,
+        )
+
+        frd_path = os.path.join(work_dir, f"{job_name}.frd")
+        dat_path = os.path.join(work_dir, f"{job_name}.dat")
+        if result.returncode != 0 or not os.path.isfile(frd_path):
+            tail = (result.stdout or "")[-4000:] + "\n" + (result.stderr or "")[-2000:]
+            if cleanup:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            raise RuntimeError(f"CalculiX run failed (rc={result.returncode}):\n{tail}")
+
+        ks_value = None
+        with open(dat_path, "r", errors="ignore") as f:
+            dat_lines = f.readlines()
+        for i, line in enumerate(dat_lines):
+            if "OBJECTIVE" in line.upper() and "STRESS" in line.upper():
+                for j in range(i + 1, min(i + 4, len(dat_lines))):
+                    stripped = dat_lines[j].strip()
+                    if stripped:
+                        ks_value = float(stripped) * sigma_ref
+                        break
+                break
+
+        dfdn = {nid: v * sigma_ref for nid, v in parse_frd_sensitivity(frd_path).items()}
+        normal = parse_frd_normals(frd_path)
+
+        if cleanup and not keep_files:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+        return ks_value, dfdn, normal
 
     def anchor_node(self, node_id: int):
         node = self.get_node(node_id)

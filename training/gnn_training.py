@@ -12,6 +12,7 @@ from utils.gnn_surrogate import GNN, HierarchicalGNN
 from utils.gnn_hierarchical_mp import HierarchicalGNNMP
 from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
 from training.dataset_io import load_dataset, shard_paths
+from core.tile_sensitivity import dims_key_order_permutation
 
 
 # ======================================================
@@ -197,6 +198,19 @@ def train_gnn_model(
         _graph_node_id = torch.arange(_g["num_nodes"], dtype=torch.long)
         _num_pos_nodes_from_graph = _g["num_nodes"]
 
+    # dims-key order (d1..dK) is NOT tile_idx's own (IRIT-native) order
+    # whenever NX != NY -- see core/tile_sensitivity.py's
+    # dims_key_order_permutation. Precomputed once here (NX/NY/NZ are fixed
+    # for the whole run) and reused by _preprocess below via a single
+    # vectorized gather, instead of recomputing per sample.
+    _strut_perm = None
+    _strut_perm_inv = None
+    _get_tile_grid = getattr(_bc, "tile_grid", None)
+    if _get_tile_grid is not None:
+        _NX, _NY, _NZ = _get_tile_grid(None)
+        _strut_perm = torch.tensor(dims_key_order_permutation(_NX, _NY, _NZ), dtype=torch.long)
+        _strut_perm_inv = torch.argsort(_strut_perm).to(device)
+
     def _preprocess(sample):
         # convert force to MN / stresses to MPa
         sample.x[:, 3:6] = sample.x[:, 3:6] / 1e+6
@@ -208,9 +222,14 @@ def train_gnn_model(
             # --grad_mode -> MPa/thickness-unit, matching every other stress
             # field's unit convention in this function.
             sample.grad_dks_dx = sample.grad_dks_dx / 1e+6
-        # inject per-node strut dimension: dims[strut_offset + tile_idx]
+        # inject per-node strut dimension: dims[strut_offset + tile_idx],
+        # after reordering from dims-key order to tile_idx-native order
+        # (see _strut_perm above -- indexing dims-key order directly by
+        # tile_idx silently fed most nodes another tile's thickness).
         K = int(sample.tile_NX) * int(sample.tile_NY) * int(sample.tile_NZ)
-        tile_struts = sample.dims[0, strut_offset:strut_offset+K].float()
+        tile_struts_dims_key_order = sample.dims[0, strut_offset:strut_offset+K].float()
+        tile_struts = (tile_struts_dims_key_order[_strut_perm] if _strut_perm is not None
+                       else tile_struts_dims_key_order)
         strut_param = tile_struts[sample.tile_idx].unsqueeze(1)
         sample.x = torch.cat([sample.x, strut_param], dim=1)
         sample.tile_x = tile_struts.view(-1, 1)
@@ -876,7 +895,14 @@ def train_gnn_model(
                 g_tile_x     = g_tile_x.float().to(device, non_blocking=True)
                 if g_node_id is not None:
                     g_node_id = g_node_id.to(device, non_blocking=True)
+                # grad_tile_idx is stored in dims-key order by both
+                # dataset_builder.py's _ccx_run_grad_sample and
+                # _ccx_run_grad_sample_adjoint (it's built from "d{t+1}"
+                # keys), but d_pred's columns below are tile_idx-native
+                # order (t_leaf/tile_x, per _preprocess) -- convert before
+                # gathering, or this silently reads another tile's gradient.
                 g_grad_tile_idx = gbatch.grad_tile_idx.to(device, non_blocking=True).view(g_num_graphs, grad_M)
+                g_grad_tile_idx = _strut_perm_inv[g_grad_tile_idx]
                 g_grad_dks_dx = gbatch.grad_dks_dx.float().to(device, non_blocking=True).view(g_num_graphs, grad_M)
 
                 # Shared differentiable leaf: strut thickness enters the

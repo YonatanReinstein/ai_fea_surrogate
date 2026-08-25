@@ -70,3 +70,51 @@ def parse_frd(path):
         for nid, vals in stress_raw.items() if len(vals) >= 6
     }
     return displacement, stress
+
+
+def parse_frd_sensitivity(path):
+    """Return dfdn: dict mapping node id -> d(objective)/d(normal displacement),
+    the raw (unfiltered) SENSTRE field written by a *SENSITIVITY step's
+    `*NODE FILE / SEN` request. Zero (or absent) for nodes outside the
+    *DESIGNVARIABLES,TYPE=COORDINATE set.
+
+    SENSTRE has two sub-fields, DFDN (raw) and DFDNFIL (spatially filtered,
+    normalized for direct use in an OC-style update) -- this returns DFDN,
+    the physically-scaled derivative, for use as an exact chain-rule term.
+    """
+    with open(path, "r", errors="ignore") as f:
+        lines = f.readlines()
+
+    sen_raw = {}
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped.startswith("-4") and "SENSTRE" in stripped.upper():
+            sen_raw, i = _parse_block(lines, i)
+            continue
+        i += 1
+
+    return {nid: vals[0] for nid, vals in sen_raw.items() if len(vals) >= 1}
+
+
+def parse_frd_normals(path):
+    """Return normal: dict mapping node id -> unit outward-normal (nx, ny, nz),
+    the NORM field CalculiX writes for every *DESIGNVARIABLES,TYPE=COORDINATE
+    node during a *SENSITIVITY step (the mean of the normals on every
+    external face the node belongs to). Needed to project a 3D geometric
+    velocity (e.g. core.geometric_jacobian's dX_dt) onto the single
+    normal-direction component that SENSTRE's DFDN is a derivative of.
+    """
+    with open(path, "r", errors="ignore") as f:
+        lines = f.readlines()
+
+    norm_raw = {}
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped.startswith("-4") and "NORM" in stripped.upper():
+            norm_raw, i = _parse_block(lines, i)
+            continue
+        i += 1
+
+    return {nid: tuple(vals[:3]) for nid, vals in norm_raw.items() if len(vals) >= 3}
