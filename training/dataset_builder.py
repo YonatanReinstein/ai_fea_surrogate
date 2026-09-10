@@ -113,8 +113,6 @@ from core.IritModel import IritModel, IritCModel
 from core.node import Node
 from core.element import Element
 from core.mesh import Mesh
-from core.geometric_jacobian import compute_thickness_jacobian
-from core.tile_sensitivity import assemble_tile_thickness_sensitivity
 from ansys.mapdl.core import MapdlPool
 from ansys.mapdl.core.errors import MapdlRuntimeError
 
@@ -328,7 +326,7 @@ def _kill_and_reap_pool(ex):
 
 def _ccx_run_single(model_path, mesh_threads, fixed_dims, anchor_condition, force_pattern,
                      U, V, W, young, poisson, ccx_path, nproc, get_tile_grid, dim_idx, dims,
-                     graph_path, stress_ks_rho_mpa):
+                     graph_path, stress_ks_rho_mpa, return_comp=False):
     # Top-level (picklable) worker for ProcessPoolExecutor. Unlike MAPDL, ccx
     # needs no persistent client/pool: each sample is a standalone subprocess
     # in its own tempdir, so a plain process pool is enough (see CCXEvaluator).
@@ -375,17 +373,141 @@ def _ccx_run_single(model_path, mesh_threads, fixed_dims, anchor_condition, forc
                     data.tile_idx = None
             if data is None:
                 data = comp.to_graph_with_labels(tile_grid=tg, stress_ks_rho_mpa=stress_ks_rho_mpa)
-            return dim_idx, data, {
+            meta = {
                 "id": dim_idx,
                 **dims,
                 "volume": comp.get_volume(),
                 "max_stress": comp.mesh.get_max_stress(),
                 "ks_stress": comp.mesh.get_aggregated_stress(rho=stress_ks_rho_mpa * 1e-6),
             }
+            return (dim_idx, data, meta, comp) if return_comp else (dim_idx, data, meta)
         except Exception as e:
             print(f"dim_idx={dim_idx} failed (attempt {attempt+1}/{max_retries}): {e}. Retrying...", flush=True)
     print(f"dim_idx={dim_idx} failed after {max_retries} attempts, skipping.", flush=True)
-    return dim_idx, None, None
+    return (dim_idx, None, None, None) if return_comp else (dim_idx, None, None)
+
+
+def _grad_mode_name(v):
+    """Normalize --grad_mode to False | "fd" | "adjoint".
+
+    It used to be a plain bool, so True/"true" must keep meaning the
+    finite-difference builder every existing slurm script was written
+    against; "adjoint" is the exact one.
+    """
+    if v is None or v is False:
+        return False
+    if v is True:
+        return "fd"
+    t = str(v).strip().lower()
+    if t in ("false", "0", "no", "none", ""):
+        return False
+    if t in ("true", "1", "yes", "fd"):
+        return "fd"
+    if t == "adjoint":
+        return "adjoint"
+    raise ValueError(f"--grad_mode must be false, fd (=true) or adjoint, got {v!r}")
+
+
+def _grad_mode_arg(s):
+    return _grad_mode_name(s)
+
+
+def _adjoint_run_grad_sample(model_path, mesh_threads, fixed_dims, anchor_condition,
+                             force_pattern, U, V, W, young, poisson, ccx_path, nproc,
+                             get_tile_grid, dim_idx, dims, graph_path, stress_ks_rho_mpa,
+                             dims_bounds, grad_store_nodes=True, grad_store_tiles=True):
+    """Exact per-node (and per-tile) dKS/dX labels from ONE extra solve.
+
+    This replaces _ccx_run_grad_sample's finite differencing, and the change
+    in economics is the whole point. That worker spent
+    grad_tiles_per_sample EXTRA full ccx solves (6 by default, ~166 s) to
+    label SIX tiles by differencing. core.fem_adjoint now reproduces ccx's
+    C3D8I to 1e-5%, so one adjoint solve on the mesh ccx already built
+    labels EVERY node (dKS/dX, ~45k x 3) and, with the CAD Jacobian, every
+    tile -- exactly, not differenced. Measured on hollow_cube at 3,3,3:
+
+        adjoint solve (factorize + u)   27.6 s   (the unavoidable part)
+        gradient() -> dKS/dX             6.9 s   per-node labels
+        CAD Jacobian dX/dt               6.9 s   per-tile labels
+        chain to per-tile dKS/dt         0.2 s
+
+    ccx still produces the stress labels, unchanged, so this dataset stays
+    label-compatible with everything built before it. The adjoint's own KS
+    is stored alongside as ks_stress_adjoint: it should track ccx's to ~4
+    decimals on every sample, and a drift means the element agreement that
+    core.fem_adjoint's header documents has broken -- cheap standing
+    insurance, given that plain C3D8 agreed at the uniform design and read
+    32% low on thinned ones without anything noticing for four jobs.
+    """
+    out = _ccx_run_single(
+        model_path, mesh_threads, fixed_dims, anchor_condition, force_pattern,
+        U, V, W, young, poisson, ccx_path, nproc, get_tile_grid, dim_idx, dims,
+        graph_path, stress_ks_rho_mpa, return_comp=True,
+    )
+    dim_idx, data, meta, comp = out
+    if data is None:
+        return dim_idx, None, None
+
+    try:
+        from core.fem_adjoint import ShapeAdjoint
+
+        mesh_nodes = comp.mesh.all_nodes()
+        nodes0 = {n.id: tuple(n.coords) for n in mesh_nodes}
+        elements0 = {e.id: [n.id for n in e.nodes] for e in comp.mesh.all_elements()}
+        total_force = [sum(n.forces[j] for n in mesh_nodes) for j in range(3)]
+        sa = ShapeAdjoint(nodes0, elements0,
+                          [n.id for n in mesh_nodes if n.anchored],
+                          [n.id for n in mesh_nodes if any(n.forces)],
+                          total_force, young, poisson)
+        sa.solve()
+        ks_adj = sa.ks(stress_ks_rho_mpa) / 1e6
+        # Stored on `data`, not just `meta`: the sharded writer deliberately
+        # stopped persisting metadata.json (it was a full-array rewrite that
+        # starved the GIL past ~15k samples), so anything that must survive
+        # to training time has to ride along with the sample.
+        meta["ks_stress_adjoint"] = ks_adj
+        data.ks_stress_adjoint = torch.tensor([ks_adj], dtype=torch.float)
+
+        # dKS/dX is returned in sa.ids order (sorted node id). The graph's
+        # node rows are comp.mesh.all_nodes() order, and the two are NOT the
+        # same ordering in general -- align explicitly rather than assuming,
+        # because a silent permutation here is exactly the class of bug that
+        # cost this project two separate tile-transpose hunts.
+        gX = sa.gradient(stress_ks_rho_mpa).numpy() / 1e6      # MPa per length
+        row = {nid: i for i, nid in enumerate(sa.ids)}
+        order = np.array([row[n.id] for n in mesh_nodes], dtype=np.int64)
+        if grad_store_nodes:
+            data.grad_dks_dnode = torch.tensor(gX[order], dtype=torch.float)
+
+        if grad_store_tiles:
+            from core.geometric_jacobian import compute_thickness_jacobian
+            exe = os.path.join(model_path, "model")
+            model_cls, path = IritCModel, exe
+            if not os.path.isfile(exe):
+                exe_win = os.path.join(model_path, "model.exe")
+                if os.path.isfile(exe_win):
+                    path = exe_win
+                else:
+                    model_cls, path = IritModel, os.path.join(model_path, "model.irt")
+            dX_dt, _, _, elem_to_tile, _ = compute_thickness_jacobian(
+                path, dims, U, V, W, fixed_dims=fixed_dims,
+                mesh_threads=mesh_threads, model_cls=model_cls, return_model=True)
+            NX, NY, NZ = get_tile_grid(dims)
+            keys = sorted(dims_bounds, key=lambda k: int(k[1:]))
+            dks_dt = sa.tile_gradient(dX_dt, elem_to_tile, keys, NX, NY, NZ,
+                                      rho_mpa=stress_ks_rho_mpa)
+            # Stored in dims-key order ("d1".."dK"), matching
+            # _ccx_run_grad_sample's convention so the existing
+            # gradient-matching loss in training/gnn_training.py -- which
+            # remaps through _strut_perm_inv -- keeps working unchanged.
+            data.grad_tile_idx = torch.arange(len(keys), dtype=torch.long)
+            data.grad_dks_dx = torch.tensor(
+                [float(dks_dt[k]) / 1e6 for k in keys], dtype=torch.float)
+    except Exception as e:
+        print(f"dim_idx={dim_idx} adjoint gradient failed: {e}", flush=True)
+        return dim_idx, None, None
+
+    return dim_idx, data, meta
 
 
 def _ccx_run_grad_sample(model_path, mesh_threads, fixed_dims, anchor_condition, force_pattern,
@@ -456,79 +578,6 @@ def _ccx_run_grad_sample(model_path, mesh_threads, fixed_dims, anchor_condition,
     return dim_idx, data, meta
 
 
-def _ccx_run_grad_sample_adjoint(model_path, mesh_threads, fixed_dims, anchor_condition, force_pattern,
-                                  U, V, W, young, poisson, ccx_path, nproc, get_tile_grid, dim_idx, dims,
-                                  graph_path, stress_ks_rho_mpa, dims_bounds, grad_max_tiles):
-    """Adjoint alternative to _ccx_run_grad_sample: one base ccx run (for the
-    node/edge training features, unchanged) plus ONE extra mesh regeneration
-    and ONE ccx *SENSITIVITY solve -- covering every tile CCX will accept as
-    a design node (see core.mesh.Mesh.solve_ccx_sensitivity's docstring) in
-    a single pass, instead of grad_tiles_per_sample separate full ccx
-    reruns. See core/geometric_jacobian.py, core/tile_sensitivity.py, and
-    core/mesh.py's solve_ccx_sensitivity for the chain rule itself.
-
-    Which tiles get a valid sensitivity is a function of mesh topology only
-    (CCX's design-node acceptance depends on element connectivity and the
-    fixed anchor/force pattern, not on the sampled thickness values -- see
-    getdesiinfo3d.f) -- so for a fixed geometry/resolution, the same tile
-    set is accepted every sample, and every sample naturally carries the
-    same number of (tile, sensitivity) pairs without needing grad_mode's FD
-    path random per-sample tile choice.
-    """
-    base_idx, data, meta = _ccx_run_single(
-        model_path, mesh_threads, fixed_dims, anchor_condition, force_pattern,
-        U, V, W, young, poisson, ccx_path, nproc, get_tile_grid, dim_idx, dims,
-        graph_path, stress_ks_rho_mpa,
-    )
-    if data is None:
-        return dim_idx, None, None
-
-    try:
-        exe_path = os.path.join(model_path, "model")
-        NX, NY, NZ = get_tile_grid(dims)
-
-        dX_dt, nodes_dict, elements_dict, elem_to_tile = compute_thickness_jacobian(
-            exe_path, dims, U, V, W, fixed_dims=fixed_dims, eps=1e-4,
-        )
-        design_node_ids = [nid for nid, v in dX_dt.items() if any(abs(c) > 1e-9 for c in v)]
-
-        nodes = {nid: Node(nid, xyz) for nid, xyz in nodes_dict.items()}
-        elements = {eid: Element(eid, [nodes[nid] for nid in nlist]) for eid, nlist in elements_dict.items()}
-        sens_mesh = Mesh(nodes, elements)
-        sens_mesh.anchor_nodes_by_condition(anchor_condition)
-        sens_mesh.apply_force_by_pattern(force_pattern)
-
-        _, dfdn, normal = sens_mesh.solve_ccx_sensitivity(
-            young, poisson, design_node_ids, stress_ks_rho_mpa=stress_ks_rho_mpa,
-            ccx_path=ccx_path, nproc=nproc,
-        )
-
-        dims_keys = list(dims_bounds.keys())
-        per_tile = assemble_tile_thickness_sensitivity(
-            dX_dt, dfdn, normal, elements_dict, elem_to_tile, NX, NY, NZ, dims_keys,
-        )
-    except Exception as e:
-        print(f"dim_idx={dim_idx} adjoint sensitivity failed: {e}. Treating sample as failed.", flush=True)
-        return dim_idx, None, None
-
-    if not per_tile:
-        print(f"dim_idx={dim_idx} adjoint sensitivity accepted zero design nodes, "
-              f"treating as failed.", flush=True)
-        return dim_idx, None, None
-
-    # Deterministic (sorted by key) so every sample's grad_tile_idx lists the
-    # same tiles in the same order -- required since training reshapes the
-    # concatenated per-sample tensors to [batch_size, grad_M].
-    keys_sorted = sorted(per_tile.keys(), key=lambda k: int(k[1:]))
-    if grad_max_tiles is not None and grad_max_tiles > 0:
-        keys_sorted = keys_sorted[:grad_max_tiles]
-
-    key_to_idx = {k: i for i, k in enumerate(dims_keys)}
-    data.grad_tile_idx = torch.tensor([key_to_idx[k] for k in keys_sorted], dtype=torch.long)
-    data.grad_dks_dx = torch.tensor([per_tile[k] for k in keys_sorted], dtype=torch.float)
-    return dim_idx, data, meta
-
-
 def build_dataset(
     geometry: str,
     num_samples: int = 10,
@@ -545,11 +594,10 @@ def build_dataset(
     field_amplitude_frac_down: float = 0.10,
     field_base_thickness: float = None,
     field_random_base: bool = False,
-    grad_mode: bool = False,
+    grad_mode=False,
+    grad_store_nodes: bool = True,
     grad_tiles_per_sample: int = 6,
     grad_fd_frac: float = 0.02,
-    grad_engine: str = "fd",
-    grad_max_tiles: int = None,
 ):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -600,6 +648,7 @@ def build_dataset(
     with open(dims_json_path, "r") as f:
         dims_template = json.load(f)
 
+    grad_mode = _grad_mode_name(grad_mode)
     grad_dims_bounds = ({k: (v["min"], v["max"]) for k, v in dims_template.items()}
                          if grad_mode else None)
 
@@ -827,18 +876,22 @@ def build_dataset(
                 # instead of the plain _ccx_run_single -- same
                 # (dim_idx, data, meta) return contract either way, so the
                 # pool/retry/shard machinery below needs no other changes.
-                # grad_engine="fd" (default): _ccx_run_grad_sample, base ccx
-                # run + grad_tiles_per_sample single-tile-perturbed reruns.
-                # grad_engine="adjoint": _ccx_run_grad_sample_adjoint, base
-                # ccx run + one geometric-Jacobian mesh regen + one ccx
-                # *SENSITIVITY solve covering every CCX-accepted tile at
-                # once (see core/tile_sensitivity.py).
+                #   "fd"      _ccx_run_grad_sample: base ccx run +
+                #             grad_tiles_per_sample single-tile-perturbed
+                #             reruns, differencing ks_stress. 6 tiles for 6
+                #             extra solves.
+                #   "adjoint"  _adjoint_run_grad_sample: base ccx run + ONE
+                #             exact adjoint solve labelling every node and
+                #             every tile. Strictly better per second now
+                #             that core.fem_adjoint matches ccx's C3D8I to
+                #             1e-5%; "fd" is kept only to reproduce the
+                #             datasets built before that was true.
                 if not grad_mode:
                     worker_fn = _ccx_run_single
                     worker_extra_args = ()
-                elif grad_engine == "adjoint":
-                    worker_fn = _ccx_run_grad_sample_adjoint
-                    worker_extra_args = (grad_dims_bounds, grad_max_tiles)
+                elif grad_mode == "adjoint":
+                    worker_fn = _adjoint_run_grad_sample
+                    worker_extra_args = (grad_dims_bounds, grad_store_nodes)
                 else:
                     worker_fn = _ccx_run_grad_sample
                     worker_extra_args = (grad_tiles_per_sample, grad_fd_frac, grad_dims_bounds)
@@ -1194,11 +1247,10 @@ if __name__ == "__main__":
             return s
         return str(s).lower() in ("1", "true", "yes", "y", "on")
     parser.add_argument("--field_random_base", type=_bool, default=False, help="Instead of one fixed anchor shared by every field-sampled example (dims.json's default, or --field_base_thickness), draw a fresh scalar anchor per sample uniformly over the tile's real [min, max] range, then add the correlated noise on top of that. Gives full coverage of thin/thick overall baselines instead of just noise around one baseline -- use this to cover the low-volume regime a fixed-default dataset misses (see project_gnn_anchor_sensitivity_bug.md).")
-    parser.add_argument("--grad_mode", type=_bool, default=False, help="Build a gradient-matching-loss dataset instead of a plain one (engine=ccx only): each sample is a base ccx run plus --grad_tiles_per_sample single-tile-perturbed reruns, finite-differencing the real solver's ks_stress to attach ground-truth per-tile sensitivity labels (grad_tile_idx/grad_dks_dx) used by training/gnn_training.py's gradient-matching loss. Point --output_dir at a directory SEPARATE from the main dataset -- samples from this mode must not be mixed into the same shards as unlabeled samples (PyG's batch collation can't handle a mixed schema).")
+    parser.add_argument("--grad_store_nodes", type=_bool, default=True, help="In --grad_mode adjoint, store the full per-node dKS/dX field (grad_dks_dnode, ~45k x 3 floats = 0.54 MB/sample on hollow_cube). false keeps only the per-tile labels, which are ~3 KB/sample.")
+    parser.add_argument("--grad_mode", type=_grad_mode_arg, default=False, help="Build a gradient-matching-loss dataset instead of a plain one (engine=ccx only): each sample is a base ccx run plus --grad_tiles_per_sample single-tile-perturbed reruns, finite-differencing the real solver's ks_stress to attach ground-truth per-tile sensitivity labels (grad_tile_idx/grad_dks_dx) used by training/gnn_training.py's gradient-matching loss. Point --output_dir at a directory SEPARATE from the main dataset -- samples from this mode must not be mixed into the same shards as unlabeled samples (PyG's batch collation can't handle a mixed schema).")
     parser.add_argument("--grad_tiles_per_sample", type=int, default=6, help="Number of tiles to finite-difference per sample in --grad_mode (chosen uniformly at random, seeded by dim_idx for reproducibility).")
-    parser.add_argument("--grad_fd_frac", type=float, default=0.02, help="FD step size in --grad_mode, as a fraction of each tile's own [min,max] span -- matches optimization/topopt_optimizer.py's --fd_step convention so the two are comparable. Ignored by --grad_engine adjoint.")
-    parser.add_argument("--grad_engine", type=str, default="fd", choices=["fd", "adjoint"], help="How --grad_mode computes ground-truth per-tile sensitivity. 'fd' (default): grad_tiles_per_sample separate single-tile-perturbed ccx reruns per sample. 'adjoint': one ccx *SENSITIVITY solve per sample (core/tile_sensitivity.py's chain rule) covering every CCX-accepted tile at once -- far cheaper, but only covers tiles CCX accepts as design nodes (see core/mesh.py's solve_ccx_sensitivity docstring), not every tile.")
-    parser.add_argument("--grad_max_tiles", type=int, default=None, help="--grad_engine adjoint only: cap on how many (tile, sensitivity) pairs to keep per sample (sorted by tile index, so the same subset every sample). Unset/<=0 keeps every CCX-accepted tile.")
+    parser.add_argument("--grad_fd_frac", type=float, default=0.02, help="FD step size in --grad_mode, as a fraction of each tile's own [min,max] span -- matches optimization/topopt_optimizer.py's --fd_step convention so the two are comparable.")
     args = parser.parse_args()
     build_dataset(
         args.geometry, num_samples=args.num_samples, pool_size=args.pool_size, nproc=args.nproc,
@@ -1207,8 +1259,7 @@ if __name__ == "__main__":
         stress_ks_rho_mpa=args.stress_ks_rho_mpa,
         field_amplitude_frac_up=args.field_amplitude_frac_up, field_amplitude_frac_down=args.field_amplitude_frac_down,
         field_base_thickness=args.field_base_thickness, field_random_base=args.field_random_base,
-        grad_mode=args.grad_mode, grad_tiles_per_sample=args.grad_tiles_per_sample, grad_fd_frac=args.grad_fd_frac,
-        grad_engine=args.grad_engine, grad_max_tiles=args.grad_max_tiles,
+        grad_mode=args.grad_mode, grad_store_nodes=args.grad_store_nodes, grad_tiles_per_sample=args.grad_tiles_per_sample, grad_fd_frac=args.grad_fd_frac,
     )
     # By this point every result is already durably written to shards/ on
     # disk -- there's nothing left for normal interpreter shutdown to do.

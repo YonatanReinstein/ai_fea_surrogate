@@ -44,7 +44,7 @@ ulimit -n 65536
 
 torchrun --standalone --nproc_per_node=1 -m training.gnn_training \
     --geometry hollow_cube \
-    --dataset data/hollow_cube/dataset_ccx/dataset.pt \
+    --dataset data/hollow_cube/dataset_gradadj/dataset.pt \
     --grad_dataset_path data/hollow_cube/dataset_grad/dataset.pt \
     --grad_loss_weight 0.1 \
     --num_samples 4000 \

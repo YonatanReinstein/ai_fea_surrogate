@@ -37,7 +37,7 @@ ulimit -n 65536
 unset CUDA_VISIBLE_DEVICES
 torchrun --standalone --nproc_per_node=3 -m training.gnn_training \
     --geometry hollow_cube \
-    --dataset data/hollow_cube/dataset_ccx/dataset.pt \
+    --dataset data/hollow_cube/dataset_gradadj/dataset.pt \
     --num_samples 50000 \
     --epochs 300 \
     --lr 1e-3 \

@@ -39,7 +39,7 @@ ulimit -n 65536
 
 torchrun --standalone --nproc_per_node=1 -m training.gnn_training \
     --geometry hollow_cube_ddptest \
-    --dataset data/hollow_cube/dataset_ccx/dataset.pt \
+    --dataset data/hollow_cube/dataset_gradadj/dataset.pt \
     --num_samples 4000 \
     --epochs 60 --batch_size 8 \
     --hidden_dim 32 --coarse_arch cnn --cnn_depth 3 --conv_layers 6 \

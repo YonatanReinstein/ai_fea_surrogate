@@ -95,7 +95,7 @@ mkdir -p "${RUN_DIR}"
 unset CUDA_VISIBLE_DEVICES
 torchrun --standalone --nproc_per_node=2 -m training.gnn_training \
     --geometry hollow_cube_ddptest \
-    --dataset data/hollow_cube/dataset_ccx/dataset.pt \
+    --dataset data/hollow_cube/dataset_gradadj/dataset.pt \
     --num_samples "${NUM_SAMPLES}" \
     --epochs "${EPOCHS}" \
     --lr 1e-3 \

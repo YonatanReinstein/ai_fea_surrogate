@@ -80,7 +80,8 @@ class HierarchicalGNNCNN(nn.Module):
     def __init__(self, node_in_dim, edge_in_dim=1, hidden_dim=128, num_layers=6, tile_in_dim=1,
                  use_checkpoint=False, checkpoint_fine_only=False,
                  num_pos_nodes=0, dropout=0.0, node_target_mean=0.0, node_target_std=1.0,
-                 stress_ks_rho_mpa=0.15, coarse_dim=None, cnn_depth=3):
+                 stress_ks_rho_mpa=0.15, coarse_dim=None, cnn_depth=3,
+                 predict_node_grad=False):
         super().__init__()
         # num_layers is accepted (unused) for constructor-signature parity with
         # HierarchicalGNN/HierarchicalGNNMP -- checkpoint reconstruction always
@@ -103,6 +104,29 @@ class HierarchicalGNNCNN(nn.Module):
 
         self.encoder = MLP([node_in_dim, hidden_dim, hidden_dim], norm=None, dropout=dropout)
         self.head = MLP([hidden_dim, hidden_dim, 1], norm=None, dropout=dropout)
+        # Per-node dKS/dX head. Predicts the ADJOINT NODAL gradient field
+        # (3 components/node) off the same final hidden state the stress
+        # head reads, so it costs one small MLP and no second forward.
+        #
+        # Why per-node rather than per-tile: the tile sensitivity is
+        # dKS/dt_i = sum_{n in tile i} <dKS/dX_n, dX_n/dt_i>, and dX/dt is
+        # EXACT, block-diagonal geometry from core/geometric_jacobian.py
+        # (two mesh builds, ~10s) -- there is no reason to spend network
+        # capacity approximating a closed-form chain rule. Measured
+        # 2026-09-07: composing stored node gradients through a freshly
+        # computed Jacobian reproduces the stored per-tile labels to
+        # cosine +1.00000002 / rel_l2 3.8e-08 on two very different
+        # designs, and the composition is strikingly error-tolerant --
+        # 20% per-node relative error still gives tile cosine +0.997 with
+        # 0.0% wrong-way mass, versus the constant-direction control's
+        # +0.613 / 12.4%. Each tile sums ~57 node contributions and the
+        # largest single node carries only ~10-14% of its tile's total, so
+        # per-node error averages down instead of accumulating.
+        #
+        # Built only when asked so existing checkpoints keep loading and
+        # runs that do not use it pay nothing.
+        self.grad_head = (MLP([hidden_dim, hidden_dim, 3], norm=None, dropout=dropout)
+                          if predict_node_grad else None)
         self.conv_dropout = nn.Dropout(dropout)
 
         # Fine mesh (real<->real): one pass right after encoding (paired with
@@ -186,7 +210,7 @@ class HierarchicalGNNCNN(nn.Module):
 
     def forward(self, x, edge_index, edge_attr, batch,
                 tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
-                num_graphs=None, node_id=None):
+                num_graphs=None, node_id=None, return_node_grad=False):
         N = x.size(0)
         if num_graphs is None:
             num_graphs = int(batch.max().item()) + 1 if N > 0 else 0
@@ -274,4 +298,9 @@ class HierarchicalGNNCNN(nn.Module):
         node_pred = self.head(h)
         graph_pred = ks_pool(node_pred, batch, num_graphs, self.node_target_mean,
                               self.node_target_std, self.stress_ks_rho_mpa)
+        if return_node_grad:
+            assert self.grad_head is not None, (
+                "return_node_grad=True but the model was built with "
+                "predict_node_grad=False -- no grad_head exists")
+            return graph_pred, node_pred, self.grad_head(h)
         return graph_pred, node_pred

@@ -41,3 +41,17 @@ optimization/*.pptx
 training/runs/
 training/*.png
 training/*.html
+
+# topopt run byproducts: per-generation history, checkpoints and screenshots.
+# One 300-generation run writes ~17MB of history and ~56MB of renders.
+optimization/artifacts_*/
+optimization/screenshots_*/
+# scratch probes//analysis scripts and their outputs (see the session that
+# produced evaluators/probe_dg_alignment.py)
+logs_probe/
+# trained checkpoints and per-shard datasets live outside git
+data/*/checkpoints*/
+data/*/*.pt
+data/*/gradsub*/
+data/*/grad_audit*/
+data/*/grad_val_mid/

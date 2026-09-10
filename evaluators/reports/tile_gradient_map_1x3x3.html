@@ -1,0 +1,516 @@
+<title>Tile Gradient Map</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  color-scheme:light;
+  --plane:#f2f4f6; --surface:#fdfdfe; --surface-2:#f6f8fa;
+  --ink:#14171a; --ink-2:#4b5257; --muted:#828a90;
+  --rule:#e1e6ea; --rule-2:#c9d1d6;
+  --mid:#eceff1;
+  --n1:#cde2fb; --n2:#9ec5f4; --n3:#5598e7; --n4:#2a78d6; --n5:#184f95;
+  --p1:#fbd5d1; --p2:#f3ada7; --p3:#e06e68; --p4:#ca4442; --p5:#8c2828;
+  --band:rgba(42,120,214,.11);
+  --hatch:#a3adb4;
+  --shadow:0 1px 2px rgba(20,23,26,.05),0 10px 30px -16px rgba(20,23,26,.28);
+  --focus:#2a78d6;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --plane:#0c0f11; --surface:#171b1e; --surface-2:#1d2226;
+    --ink:#f1f4f6; --ink-2:#b2babf; --muted:#7e868c;
+    --rule:#2a3035; --rule-2:#3b4349;
+    --mid:#262c31;
+    --n1:#104281; --n2:#1c5cab; --n3:#2a78d6; --n4:#5598e7; --n5:#86b6ef;
+    --p1:#7a1c1e; --p2:#a22e2e; --p3:#cc4140; --p4:#e26d66; --p5:#ee9891;
+    --band:rgba(85,152,231,.15);
+    --hatch:#616b72;
+    --shadow:0 1px 2px rgba(0,0,0,.45),0 10px 30px -16px rgba(0,0,0,.8);
+    --focus:#5598e7;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --plane:#0c0f11; --surface:#171b1e; --surface-2:#1d2226;
+  --ink:#f1f4f6; --ink-2:#b2babf; --muted:#7e868c;
+  --rule:#2a3035; --rule-2:#3b4349;
+  --mid:#262c31;
+  --n1:#104281; --n2:#1c5cab; --n3:#2a78d6; --n4:#5598e7; --n5:#86b6ef;
+  --p1:#7a1c1e; --p2:#a22e2e; --p3:#cc4140; --p4:#e26d66; --p5:#ee9891;
+  --band:rgba(85,152,231,.15);
+  --hatch:#616b72;
+  --shadow:0 1px 2px rgba(0,0,0,.45),0 10px 30px -16px rgba(0,0,0,.8);
+  --focus:#5598e7;
+}
+
+*{box-sizing:border-box}
+body{
+  background:var(--plane); color:var(--ink);
+  font-family:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  font-size:15px; line-height:1.6; -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1060px;margin:0 auto;padding:56px 24px 96px;display:flex;flex-direction:column;gap:52px}
+
+.eyebrow{
+  font-family:"IBM Plex Sans Condensed","IBM Plex Sans",sans-serif;
+  font-weight:600;font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--muted);margin:0;
+}
+h1{font-size:34px;line-height:1.15;font-weight:600;letter-spacing:-.02em;margin:10px 0 0;text-wrap:balance}
+h2{font-size:20px;font-weight:600;letter-spacing:-.01em;margin:0;text-wrap:balance}
+p{margin:0;max-width:66ch;color:var(--ink-2)}
+p strong{color:var(--ink);font-weight:600}
+code,.mono{font-family:"IBM Plex Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums}
+code{font-size:.9em;background:var(--surface-2);border:1px solid var(--rule);border-radius:4px;padding:.05em .35em}
+
+header .lede{margin-top:14px;font-size:16.5px}
+.meta{
+  margin-top:22px;display:flex;flex-wrap:wrap;gap:0;
+  border:1px solid var(--rule);border-radius:8px;background:var(--surface);overflow:hidden;
+}
+.meta div{padding:11px 18px;border-right:1px solid var(--rule);flex:1 1 auto}
+.meta div:last-child{border-right:0}
+.meta dt{font-family:"IBM Plex Sans Condensed",sans-serif;font-weight:600;font-size:10.5px;
+  letter-spacing:.13em;text-transform:uppercase;color:var(--muted);margin:0}
+.meta dd{margin:3px 0 0;font-family:"IBM Plex Mono",monospace;font-size:13.5px;font-variant-numeric:tabular-nums}
+
+section{display:flex;flex-direction:column;gap:18px}
+.section-head{display:flex;flex-direction:column;gap:7px}
+
+.panel{
+  background:var(--surface);border:1px solid var(--rule);border-radius:10px;
+  box-shadow:var(--shadow);padding:26px 26px 22px;
+}
+.figscroll{overflow-x:auto;padding-bottom:4px}
+figcaption{margin-top:16px;font-size:13.5px;color:var(--ink-2);max-width:70ch}
+
+svg{display:block}
+svg text{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums}
+svg .lbl{font-family:"IBM Plex Sans Condensed",sans-serif;font-weight:600;
+  letter-spacing:.11em;text-transform:uppercase;fill:var(--muted)}
+.cell{cursor:default;transition:opacity .12s ease}
+.grid-hot:hover .cell{opacity:.45}
+.grid-hot .cell:hover{opacity:1}
+
+.smalls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px}
+.smalls>figure{margin:0;display:flex;flex-direction:column;gap:9px;min-width:0}
+.smalls h3,.ratios h3{margin:0;font-family:"IBM Plex Mono",monospace;font-size:13px;font-weight:600}
+.smalls .sub{font-size:12px;color:var(--muted);font-family:"IBM Plex Mono",monospace}
+.ratios{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px}
+.ratios>figure{margin:0;display:flex;flex-direction:column;gap:9px;min-width:0}
+
+.findings{display:flex;flex-direction:column;gap:0;border-top:1px solid var(--rule)}
+.finding{display:grid;grid-template-columns:minmax(140px,180px) 1fr;gap:24px;
+  padding:18px 0;border-bottom:1px solid var(--rule);align-items:start}
+.finding h3{margin:0;font-size:14.5px;font-weight:600;letter-spacing:-.005em}
+.finding p{font-size:14px;margin:0}
+.finding .num{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--muted);
+  display:block;margin-bottom:3px}
+
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:8px 12px;text-align:right;border-bottom:1px solid var(--rule);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+thead th{font-family:"IBM Plex Sans Condensed",sans-serif;font-weight:600;font-size:10.5px;
+  letter-spacing:.12em;text-transform:uppercase;color:var(--muted);
+  border-bottom:1px solid var(--rule-2);padding-top:0}
+tbody td{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;color:var(--ink-2)}
+tbody td.k{color:var(--ink);font-weight:500}
+tbody tr:last-child td{border-bottom:0}
+.grp{border-left:1px solid var(--rule)}
+th.grp-head{text-align:center;border-left:1px solid var(--rule)}
+
+#tip{
+  position:fixed;z-index:50;pointer-events:none;opacity:0;transition:opacity .1s ease;
+  background:var(--surface);color:var(--ink);border:1px solid var(--rule-2);border-radius:7px;
+  box-shadow:var(--shadow);padding:9px 12px;font-size:12.5px;line-height:1.55;
+  font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;max-width:250px;
+}
+#tip b{font-weight:600;display:block;margin-bottom:3px;font-size:13px}
+#tip .dim{color:var(--muted)}
+
+footer{color:var(--muted);font-size:12.5px;border-top:1px solid var(--rule);padding-top:18px}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:3px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+@media (max-width:820px){
+  .smalls,.ratios{grid-template-columns:1fr}
+  .finding{grid-template-columns:1fr;gap:6px}
+  h1{font-size:28px}
+}
+</style>
+
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">CalculiX axis-adjoint &middot; hollow_cube_133</p>
+  <h1>Per-tile stress gradient on a 1&times;3&times;3 tile grid</h1>
+  <p class="lede">Every cell is <code>d(KS stress)/d(tile thickness)</code> for one tile of a cantilever
+  plate, from three patched-ccx solves and validated tile-by-tile against remesh finite differences.
+  The map is drawn in the part&rsquo;s own coordinates: root wall at the left, load at the tip.</p>
+  <dl class="meta">
+    <div><dt>Geometry</dt><dd>40 &times; 21 &times; 1, 9 tiles</dd></div>
+    <div><dt>Element</dt><dd>C3D8, interior on</dd></div>
+    <div><dt>Mesh 9,9,9</dt><dd>22,392 nodes / 18,432 el</dd></div>
+    <div><dt>KS stress</dt><dd>2.3095e+08 Pa</dd></div>
+    <div><dt>Solve cost</dt><dd>3 solves, all 9 tiles</dd></div>
+  </dl>
+</header>
+
+<section>
+  <div class="section-head">
+    <p class="eyebrow">The map &middot; mesh 9,9,9</p>
+    <h2>Where thickness buys stress relief</h2>
+    <p>Blue means thickening the tile <strong>lowers</strong> peak stress; red means thickening it
+    <strong>raises</strong> peak stress. Colour is signed magnitude on a log scale, because the root
+    tiles are ~700&times; stronger than the tip tiles and a linear scale would render everything but
+    the root row blank.</p>
+  </div>
+  <figure class="panel" style="margin:0">
+    <div class="figscroll"><div id="hero"></div></div>
+    <div class="figscroll" style="margin-top:20px"><div id="legend"></div></div>
+    <figcaption>Hover any tile for its gradient, its remesh-FD reference value and the ratio between
+    them. The two red tiles, <code>d5</code> and <code>d8</code>, sit on the neutral axis away from
+    the root &mdash; adding material there buys no bending stiffness and pushes the peak stress up.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <div class="section-head">
+    <p class="eyebrow">Reading the map</p>
+    <h2>Three checks the solver was never told to satisfy</h2>
+  </div>
+  <div class="findings">
+    <div class="finding">
+      <div><span class="num">0.17% / 0.9% / 7.1%</span><h3>Mirror symmetry</h3></div>
+      <p>Geometry and load are symmetric about y&nbsp;=&nbsp;10.5, so <code>d1</code>/<code>d3</code>,
+      <code>d4</code>/<code>d6</code> and <code>d7</code>/<code>d9</code> have to pair. They do, to
+      within those margins &mdash; and nothing in the pipeline imposes it. It falls out of three
+      independent ccx solves. The pairs widen as the magnitude drops, which is the signature of
+      finite-difference noise rather than of a broken gradient.</p>
+    </div>
+    <div class="finding">
+      <div><span class="num">&minus;2.73e8 vs &minus;3.05e8</span><h3>The neutral axis shows up</h3></div>
+      <p>The load bends the plate about x, putting the neutral axis at y&nbsp;=&nbsp;10.5 &mdash;
+      exactly the <code>d2</code>/<code>d5</code>/<code>d8</code> column. Those tiles should do the
+      least for bending stiffness, and at the root <code>d2</code> is the weakest of the three despite
+      sitting directly under the load path. Away from the root the same effect flips the sign outright:
+      <code>d5</code> and <code>d8</code> go positive.</p>
+    </div>
+    <div class="finding">
+      <div><span class="num">&asymp;660&times;</span><h3>Root dominance</h3></div>
+      <p>The strongest root tile is &minus;3.05e+08 against the strongest tip tile&rsquo;s
+      &minus;4.59e+05. All the bending moment is at z&nbsp;=&nbsp;0, so essentially the entire
+      optimisation gradient lives in the three root tiles &mdash; the row sums are &minus;8.8e+08 at
+      the root against +6.7e+04 at the tip. A surrogate that gets the tip tiles wrong costs almost
+      nothing; one that gets the root row wrong is useless.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="section-head">
+    <p class="eyebrow">Mesh convergence</p>
+    <h2>5,5,5 is not enough for tiles this large</h2>
+    <p>Same nine tiles, same colour scale, three resolutions. At <code>5,5,5</code> the whole field is
+    too weak <em>and</em> <code>d5</code>/<code>d8</code> point the wrong way. At <code>7,7,7</code> and
+    <code>9,9,9</code> the structure is stable. This is the elements-per-wall rule: nine tiles over the
+    same plate makes each element roughly 2.3&times; coarser in plane than the 48-tile geometry, and the 0.3-thick frame
+    walls stop being resolved.</p>
+  </div>
+  <figure class="panel" style="margin:0">
+    <div class="smalls" id="smalls"></div>
+    <figcaption>The sign flip at <code>d5</code>/<code>d8</code> is not a gradient error &mdash; the
+    remesh-FD reference flips with it. It is the KS objective itself being discretisation-defined, the
+    same non-convergence measured earlier on <code>hollow_cube_one</code>.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <div class="section-head">
+    <p class="eyebrow">Validation</p>
+    <h2>Adjoint contraction &divide; remesh finite difference</h2>
+    <p>One dot per tile. The shaded band is &plusmn;5% of the finite-difference truth; the line is
+    exact agreement. Each remesh-FD reference costs two full solves per tile &mdash; 18 solves against
+    the adjoint&rsquo;s 3.</p>
+  </div>
+  <figure class="panel" style="margin:0">
+    <div class="ratios" id="ratios"></div>
+    <figcaption>Sign agreement is 9/9 at every resolution. At <code>9,9,9</code> the ratio median is
+    <strong>1.0002</strong>, spanning 0.966&ndash;1.108; the two widest tiles are <code>d7</code> and
+    <code>d9</code>, whose absolute magnitudes are the smallest on the plate and closest to FD noise.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <div class="section-head">
+    <p class="eyebrow">All values</p>
+    <h2>dKS/dt in Pa per unit thickness</h2>
+  </div>
+  <div class="panel figscroll">
+    <table id="tbl"></table>
+  </div>
+</section>
+
+<footer>
+  Patched CalculiX 2.17 (<code>ccx_axis</code>) with <code>CCX_DESI_AXIS</code>,
+  <code>CCX_NO_AREA_NORM</code> and <code>CCX_DESI_INTERIOR</code>. KS aggregation &rho; = 0.15 /MPa.
+  Reference values from central-difference remeshing at 2% of each tile&rsquo;s bound range.
+</footer>
+
+</div>
+<div id="tip" role="status" aria-live="polite"></div>
+
+<script>
+const TILES=[
+ {id:"d1",y:3.5,z:6.67,col:0,row:2},{id:"d2",y:10.5,z:6.67,col:0,row:1},{id:"d3",y:17.5,z:6.67,col:0,row:0},
+ {id:"d4",y:3.5,z:20.0,col:1,row:2},{id:"d5",y:10.5,z:20.0,col:1,row:1},{id:"d6",y:17.5,z:20.0,col:1,row:0},
+ {id:"d7",y:3.5,z:33.33,col:2,row:2},{id:"d8",y:10.5,z:33.33,col:2,row:1},{id:"d9",y:17.5,z:33.33,col:2,row:0}];
+const RUNS={
+ "5,5,5":{ks:7.34519e7,nodes:3320,el:2304,v:{
+   d1:[-3.0587e7,-3.4325e7,0.8911], d2:[-1.0542e7,-1.1642e7,0.9055], d3:[-3.0796e7,-3.4325e7,0.8972],
+   d4:[-2.4187e6,-3.9482e6,0.6126], d5:[-1.0608e6,-2.0972e6,0.5058], d6:[-2.4587e6,-3.9482e6,0.6227],
+   d7:[-2.9576e5,-8.8506e5,0.3342], d8:[-4.3073e5,-1.3413e6,0.3211], d9:[-2.9876e5,-8.8506e5,0.3376]}},
+ "7,7,7":{ks:1.30641e8,nodes:10024,el:7776,v:{
+   d1:[-1.4285e8,-1.4290e8,0.9997], d2:[-1.0912e8,-1.0923e8,0.9990], d3:[-1.4303e8,-1.4290e8,1.0009],
+   d4:[-3.3802e6,-3.4278e6,0.9861], d5:[ 7.2393e6, 7.2239e6,1.0021], d6:[-3.3666e6,-3.4278e6,0.9822],
+   d7:[-3.2404e5,-3.3558e5,0.9656], d8:[ 4.3382e5, 4.1981e5,1.0334], d9:[-3.3585e5,-3.3558e5,1.0008]}},
+ "9,9,9":{ks:2.30954e8,nodes:22392,el:18432,v:{
+   d1:[-3.0484e8,-3.0366e8,1.0039], d2:[-2.7283e8,-2.7278e8,1.0002], d3:[-3.0431e8,-3.0366e8,1.0021],
+   d4:[-4.9878e6,-5.1656e6,0.9656], d5:[ 1.7394e7, 1.7409e7,0.9991], d6:[-5.0345e6,-5.1656e6,0.9746],
+   d7:[-4.5890e5,-4.1410e5,1.1082], d8:[ 9.5380e5, 9.7599e5,0.9773], d9:[-4.2751e5,-4.1410e5,1.0324]}}};
+const MESHES=["5,5,5","7,7,7","9,9,9"];
+const LO=5, HI=9;   // log10 decades spanned by the colour scale
+
+/* ---------- colour ---------- */
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function hex2rgb(h){h=h.replace("#","");return [0,2,4].map(i=>parseInt(h.slice(i,i+2),16));}
+function mix(a,b,t){return "rgb("+a.map((v,i)=>Math.round(v+(b[i]-v)*t)).join(",")+")";}
+let RAMP={};
+function loadRamp(){
+  RAMP={mid:hex2rgb(css("--mid")),
+    neg:[1,2,3,4,5].map(i=>hex2rgb(css("--n"+i))),
+    pos:[1,2,3,4,5].map(i=>hex2rgb(css("--p"+i)))};
+}
+function tOf(v){
+  const m=Math.abs(v); if(!(m>0)) return 0;
+  return Math.max(0,Math.min(1,(Math.log10(m)-LO)/(HI-LO)));
+}
+function colorOf(v){
+  const t=tOf(v), arm=v<0?RAMP.neg:RAMP.pos, stops=[RAMP.mid,...arm];
+  const x=t*(stops.length-1), i=Math.min(stops.length-2,Math.floor(x));
+  return mix(stops[i],stops[i+1],x-i);
+}
+function inkOn(rgbStr){
+  const [r,g,b]=rgbStr.match(/\d+/g).map(Number);
+  const f=c=>{c/=255;return c<=.03928?c/12.92:Math.pow((c+.055)/1.055,2.4);};
+  return (.2126*f(r)+.7152*f(g)+.0722*f(b))>0.42?"#14171a":"#ffffff";
+}
+
+/* ---------- formatting ---------- */
+function sci(v,d){
+  const [m,e]=v.toExponential(d===undefined?2:d).split("e");
+  return m.replace("-","\u2212")+"e"+(e[0]==="-"?"\u2212":"+")+String(Math.abs(+e)).padStart(2,"0");
+}
+const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;");
+
+/* ---------- tooltip ---------- */
+const tip=document.getElementById("tip");
+function bindTip(el,html){
+  el.addEventListener("pointerenter",()=>{tip.innerHTML=html;tip.style.opacity="1";});
+  el.addEventListener("pointermove",e=>{
+    const r=tip.getBoundingClientRect();
+    let x=e.clientX+16, y=e.clientY+16;
+    if(x+r.width>innerWidth-10) x=e.clientX-r.width-16;
+    if(y+r.height>innerHeight-10) y=e.clientY-r.height-16;
+    tip.style.left=x+"px"; tip.style.top=y+"px";
+  });
+  el.addEventListener("pointerleave",()=>{tip.style.opacity="0";});
+}
+
+/* ---------- heat grid ---------- */
+function grid(mesh,{cw,ch,big}){
+  const L=big?64:26, R=big?96:10, T=big?34:8, B=big?40:20;
+  const W=L+cw*3+R, H=T+ch*3+B, run=RUNS[mesh];
+  const p=[];
+  p.push(`<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" class="grid-hot"
+    aria-label="Gradient heat map, mesh ${mesh}">`);
+  if(big){
+    // fixity hatch on the root wall
+    p.push(`<g stroke="var(--hatch)" stroke-width="1.4">
+      <line x1="${L-9}" y1="${T-4}" x2="${L-9}" y2="${T+ch*3+4}"/>`);
+    for(let i=0;i<=17;i++){const yy=T-4+i*((ch*3+8)/17);
+      p.push(`<line x1="${L-9}" y1="${yy}" x2="${L-19}" y2="${yy+9}"/>`);}
+    p.push(`</g>`);
+    p.push(`<text class="lbl" font-size="9.5" x="${L-14}" y="${T+ch*3+30}"
+      text-anchor="start" transform="rotate(-90 ${L-14} ${T+ch*3+30})">Root &#183; anchored z=0</text>`);
+    // load arrow at the tip, middle row
+    const ax=L+cw*3+30, ay=T+ch*1.5;
+    p.push(`<g stroke="var(--ink)" stroke-width="1.6" fill="none">
+      <line x1="${ax}" y1="${ay-30}" x2="${ax}" y2="${ay+22}"/>
+      <path d="M${ax-5} ${ay+15} L${ax} ${ay+24} L${ax+5} ${ay+15}" stroke-linejoin="round"/></g>`);
+    p.push(`<text class="lbl" font-size="9.5" x="${ax+9}" y="${ay-14}">Load</text>`);
+    p.push(`<text font-size="10" fill="var(--muted)" x="${ax+9}" y="${ay+1}">&#8722;5e7 N</text>`);
+    p.push(`<text font-size="10" fill="var(--muted)" x="${ax+9}" y="${ay+14}">in &#8722;y</text>`);
+    // neutral axis
+    p.push(`<line x1="${L-4}" y1="${T+ch*1.5}" x2="${L+cw*3+4}" y2="${T+ch*1.5}"
+      stroke="var(--ink)" stroke-width="1" stroke-dasharray="1 4" opacity=".5"/>`);
+    p.push(`<text class="lbl" font-size="9" x="${L+cw*3+4}" y="${T+ch*1.5-6}" text-anchor="end">Neutral axis y=10.5</text>`);
+    p.push(`<text class="lbl" font-size="9.5" x="${L+cw*1.5}" y="${T-16}" text-anchor="middle">z &#8594; length (mm)</text>`);
+    p.push(`<text class="lbl" font-size="9.5" x="${20}" y="${T+ch*1.5}"
+      text-anchor="middle" transform="rotate(-90 20 ${T+ch*1.5})">y &#8594; height (mm)</text>`);
+  }
+  TILES.forEach(t=>{
+    const [g,fd,r]=run.v[t.id];
+    const x=L+t.col*cw, y=T+t.row*ch, fill=colorOf(g), ink=inkOn(fill);
+    p.push(`<g class="cell"><rect x="${x+1}" y="${y+1}" width="${cw-2}" height="${ch-2}" rx="3"
+      fill="${fill}" stroke="var(--surface)" stroke-width="2"/>`);
+    if(big){
+      p.push(`<text x="${x+12}" y="${y+22}" font-size="12" font-weight="600" fill="${ink}" opacity=".78">${t.id}</text>`);
+      p.push(`<text x="${x+cw/2}" y="${y+ch/2+11}" font-size="17" font-weight="500"
+        text-anchor="middle" fill="${ink}">${sci(g,2)}</text>`);
+    }else{
+      p.push(`<text x="${x+cw/2}" y="${y+ch/2+3.5}" font-size="10" font-weight="500"
+        text-anchor="middle" fill="${ink}">${sci(g,1)}</text>`);
+    }
+    p.push(`</g>`);
+  });
+  if(big){
+    ["6.7","20.0","33.3"].forEach((z,i)=>
+      p.push(`<text x="${L+cw*(i+.5)}" y="${T+ch*3+22}" font-size="10.5" fill="var(--muted)"
+        text-anchor="middle">z=${z}</text>`));
+    ["17.5","10.5","3.5"].forEach((y,i)=>
+      p.push(`<text x="${L-14}" y="${T+ch*(i+.5)+4}" font-size="10.5" fill="var(--muted)"
+        text-anchor="end">${y}</text>`));
+  }else{
+    p.push(`<text x="${L}" y="${T+ch*3+13}" font-size="9.5" fill="var(--muted)">root</text>`);
+    p.push(`<text x="${L+cw*3}" y="${T+ch*3+13}" font-size="9.5" fill="var(--muted)" text-anchor="end">tip</text>`);
+  }
+  p.push(`</svg>`);
+  return p.join("");
+}
+function bindCells(root,mesh){
+  const run=RUNS[mesh];
+  root.querySelectorAll("g.cell").forEach((g,i)=>{
+    const t=TILES[i], [v,fd,r]=run.v[t.id];
+    bindTip(g,`<b>${t.id} &middot; mesh ${mesh}</b>
+      <span class="dim">y=${t.y}&nbsp;&nbsp;z=${t.z}</span><br>
+      dKS/dt&nbsp; ${sci(v,3)}<br>
+      remesh FD&nbsp; ${sci(fd,3)}<br>
+      ratio&nbsp; ${r.toFixed(4)}<br>
+      <span class="dim">${v<0?"thicker → lower stress":"thicker → HIGHER stress"}</span>`);
+  });
+}
+
+/* ---------- legend ---------- */
+function legend(){
+  const W=680,H=64,BX=30,BY=16,BW=W-60,BH=15, n=120;
+  const p=[`<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img"
+    aria-label="Colour scale: signed log magnitude of dKS/dt">`];
+  for(let i=0;i<n;i++){
+    const f=i/(n-1);
+    const t=1-Math.abs(f-.5)*2;
+    const arm=f<.5?RAMP.neg:RAMP.pos, stops=[RAMP.mid,...arm];
+    const x=t*(stops.length-1), k=Math.min(stops.length-2,Math.floor(x));
+    p.push(`<rect x="${BX+BW*i/n}" y="${BY}" width="${BW/n+.7}" height="${BH}"
+      fill="${mix(stops[k],stops[k+1],x-k)}"/>`);
+  }
+  p.push(`<rect x="${BX}" y="${BY}" width="${BW}" height="${BH}" fill="none"
+    stroke="var(--rule-2)" stroke-width="1" rx="2"/>`);
+  const ticks=[[0,"\u22121e9"],[.125,"\u22121e8"],[.25,"\u22121e7"],[.375,"\u22121e6"],[.5,"0"],
+               [.625,"+1e6"],[.75,"+1e7"],[.875,"+1e8"],[1,"+1e9"]];
+  ticks.forEach(([f,lab])=>{
+    const x=BX+BW*f;
+    p.push(`<line x1="${x}" y1="${BY+BH}" x2="${x}" y2="${BY+BH+4}" stroke="var(--rule-2)"/>`);
+    p.push(`<text x="${x}" y="${BY+BH+16}" font-size="10" fill="var(--muted)" text-anchor="middle">${lab}</text>`);
+  });
+  p.push(`<text class="lbl" font-size="9.5" x="${BX}" y="${BY-5}">Thicker &#8594; lower stress</text>`);
+  p.push(`<text class="lbl" font-size="9.5" x="${BX+BW}" y="${BY-5}" text-anchor="end">Thicker &#8594; higher stress</text>`);
+  p.push(`<text font-size="10" fill="var(--muted)" x="${BX+BW/2}" y="${H-2}" text-anchor="middle">dKS/dt, Pa per unit thickness &#183; log scale on each arm</text>`);
+  p.push(`</svg>`);
+  return p.join("");
+}
+
+/* ---------- ratio strip ---------- */
+function ratios(mesh){
+  const W=300,H=200,L=42,R=12,T=14,B=30, run=RUNS[mesh];
+  const lo=0.25, hi=1.20;
+  const yv=r=>T+(H-T-B)*(1-(r-lo)/(hi-lo));
+  const xv=i=>L+(W-L-R)*((i+.5)/9);
+  const p=[`<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="xMidYMid meet"
+    role="img" aria-label="Ratio of adjoint contraction to remesh FD, mesh ${mesh}">`];
+  p.push(`<rect x="${L}" y="${yv(1.05)}" width="${W-L-R}" height="${yv(0.95)-yv(1.05)}" fill="var(--band)"/>`);
+  [0.4,0.6,0.8,1.0].forEach(r=>{
+    p.push(`<line x1="${L}" y1="${yv(r)}" x2="${W-R}" y2="${yv(r)}" stroke="var(--rule)"
+      stroke-width="1" ${r===1?'stroke-dasharray="none"':''}/>`);
+    p.push(`<text x="${L-8}" y="${yv(r)+3.5}" font-size="10" fill="var(--muted)" text-anchor="end">${r.toFixed(1)}</text>`);
+  });
+  p.push(`<line x1="${L}" y1="${yv(1)}" x2="${W-R}" y2="${yv(1)}" stroke="var(--ink)" stroke-width="1.4" opacity=".55"/>`);
+  TILES.slice().sort((a,b)=>a.id<b.id?-1:1).forEach((t,i)=>{
+    const r=run.v[t.id][2];
+    p.push(`<g class="dot"><circle cx="${xv(i)}" cy="${yv(Math.max(lo,Math.min(hi,r)))}" r="4.5"
+      fill="var(--ink)" stroke="var(--surface)" stroke-width="2"/>
+      <circle cx="${xv(i)}" cy="${yv(Math.max(lo,Math.min(hi,r)))}" r="11" fill="transparent"/></g>`);
+    p.push(`<text x="${xv(i)}" y="${H-10}" font-size="9.5" fill="var(--muted)" text-anchor="middle">${t.id}</text>`);
+  });
+  p.push(`<text class="lbl" font-size="9" x="${L-34}" y="${T+(H-T-B)/2}" text-anchor="middle"
+    transform="rotate(-90 ${L-34} ${T+(H-T-B)/2})">adjoint / FD</text>`);
+  p.push(`</svg>`);
+  return p.join("");
+}
+
+/* ---------- table ---------- */
+function table(){
+  const h=[`<thead><tr><th rowspan="2">Tile</th><th rowspan="2">y</th><th rowspan="2">z</th>`];
+  MESHES.forEach(m=>h.push(`<th class="grp-head" colspan="2">mesh ${m}</th>`));
+  h.push(`</tr><tr>`);
+  MESHES.forEach(()=>h.push(`<th class="grp">dKS/dt</th><th>ratio</th>`));
+  h.push(`</tr></thead><tbody>`);
+  TILES.slice().sort((a,b)=>a.id<b.id?-1:1).forEach(t=>{
+    h.push(`<tr><td class="k">${t.id}</td><td>${t.y.toFixed(1)}</td><td>${t.z.toFixed(2)}</td>`);
+    MESHES.forEach(m=>{const [v,fd,r]=RUNS[m].v[t.id];
+      h.push(`<td class="grp">${sci(v,3)}</td><td>${r.toFixed(4)}</td>`);});
+    h.push(`</tr>`);
+  });
+  h.push(`</tbody>`);
+  return h.join("");
+}
+
+/* ---------- render ---------- */
+function render(){
+  loadRamp();
+  const hero=document.getElementById("hero");
+  hero.innerHTML=grid("9,9,9",{cw:186,ch:118,big:true});
+  bindCells(hero,"9,9,9");
+  document.getElementById("legend").innerHTML=legend();
+
+  const sm=document.getElementById("smalls");
+  sm.innerHTML=MESHES.map(m=>`<figure>
+      <h3>mesh ${m}</h3>
+      <div class="sub">${RUNS[m].nodes.toLocaleString()} nodes &middot; KS ${sci(RUNS[m].ks,3)} Pa</div>
+      <div class="figscroll" data-mesh="${m}">${grid(m,{cw:88,ch:60,big:false})}</div>
+    </figure>`).join("");
+  sm.querySelectorAll("[data-mesh]").forEach(d=>bindCells(d,d.dataset.mesh));
+
+  const rt=document.getElementById("ratios");
+  rt.innerHTML=MESHES.map(m=>{
+    const rs=TILES.map(t=>RUNS[m].v[t.id][2]).sort((a,b)=>a-b);
+    return `<figure><h3>mesh ${m}</h3>
+      <div class="sub">median ${rs[4].toFixed(4)} &middot; ${rs[0].toFixed(2)}&ndash;${rs[8].toFixed(2)}</div>
+      <div data-mesh="${m}">${ratios(m)}</div></figure>`;}).join("");
+  rt.querySelectorAll("[data-mesh]").forEach(d=>{
+    const m=d.dataset.mesh, ids=TILES.map(t=>t.id).sort();
+    d.querySelectorAll("g.dot").forEach((g,i)=>{
+      const [v,fd,r]=RUNS[m].v[ids[i]];
+      bindTip(g,`<b>${ids[i]} &middot; mesh ${m}</b>
+        adjoint&nbsp; ${sci(v,3)}<br>remesh FD&nbsp; ${sci(fd,3)}<br>
+        ratio&nbsp; ${r.toFixed(4)} <span class="dim">(${((r-1)*100).toFixed(1)}%)</span>`);
+    });
+  });
+
+  document.getElementById("tbl").innerHTML=table();
+}
+render();
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change",render);
+new MutationObserver(render).observe(document.documentElement,{attributes:true,attributeFilter:["data-theme"]});
+</script>

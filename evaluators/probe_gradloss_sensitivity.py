@@ -62,6 +62,14 @@ def load_model(ckpt_path, geometry, device):
         else:
             model_kwargs["coarse_dim"] = ckpt.get("coarse_dim")
             model_kwargs["cnn_depth"] = ckpt.get("cnn_depth", 3)
+            # Rebuild the per-node dKS/dX head when the checkpoint has one.
+            # Checkpoints written before "predict_node_grad" was recorded
+            # still carry grad_head.* weights, so fall back to sniffing the
+            # state_dict -- otherwise the model is built without the head
+            # and load_state_dict drops those tensors on the floor.
+            model_kwargs["predict_node_grad"] = ckpt.get(
+                "predict_node_grad",
+                any(k.startswith("grad_head.") for k in ckpt["model_state"]))
     model = ModelClass(**model_kwargs).to(device)
 
     if hierarchical:
@@ -116,11 +124,23 @@ def compute_sensitivities(model, stats, dataset, device, strut_offset):
         d_pred = torch.autograd.grad(graph_pred_raw_mpa.sum(), t_leaf)[0].view(-1)
 
         # grad_tile_idx is stored in dims-key order (dataset_builder.py's
-        # _ccx_run_grad_sample/_ccx_run_grad_sample_adjoint build it from
-        # "d{t+1}" keys); d_pred's columns are tile_idx-native (t_leaf's
-        # own layout) -- convert before indexing.
+        # _ccx_run_grad_sample builds it from "d{t+1}" keys); d_pred's
+        # columns are tile_idx-native (t_leaf's own layout) -- convert
+        # before indexing.
         grad_tile_idx = strut_perm_inv[sample.grad_tile_idx.to(device)]
-        grad_dks_dx_true = sample.grad_dks_dx.float() / 1e6  # Pa/unit -> MPa/unit, matches _preprocess
+        # Same unit trap as training/gnn_training.py's _preprocess: the two
+        # --grad_mode builders store this label in DIFFERENT units.
+        #   fd      -- dataset_builder._ccx_run_grad_sample finite-differences
+        #              raw ccx ks_stress, giving Pa/unit, so it needs /1e6.
+        #   adjoint -- dataset_builder._adjoint_run_grad_sample ALREADY divides
+        #              by 1e6 when storing the label; dividing again makes the
+        #              ground truth 1e6x too small and every model then looks
+        #              ~1e6x "too large".
+        # ks_stress_adjoint is written only by the adjoint builder, so it is
+        # the reliable discriminator.
+        grad_dks_dx_true = sample.grad_dks_dx.float()
+        if not hasattr(sample, "ks_stress_adjoint"):
+            grad_dks_dx_true = grad_dks_dx_true / 1e6  # Pa/unit -> MPa/unit
 
         preds.append(d_pred[grad_tile_idx].detach().cpu())
         trues.append(grad_dks_dx_true)

@@ -72,7 +72,7 @@ def parse_frd(path):
     return displacement, stress
 
 
-def parse_frd_sensitivity(path):
+def parse_frd_sensitivity(path, block: str = "SENSTRE"):
     """Return dfdn: dict mapping node id -> d(objective)/d(normal displacement),
     the raw (unfiltered) SENSTRE field written by a *SENSITIVITY step's
     `*NODE FILE / SEN` request. Zero (or absent) for nodes outside the
@@ -81,6 +81,13 @@ def parse_frd_sensitivity(path):
     SENSTRE has two sub-fields, DFDN (raw) and DFDNFIL (spatially filtered,
     normalized for direct use in an OC-style update) -- this returns DFDN,
     the physically-scaled derivative, for use as an exact chain-rule term.
+
+    `block` selects which sensitivity field to read: CalculiX names it after
+    the *OBJECTIVE, so a MASS objective writes SENMASS instead of SENSTRE
+    (same DFDN/DFDNFIL sub-field layout). A MASS run is the calibration case
+    -- with *DENSITY 1.0 the objective is exactly the volume, whose true
+    derivative is known independently, which is how the DFDN convention was
+    pinned down.
     """
     with open(path, "r", errors="ignore") as f:
         lines = f.readlines()
@@ -89,7 +96,7 @@ def parse_frd_sensitivity(path):
     i = 0
     while i < len(lines):
         stripped = lines[i].strip()
-        if stripped.startswith("-4") and "SENSTRE" in stripped.upper():
+        if stripped.startswith("-4") and block.upper() in stripped.upper():
             sen_raw, i = _parse_block(lines, i)
             continue
         i += 1

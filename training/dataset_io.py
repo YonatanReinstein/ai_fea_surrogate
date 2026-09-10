@@ -13,6 +13,7 @@ Layout: <dataset_dir>/shards/shard_{start:06d}_{end:06d}.pt, each a plain list
 of torch_geometric Data objects (same schema as before).
 """
 import glob
+import io
 import os
 import torch
 
@@ -38,10 +39,35 @@ def save_shard(dataset_dir: str, start_idx: int, samples: list) -> str:
     return path
 
 
+
+def load_shard(path: str) -> list:
+    """torch.load a shard, reading the file in ONE sequential pass.
+
+    torch.load(path) lets torch seek around the .pt zip container, which on
+    this NFS home (nfs1.vast:/newton_users) turns into a long stream of small
+    high-latency reads. Measured on a cold 657MB shard:
+
+        torch.load(path)                      57 MB/s
+        read() + torch.load(BytesIO)         395 MB/s   (6.9x)
+        plain sequential read alone          623 MB/s
+
+    Under two concurrent DDP ranks on a cold node it degrades much further --
+    job 1371761 was observed loading at 6 MB/s per rank, i.e. ~9 hours to read
+    a 322GB dataset that streams in minutes (dd: 447 MB/s one stream,
+    1165 MB/s over eight). Slurping the file first makes the read sequential
+    and hands torch a purely in-memory buffer.
+
+    Costs one shard's worth of extra transient RAM (~657MB here) per call.
+    """
+    with open(path, "rb") as f:
+        buf = f.read()
+    return torch.load(io.BytesIO(buf), weights_only=False)
+
+
 def load_sharded_dataset(dataset_dir: str) -> list:
     dataset = []
     for p in shard_paths(dataset_dir):
-        dataset.extend(torch.load(p, weights_only=False))
+        dataset.extend(load_shard(p))
     return dataset
 
 

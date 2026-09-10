@@ -11,8 +11,51 @@ from torch_geometric.utils import scatter
 from utils.gnn_surrogate import GNN, HierarchicalGNN
 from utils.gnn_hierarchical_mp import HierarchicalGNNMP
 from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
-from training.dataset_io import load_dataset, shard_paths
+from training.dataset_io import load_dataset, load_shard, shard_paths
 from core.tile_sensitivity import dims_key_order_permutation
+
+
+def weighted_node_grad_loss(pred, true, batch_idx, scale, power=1.0, cos_weight=0.0):
+    """Match the adjoint NODAL field dKS/dX, weighted toward the nodes the
+    geometric composition actually sums.
+
+    An UNWEIGHTED mean over this target does not work, and job 1374298 is the
+    proof: 1.93M node targets whose mean |slog| is 0.049 against a std of
+    0.291 (97.2% of the field's mass sits in one decile of nodes), so plain
+    MSE is minimised by predicting ~0 everywhere. That run drove its loss from
+    0.0959 to 0.0248 -- below the 0.0848 zero-prediction floor -- while the
+    predicted magnitudes collapsed to 87x too small and the COMPOSED per-tile
+    dg went anti-correlated (cosine -0.360, 82.8% wrong-way mass).
+
+    Two corrections, mirroring what already works elsewhere in this file:
+      power     -- per-graph magnitude weighting, exactly weighted_node_mse's
+                   scheme but keyed on |dKS/dX| instead of von Mises stress.
+                   The composition sums <g_n, dX_n/dt>, so mass-carrying
+                   nodes are the ones worth fitting.
+      cos_weight-- per-sample direction term on the raw node field. Scale-
+                   invariant, so it cannot be satisfied by shrinking toward
+                   zero -- the exact failure above. The best dg model this
+                   project has produced (run 2 early, median cosine +0.683 vs
+                   a +0.558 constant-direction control) came from adding the
+                   tile-level analogue of this term.
+    """
+    def _sl(v):
+        return torch.sign(v) * torch.log1p(v.abs() / scale)
+    mag = true.norm(dim=1)
+    w_pow = mag.pow(power)
+    totals = scatter(w_pow, batch_idx, dim=0, reduce="sum")
+    w = w_pow / (totals[batch_idx] + 1e-12)
+    sq = ((_sl(pred) - _sl(true)) ** 2).sum(dim=1)
+    loss = scatter(w * sq, batch_idx, dim=0, reduce="sum").mean()
+
+    cos = None
+    if cos_weight > 0.0:
+        num = scatter((pred * true).sum(dim=1), batch_idx, dim=0, reduce="sum")
+        pn  = scatter((pred * pred).sum(dim=1), batch_idx, dim=0, reduce="sum").clamp_min(1e-24).sqrt()
+        tn  = scatter((true * true).sum(dim=1), batch_idx, dim=0, reduce="sum").clamp_min(1e-24).sqrt()
+        cos = (num / (pn * tn)).clamp(-1.0, 1.0)
+        loss = loss + cos_weight * (1.0 - cos).mean()
+    return loss, cos
 
 
 # ======================================================
@@ -123,7 +166,13 @@ def train_gnn_model(
     lr_plateau_factor: float = 0.5,
     seed_offset: int = 42,
     grad_dataset_path: str = None,
+    grad_from_train: bool = False,
+    node_grad_weight: float = 0.0,
+    node_grad_power: float = 1.0,
+    node_grad_cos_weight: float = 0.0,
     grad_loss_weight: float = 0.1,
+    grad_cos_weight: float = 0.0,
+    grad_sign_weight: float = 0.0,
     grad_batch_size: int = None,
 ):
     torch.manual_seed(42)
@@ -218,10 +267,23 @@ def train_gnn_model(
         sample.ks_stress = sample.ks_stress / 1e+6
         sample.node_stress = sample.node_stress / 1e+6
         if hasattr(sample, "grad_dks_dx"):
-            # Raw Pa/thickness-unit from training/dataset_builder.py's
-            # --grad_mode -> MPa/thickness-unit, matching every other stress
-            # field's unit convention in this function.
-            sample.grad_dks_dx = sample.grad_dks_dx / 1e+6
+            # The two --grad_mode builders store this label in DIFFERENT
+            # units, so key off which one wrote the sample:
+            #   fd      -- dataset_builder._ccx_run_grad_sample finite-
+            #              differences raw ccx ks_stress, giving Pa/unit, so
+            #              it needs the /1e6 like every other stress field.
+            #   adjoint -- dataset_builder._adjoint_run_grad_sample ALREADY
+            #              divides by 1e6 when storing the label, and stores
+            #              ks_stress_adjoint in MPa while ks_stress stays Pa
+            #              (that 1e6 is exactly the agreement-guard ratio).
+            # Applying the conversion twice put the adjoint labels 1e6 too
+            # small -- measured mean|dks/dx| 109.75 -> 1.098e-04 MPa/unit --
+            # which parks the signed-log grad loss in log1p's linear regime
+            # and trains the surrogate toward a ZERO gradient field, i.e. the
+            # exact defect this dataset was built to fix. ks_stress_adjoint
+            # is written only by the adjoint path, so it is the discriminator.
+            if not hasattr(sample, "ks_stress_adjoint"):
+                sample.grad_dks_dx = sample.grad_dks_dx / 1e+6
         # inject per-node strut dimension: dims[strut_offset + tile_idx],
         # after reordering from dims-key order to tile_idx-native order
         # (see _strut_perm above -- indexing dims-key order directly by
@@ -271,7 +333,7 @@ def train_gnn_model(
 
         train_set = []
         for p in my_train_shards:
-            for sample in torch.load(p, weights_only=False):
+            for sample in load_shard(p):
                 _preprocess(sample)  # converts max_stress to MPa -- must run before the threshold check
                 if sample.max_stress < 3000:
                     train_set.append(sample)
@@ -279,7 +341,7 @@ def train_gnn_model(
         if is_main:
             val_set = []
             for p in val_shards:
-                for sample in torch.load(p, weights_only=False):
+                for sample in load_shard(p):
                     _preprocess(sample)
                     if sample.max_stress < 3000:
                         val_set.append(sample)
@@ -502,14 +564,61 @@ def train_gnn_model(
     # to build), so no sharding is needed the way the (much larger) main
     # dataset requires under DDP.
     # ----------------------------------------------------
+    def _slog_scaled(v, scale):
+        """Signed log1p compression, shared by the tile-gradient loss and
+        the node-gradient head. Both targets span many decades, so a plain
+        MSE is dominated by the largest-magnitude entries."""
+        return torch.sign(v) * torch.log1p(v.abs() / scale)
+
+    grad_enabled = (grad_dataset_path is not None) or grad_from_train
+    # Scale for the node-gradient signed-log loss. Same role as
+    # grad_target_scale below: it only sets where log1p's compression
+    # starts, so a mean of |dKS/dX| over a subsample is enough.
+    node_grad_scale = None
+    if node_grad_weight > 0.0:
+        _ng = [s.grad_dks_dnode.abs().mean() for s in train_set[:512]
+               if hasattr(s, "grad_dks_dnode")]
+        assert _ng, ("--node_grad_weight set but no train sample has "
+                     "grad_dks_dnode; rebuild with --grad_store_nodes true")
+        node_grad_scale = (torch.stack(_ng).mean() + 1e-12).to(device)
+        print(f"[node-grad] rank={rank} scale={node_grad_scale.item():.6g} MPa/length "
+              f"from {len(_ng)} samples")
     grad_loader = None
     grad_M = 0
     grad_target_scale = None
     K_tiles = 0
-    if grad_dataset_path:
-        grad_dataset = load_dataset(grad_dataset_path)
-        for sample in grad_dataset:
-            _preprocess(sample)
+    if grad_dataset_path or grad_from_train:
+        if grad_from_train:
+            # Draw gradient supervision from THIS rank's already-loaded train
+            # shards instead of a separate file. Every dataset_gradadj sample
+            # carries grad_dks_dx/grad_tile_idx already -- data/hollow_cube/
+            # gradsub was only a 1-in-10 SYMLINK subsample of the very same
+            # shards (41 of 501, stride 10), so the old default trained the
+            # grad loss on 4,100 of 50,001 available gradients.
+            #
+            # That starved it: grad_iter below cycles, so the number of grad
+            # steps per epoch is set by the MAIN loader (2496 steps), not by
+            # the pool size. With 4,100 samples at grad_batch_size 4 that is
+            # ~2.4 passes over the same gradients EVERY epoch (~41 passes by
+            # epoch 17). Job 1373261's held-out dg peaked at epoch ~4
+            # (median cosine +0.715, beating the +0.613 constant-direction
+            # control) and collapsed to +0.062 by epoch 15 while TRAIN cos
+            # rose to +0.9585 -- textbook memorisation of the small pool.
+            #
+            # train_set is this rank's own shard slice and is already
+            # _preprocess()ed, so do NOT re-run it (that would re-convert
+            # max_stress to MPa a second time). Costs no extra memory (same
+            # objects) and no extra compute (the iterator cycles either way).
+            # Val shards are excluded by construction, so grad_audit stays
+            # clean as a held-out set.
+            grad_dataset = [s for s in train_set if hasattr(s, "grad_tile_idx")]
+            assert grad_dataset, (
+                "--grad_from_train set but no train sample has grad_tile_idx; "
+                "the main dataset must be built with --grad_mode adjoint")
+        else:
+            grad_dataset = load_dataset(grad_dataset_path)
+            for sample in grad_dataset:
+                _preprocess(sample)
         assert grad_dataset and hasattr(grad_dataset[0], "grad_tile_idx"), (
             f"{grad_dataset_path} has no grad_tile_idx/grad_dks_dx samples -- build it with "
             f"training/dataset_builder.py --grad_mode true (or jobs/build_grad_dataset_hollow_cube.slurm)"
@@ -550,6 +659,9 @@ def train_gnn_model(
 
     hierarchical = hasattr(train_set[0], 'tile_idx')
     assert coarse_arch in ("transformer", "gnn", "cnn"), coarse_arch
+    assert not (node_grad_weight > 0.0 and coarse_arch != "cnn"), (
+        "--node_grad_weight is only implemented for coarse_arch=cnn "
+        "(HierarchicalGNNCNN.grad_head); it would silently do nothing otherwise")
     if hierarchical:
         ModelClass = {"transformer": HierarchicalGNN, "gnn": HierarchicalGNNMP,
                       "cnn": HierarchicalGNNCNN}[coarse_arch]
@@ -581,6 +693,7 @@ def train_gnn_model(
             model_kwargs["dropout"] = mp_dropout
             model_kwargs["coarse_dim"] = coarse_dim
             model_kwargs["cnn_depth"] = cnn_depth
+            model_kwargs["predict_node_grad"] = node_grad_weight > 0.0
     raw_model = ModelClass(**model_kwargs).to(device)
     if hierarchical:
         # Fixed-topology: the tile grid never changes during a training run,
@@ -643,7 +756,7 @@ def train_gnn_model(
         # reduction..." until this was added -- also needs True.
         model = DDP(model, device_ids=[local_rank],
                     find_unused_parameters=(coarse_arch in ("transformer", "cnn")),
-                    # static_graph=True whenever grad_dataset_path is set: the
+                    # static_graph=True whenever the grad loss is on (either
                     # grad-loss block calls model(...) a SECOND time (grad
                     # batch) before the single combined loss.backward(), and
                     # PyTorch's own DDP docs list "multiple forward calls in
@@ -651,8 +764,8 @@ def train_gnn_model(
                     # every step here, so it's safe). Left off by default
                     # (only one forward/step normally -- no need to pay the
                     # first-few-iteration graph-capture cost).
-                    static_graph=(grad_dataset_path is not None),
-                    # broadcast_buffers=False whenever grad_dataset_path is
+                    static_graph=grad_enabled,
+                    # broadcast_buffers=False whenever the grad loss is on
                     # set: DDP's default (True) re-copies every registered
                     # buffer -- including the model's node_target_mean/
                     # node_target_std (utils/gnn_surrogate.py's
@@ -672,7 +785,7 @@ def train_gnn_model(
                     # already broadcast-synced across ranks and never change
                     # during training, so the redundant per-forward re-copy
                     # was doing nothing useful even before this bug.
-                    broadcast_buffers=(grad_dataset_path is None))
+                    broadcast_buffers=(not grad_enabled))
     print(f"[compile] torch.compile enabled={compiled}")
     print(f"[ddp] model wrapped={ddp}")
 
@@ -686,6 +799,7 @@ def train_gnn_model(
     train_node_losses  = []
     val_node_losses    = []
     train_grad_losses  = []  # gradient-matching loss (train-only, see grad_iter above)
+    train_gcos_losses  = []  # 1-cos(pred_dg,true_dg); the OC-relevant direction metric
 
     # ----------------------------------------------------
     # Resume from latest checkpoint if available
@@ -728,6 +842,7 @@ def train_gnn_model(
             train_node_losses  = prev.get("train_node_losses", [])[:start_epoch]
             val_node_losses    = prev.get("val_node_losses", [])[:start_epoch]
             train_grad_losses  = prev.get("train_grad_losses", [])[:start_epoch]
+            train_gcos_losses  = prev.get("train_gcos_losses", [])[:start_epoch]
 
     # Best-checkpoint tracking (by val ks_stress/graph loss) -- recovered from
     # the resumed loss history so a resumed run doesn't reset "best" and
@@ -758,6 +873,11 @@ def train_gnn_model(
             "hierarchical": hierarchical,
             "num_pos_nodes": num_pos_nodes,
             "coarse_arch": coarse_arch,
+            # Needed to rebuild the model with its dKS/dX head; without it a
+            # loader constructs predict_node_grad=False and silently drops
+            # every grad_head.* weight. Loaders written before this key
+            # existed can infer it from the state_dict key prefix instead.
+            "predict_node_grad": node_grad_weight > 0.0,
             "transformer_heads": transformer_heads,
             "transformer_ff_mult": transformer_ff_mult,
             "stress_ks_rho_mpa": stress_ks_rho_mpa,
@@ -805,6 +925,9 @@ def train_gnn_model(
         total_train_graph = 0.0
         total_train_node  = 0.0
         total_train_grad  = 0.0
+        total_train_gcos  = 0.0
+        total_train_ngrad = 0.0
+        total_train_ncos  = 0.0
 
         # Per-section timing (only collected on epoch 1 to keep overhead off the steady state).
         profile_this_epoch = (epoch == start_epoch + 1)
@@ -855,11 +978,16 @@ def train_gnn_model(
                 _sync(); t_now = time.perf_counter(); t_h2d += t_now - t_mark; t_mark = t_now
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                graph_pred, node_pred = model(
+                _mo = model(
                     x_norm, edge_index, edge_attr_norm, batch_idx,
                     tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
                     tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
+                    **({"return_node_grad": True} if node_grad_weight > 0.0 else {}),
                 )
+                if node_grad_weight > 0.0:
+                    graph_pred, node_pred, node_grad_pred = _mo
+                else:
+                    graph_pred, node_pred = _mo
                 # graph_pred lives in node-normalized space (see ks_pool) --
                 # de-normalize to raw linear MPa (unchanged, must stay linear
                 # to match ks_pool's physics), then log+normalize to compare
@@ -870,7 +998,34 @@ def train_gnn_model(
                 node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx, stress_weight_power)
                 loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
 
+                # Node-gradient head: match the ADJOINT NODAL field
+                # dKS/dX directly, then let core/geometric_jacobian.py's
+                # exact dX/dt do the chain rule at inference instead of
+                # asking the network to learn a closed-form Jacobian.
+                #
+                # Rides the MAIN batch: every dataset_gradadj sample
+                # carries grad_dks_dnode, so this needs no second forward,
+                # no create_graph=True double backward, and no separate
+                # pool that can be cycled to memorisation (the defect that
+                # killed job 1373261 -- 4,100 gradients re-visited ~41x).
+                #
+                # Signed-log is the right transform HERE even though it was
+                # the wrong one for the per-tile loss. Per tile the metric
+                # is absolute and mass-weighted, so log1p discarded exactly
+                # the structure OC follows. Per node, slog is effectively a
+                # uniform RELATIVE-error objective, and the composition was
+                # measured to tolerate ~100% relative node error while still
+                # beating the constant-direction control (20% error ->
+                # tile cosine +0.997, 0.0% wrong-way mass).
+                if node_grad_weight > 0.0:
+                    ng_true = batch_data.grad_dks_dnode.float().to(device, non_blocking=True)
+                    node_grad_loss, node_grad_cos = weighted_node_grad_loss(
+                        node_grad_pred.float(), ng_true, batch_idx, node_grad_scale,
+                        power=node_grad_power, cos_weight=node_grad_cos_weight)
+                    loss = loss + node_grad_weight * node_grad_loss
+
             grad_loss = None
+            grad_cos = None
             if grad_iter is not None:
                 # Gradient-matching (Sobolev) loss: penalize the surrogate's
                 # own autodiff sensitivity d(ks_stress)/d(tile thickness) for
@@ -895,10 +1050,9 @@ def train_gnn_model(
                 g_tile_x     = g_tile_x.float().to(device, non_blocking=True)
                 if g_node_id is not None:
                     g_node_id = g_node_id.to(device, non_blocking=True)
-                # grad_tile_idx is stored in dims-key order by both
-                # dataset_builder.py's _ccx_run_grad_sample and
-                # _ccx_run_grad_sample_adjoint (it's built from "d{t+1}"
-                # keys), but d_pred's columns below are tile_idx-native
+                # grad_tile_idx is stored in dims-key order by
+                # dataset_builder.py's _ccx_run_grad_sample (it's built from
+                # "d{t+1}" keys), but d_pred's columns below are tile_idx-native
                 # order (t_leaf/tile_x, per _preprocess) -- convert before
                 # gathering, or this silently reads another tile's gradient.
                 g_grad_tile_idx = gbatch.grad_tile_idx.to(device, non_blocking=True).view(g_num_graphs, grad_M)
@@ -938,6 +1092,68 @@ def train_gnn_model(
                 grad_loss = loss_fn(_slog(pred_grad_at_tiles), _slog(g_grad_dks_dx))
                 loss = loss + grad_loss_weight * grad_loss
 
+                # Direction term. The signed-log MSE above is a MAGNITUDE
+                # objective, and evaluators/probe_dg_alignment.py showed it is
+                # misaligned with what optimization/topopt_optimizer.py's OC
+                # step actually consumes: after 30 epochs the slog term had
+                # fallen 7x (0.191 -> 0.028) while per-sample
+                # cosine(pred_dg, true_dg) stayed at the noise floor (median
+                # +0.019 -> +0.064, i.e. the predicted descent direction is
+                # orthogonal to the true one). Root cause is the target's ~6
+                # decades of dynamic range with 97.6% of the gradient mass in
+                # one decile of tiles: log1p is the only transform that makes
+                # that trainable, and it is exactly the transform that discards
+                # the magnitude structure OC follows.
+                #
+                # Cosine is scale-invariant, so it does not fight the slog
+                # term, and it weights the high-mass tiles automatically --
+                # the subset OC steps along. Computed on the raw (not slog)
+                # vectors for that reason.
+                if grad_cos_weight > 0.0:
+                    grad_cos = (1.0 - torch.nn.functional.cosine_similarity(
+                        pred_grad_at_tiles.float(), g_grad_dks_dx.float(), dim=1, eps=1e-12,
+                    )).mean()
+                    loss = loss + grad_cos_weight * grad_cos
+
+                # Mass-weighted SIGN term. Cosine and the slog MSE both leave
+                # the metric OC is most exposed to untouched: the fraction of
+                # total |dg| MASS whose sign is wrong. Measured across every
+                # run this session, that number sits at 15-22% while a
+                # constant-direction control achieves 9.0% -- and it does NOT
+                # improve as cosine does (the low-LR run reached cosine +0.828
+                # with 18.7% wrong-way mass). Cosine is dominated by the few
+                # largest tiles, so a model can align globally while flipping
+                # the sign on a fifth of the mass; OC then drives exactly
+                # those tiles the wrong way.
+                #
+                # Hinge on the wrong side only: relu(-pred*sign(true)) is 0
+                # wherever the sign already agrees, so this adds no pressure
+                # on tiles that are already correct and cannot fight the
+                # magnitude term there. Weighted by |true| and normalised per
+                # sample, it is a differentiable surrogate for exactly the
+                # wrong-way-mass fraction the probe reports.
+                if grad_sign_weight > 0.0:
+                    _t = g_grad_dks_dx.float()
+                    _p = pred_grad_at_tiles.float()
+                    _w = _t.abs() / (_t.abs().sum(dim=1, keepdim=True) + 1e-12)
+                    # MARGIN hinge, not a plain sign hinge. relu(-p*sign(t)) is
+                    # exactly 0 at p=0, so a plain version has a degenerate minimum
+                    # at 'predict nothing' -- the same collapse that destroyed the
+                    # node-gradient head (job 1374298, predictions 87x too small).
+                    # Measured: a zero predictor scored a PERFECT 0.000 under the
+                    # plain hinge while the real model scored 0.556, and dividing by
+                    # mean|pred| does NOT fix it (0/eps is still 0).
+                    #
+                    # Requiring pred*sign(true) >= m * mean|true| instead means a
+                    # zero prediction costs the full margin m on every tile, while a
+                    # correct, confidently-signed one costs nothing. Small tiles sit
+                    # below the margin but carry ~zero weight, so they do not drive it.
+                    _m = 0.5
+                    _s = _t.abs().mean(dim=1, keepdim=True) + 1e-12
+                    _margin = torch.relu(_m - _p * torch.sign(_t) / _s)
+                    grad_sign = (_w * _margin).sum(dim=1).mean()
+                    loss = loss + grad_sign_weight * grad_sign
+
             if profile_this_epoch:
                 _sync(); t_now = time.perf_counter(); t_fwd += t_now - t_mark; t_mark = t_now
 
@@ -955,6 +1171,12 @@ def train_gnn_model(
             total_train_node  += node_loss.item()
             if grad_loss is not None:
                 total_train_grad += grad_loss.item()
+            if grad_cos is not None:
+                total_train_gcos += grad_cos.item()
+            if node_grad_weight > 0.0:
+                total_train_ngrad += node_grad_loss.item()
+                if node_grad_cos is not None:
+                    total_train_ncos += (1.0 - node_grad_cos).mean().item()
             n_steps += 1
 
         if profile_this_epoch and n_steps > 0:
@@ -973,10 +1195,14 @@ def train_gnn_model(
         avg_train_graph = total_train_graph / n_train_batches
         avg_train_node  = total_train_node  / n_train_batches
         avg_train_grad  = total_train_grad  / n_train_batches
+        avg_train_gcos  = total_train_gcos  / n_train_batches
+        avg_train_ngrad = total_train_ngrad / n_train_batches
+        avg_train_ncos  = total_train_ncos  / n_train_batches
         train_losses.append(avg_train)
         train_graph_losses.append(avg_train_graph)
         train_node_losses.append(avg_train_node)
         train_grad_losses.append(avg_train_grad)
+        train_gcos_losses.append(avg_train_gcos)
 
         if torch.cuda.is_available():
             peak = torch.cuda.max_memory_allocated() / 1e9
@@ -1114,6 +1340,15 @@ def train_gnn_model(
             # -----------------------------
             # Save checkpoint every 10 epochs
             # -----------------------------
+            # Per-epoch model-only snapshot. best-val selection above keys
+            # on val ks_stress, which job 1373261 showed is the WRONG
+            # criterion for dg: its stress kept improving (0.0508 log MPa at
+            # epoch 15) while held-out dg fell below a constant-direction
+            # predictor. Snapshotting every epoch lets
+            # evaluators/probe_dg_alignment.py pick the best-dg epoch offline,
+            # without adding a double-backward validation pass to the loop.
+            torch.save(_build_ckpt(), os.path.join(save_dir, f"epoch_{epoch:03d}.pt"))
+
             if epoch % 10 == 0 or epoch == epochs:
                 ckpt = _build_ckpt(include_optimizer=True)
                 torch.save(ckpt, os.path.join(save_dir, f"{epoch}_epochs.pt"))
@@ -1127,12 +1362,19 @@ def train_gnn_model(
                         "train_node_losses": train_node_losses,
                         "val_node_losses": val_node_losses,
                         "train_grad_losses": train_grad_losses,
+                        "train_gcos_losses": train_gcos_losses,
                     }, f, indent=4)
 
             epoch_secs = time.time() - epoch_t0
             train_graph_rmse_mpa = avg_train_graph ** 0.5 * graph_target_std_full.item()
             val_graph_rmse_mpa   = avg_val_graph   ** 0.5 * graph_target_std_full.item()
             grad_str = f" / grad {avg_train_grad:.6f}" if grad_iter is not None else ""
+            if node_grad_weight > 0.0:
+                grad_str += f" / ngrad {avg_train_ngrad:.6f}"
+                if node_grad_cos_weight > 0.0:
+                    grad_str += f" / ncos {1.0 - avg_train_ncos:+.4f}"
+            if grad_iter is not None and grad_cos_weight > 0.0:
+                grad_str += f" / cos {1.0 - avg_train_gcos:+.4f}"
             print(
                 f"Epoch {epoch:03d}/{epochs} | {epoch_secs:6.1f}s | "
                 f"Train: {avg_train:.6f} (g {avg_train_graph:.6f} [{train_graph_rmse_mpa:.4f} log MPa] / n {avg_train_node:.6f}{grad_str}) | "
@@ -1243,6 +1485,17 @@ if __name__ == "__main__":
                              "sequence across all epochs -- e.g. to dodge a specific batch shape "
                              "that trips a torch.compile guard/specialization bug at some epoch, "
                              "without disabling --use_compile.")
+    parser.add_argument("--node_grad_power", default=1.0, type=float,
+                        help="Magnitude-weighting exponent for the node-gradient loss (weight ~ |dKS/dX|^power, normalised per graph, same scheme as --stress_weight_power). 0 = unweighted, which collapses to a zero predictor on this sparse field.")
+    parser.add_argument("--node_grad_cos_weight", default=0.0, type=float,
+                        help="Weight on 1-cos(pred,true) over each sample's node-gradient field. Scale-invariant, so unlike the MSE term it cannot be satisfied by shrinking predictions toward zero.")
+    parser.add_argument("--node_grad_weight", default=0.0, type=float,
+                        help="Weight on the per-node dKS/dX head (signed-log MSE). Composed to per-tile dg at inference through the EXACT CAD Jacobian, so the net never learns geometry. Rides the main batch: no double backward, no separate grad pool. coarse_arch=cnn only. 0 disables it.")
+    parser.add_argument("--grad_from_train", default=False, type=_bool,
+                        help="Draw the gradient-loss pool from the loaded train shards "
+                             "(~40k gradients) instead of --grad_dataset_path. The old "
+                             "gradsub file is a 1-in-10 symlink subsample of the SAME "
+                             "shards (4,100 samples), which memorised by ~epoch 5.")
     parser.add_argument("--grad_dataset_path", default=None, type=str,
                         help="Path to a gradient-matching dataset built with "
                              "training/dataset_builder.py --grad_mode true, e.g. "
@@ -1254,6 +1507,11 @@ if __name__ == "__main__":
                              "d(ks_stress)/d(tile thickness) against ground-truth FD sensitivities "
                              "from the real solver. Unset (default) -> feature fully disabled, "
                              "no behavior change.")
+    parser.add_argument("--grad_sign_weight", default=0.0, type=float,
+                        help="Weight on a mass-weighted sign hinge over the per-tile dg: relu(-pred*sign(true)) weighted by |true| and normalised per sample. A differentiable surrogate for the wrong-way-|dg|-mass fraction, the one metric that has not improved while cosine did. 0 disables it.")
+    parser.add_argument("--grad_cos_weight", default=0.0, type=float,
+                        help="Weight on 1-cos(pred_dg,true_dg), the direction term OC "
+                             "actually consumes. 0 disables it (magnitude-only).")
     parser.add_argument("--grad_loss_weight", default=0.1, type=float,
                         help="Weight on the gradient-matching loss term (only used when "
                              "--grad_dataset_path is set). Start conservative -- this is a new, "
@@ -1299,6 +1557,12 @@ if __name__ == "__main__":
         lr_plateau_factor=args.lr_plateau_factor,
         seed_offset=args.seed_offset,
         grad_dataset_path=args.grad_dataset_path,
+        grad_from_train=args.grad_from_train,
+        node_grad_weight=args.node_grad_weight,
+        node_grad_power=args.node_grad_power,
+        node_grad_cos_weight=args.node_grad_cos_weight,
         grad_loss_weight=args.grad_loss_weight,
+        grad_cos_weight=args.grad_cos_weight,
+        grad_sign_weight=args.grad_sign_weight,
         grad_batch_size=args.grad_batch_size,
     )

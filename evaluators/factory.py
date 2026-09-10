@@ -6,7 +6,8 @@ from .ccx_evaluator import CCXEvaluator
 
 def get_evaluator(geometry_name, arch="mlp", screenshots: bool = False, processes: int = None, batch_size: int = 128,
                    mesh_threads: int = 4, nproc: int = 1, heatmap_base_only: bool = False, stress_ks_rho_mpa: float = 0.15,
-                   gnn_ckpt_path: str = None):
+                   gnn_ckpt_path: str = None, ccx_axis_path: str = None, gradient_nproc: int = None,
+                   ccx_gradient: str = "adjoint"):
     if arch == "mlp":
         return MLPEvaluator(geometry_name)
     elif arch == "gnn":
@@ -16,6 +17,7 @@ def get_evaluator(geometry_name, arch="mlp", screenshots: bool = False, processe
         return MAPDLEvaluator(geometry_name)
     elif arch == "ccx":
         return CCXEvaluator(geometry_name, max_workers=processes or 8, mesh_threads=mesh_threads, nproc=nproc,
-                             stress_ks_rho_mpa=stress_ks_rho_mpa)
+                             stress_ks_rho_mpa=stress_ks_rho_mpa, ccx_axis_path=ccx_axis_path,
+                             gradient_nproc=gradient_nproc, gradient_source=ccx_gradient)
     else:
         raise ValueError(f"Unknown architecture: {arch}")

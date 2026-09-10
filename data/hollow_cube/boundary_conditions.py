@@ -1,3 +1,4 @@
+import os
 from typing import List
 from core.node import Node
 
@@ -23,6 +24,18 @@ def force_pattern(node: Node, tol: float) -> List[float]:
     return [0.0, 0.0, 0.0]
 
 def mesh_resolution() -> tuple[int]:
+    # FEA_MESH_RES overrides the default, e.g. FEA_MESH_RES=5,5,5. Read from
+    # the environment rather than passed in because this function is called
+    # from inside ProcessPoolExecutor workers (force_pattern normalises the
+    # load by it), where a monkeypatch in the parent would not be visible but
+    # an inherited env var is. Each tile is a hollow tube whose wall is
+    # subdivided (U-1) x (V-1) x (W-1), so (3,3,3) puts only TWO elements
+    # through the wall -- fine for the forward stress, but the axis/adjoint
+    # shape sensitivity needs >= 5 (see Mesh.solve_ccx_axis_gradient).
+    v = os.environ.get("FEA_MESH_RES")
+    if v:
+        u, vv, w = (int(t) for t in v.split(","))
+        return (u, vv, w)
     return (3, 3, 3)
 
 def fixed_dims() -> dict:

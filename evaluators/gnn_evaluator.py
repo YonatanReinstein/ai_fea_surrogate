@@ -10,7 +10,10 @@ from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
 from evaluators.base_evaluator import BaseEvaluator
 from core.IritModel import IritCModel
 from core.component import Component
-from core.tile_sensitivity import dims_key_order_permutation
+from core.tile_sensitivity import (
+    dims_key_order_permutation,
+    hollow_tube_volume_sensitivity,
+)
 from training.gnn_training import gnn_input_fn, gnn_target_fn
 import json
 from multiprocessing import Pool
@@ -559,32 +562,49 @@ class GNNEvaluator(BaseEvaluator):
         autodiff for the (expensive, nonlinear) stress/constraint term.
 
         Volume's sensitivity doesn't need the GNN, an FD sweep, or even an
-        extra IRIT call: hollow_cube's tile is a hollow square tube (see
-        model_lin.c's BuildHollowCubeTile), so in the tile's own local unit
-        cube, material area = outer(1x1) - inner((1-2t)^2) = 4t(1-t), and
-        every tile shares the same scale factor from local to physical
-        volume (a uniform tiling of one outline) -- calibrated here from
-        the ALREADY-COMPUTED total volume instead of a hardcoded geometry
-        constant, so this isn't tied to hollow_cube's specific 1-unit-per-
-        tile outline sizing. This is specific to hollow_cube's tile shape;
-        a different geometry's tile construction would need its own
-        formula here.
+        extra IRIT call -- it is analytic for this tile shape. See
+        core.tile_sensitivity.hollow_tube_volume_sensitivity, shared with
+        CCXEvaluator.compute_topopt_gradient so both arches report the same
+        dV/dx for the same design.
         """
         # self.yield_strength (from material_properties.json) is already in
         # the same MPa convention as evaluate()'s/compute_stress_and_gradient's
         # stress -- see GNNEvaluator.__init__ and evaluate()'s g0 = s0/yld-1
         # usage in topopt_optimizer.py, neither of which rescales it.
         stress, d_stress_dx_mpa, volume = self.compute_stress_and_gradient(dims)
+
+        # Optional uniform offset on the per-tile sensitivity, GNN_DG_BIAS in
+        # MPa per thickness-unit (0 = off, the default).
+        #
+        # Why this knob exists: the surrogate's sign accuracy is strongly
+        # magnitude-dependent. Measured on checkpoint lowlr_ep8 over 60
+        # held-out designs, sign agreement by |dg| decile runs
+        #     D1 52.9%  D2 56.6%  D4 58.0%  ...  D10 91.8%
+        # i.e. near chance on the smallest gradients and excellent on the
+        # largest. Those small tiles carry <0.01% of the gradient mass each, so
+        # they are almost invisible to cosine and to wrong-way-mass -- but they
+        # are NOT invisible to OC: x_new = x*(-dG/(lambda*dV))**eta drives a tile
+        # whose dG is tiny-and-wrong-signed straight to the 0.01 floor. That is
+        # the same trapdoor core/fem_adjoint.py's tile_gradient guards against,
+        # and a plausible source of the isolated floor/cap tiles in the final
+        # design (0.4% at each extreme, setting the whole 0.46 range).
+        #
+        # An offline sweep on lowlr_ep8 put the sign-agreement optimum at
+        # b = +0.01..+0.03 (66.5% -> 66.8%, small-|dg| tiles 58.9% -> 59.5%),
+        # with wrong-way mass and cosine both unchanged -- so this cannot be
+        # validated by the dg probes and has to be judged by what topopt does
+        # with it.
+        _bias = float(os.environ.get("GNN_DG_BIAS", "0.0"))
+        if _bias:
+            d_stress_dx_mpa = {k: v + _bias for k, v in d_stress_dx_mpa.items()}
         dG_dx = {k: v / self.yield_strength for k, v in d_stress_dx_mpa.items()}
 
         # dims here is a plain {key: float} dict (e.g. TopologyOptimizer's
         # _vec_to_dims output) -- every key is a design variable.
         free_names = list(dims.keys())
-        t = np.array([dims[k] for k in free_names])
-        local_volume = 4.0 * t * (1.0 - t)
-        scale = volume / local_volume.sum()
-        dV_dt = scale * 4.0 * (1.0 - 2.0 * t)
-        dV_dx = {k: float(v) for k, v in zip(free_names, dV_dt)}
+        dV_dt = hollow_tube_volume_sensitivity(
+            [dims[k] for k in free_names], volume)
+        dV_dx = dict(zip(free_names, dV_dt))
 
         return volume, stress, self.yield_strength, dV_dx, dG_dx
 

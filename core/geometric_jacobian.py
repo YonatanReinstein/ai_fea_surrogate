@@ -30,6 +30,7 @@ def compute_thickness_jacobian(
     mesh_threads: int = 1,
     eps: float = 1e-4,
     model_cls: Callable[..., IritModelBase] = IritCModel,
+    return_model: bool = False,
 ) -> Tuple[Dict[int, Tuple[float, float, float]], dict, dict, dict]:
     """Global simultaneous finite-difference geometric Jacobian.
 
@@ -44,6 +45,11 @@ def compute_thickness_jacobian(
         nodes0:      nominal node_id -> (x, y, z), for reuse.
         elements0:   nominal elem_id -> [node_id, ...], for reuse.
         elem_to_tile: nominal elem_id -> 0-based tile index, for reuse.
+
+    With return_model=True a fifth element is appended: the nominal
+    IritModelBase itself, so a caller that also needs the design's volume
+    can take it off the model already built here instead of paying for
+    another CAD evaluation.
     """
     resolved = _resolve_dims(dims_dict)
 
@@ -74,4 +80,6 @@ def compute_thickness_jacobian(
         nid: tuple((nodes1[nid][k] - nodes0[nid][k]) / eps for k in range(3))
         for nid in nodes0
     }
+    if return_model:
+        return dX_dt, nodes0, elements0, elem_to_tile0, nominal
     return dX_dt, nodes0, elements0, elem_to_tile0
