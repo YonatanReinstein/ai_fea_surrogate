@@ -49,6 +49,16 @@ def field(model, stats):
         ns = t_leaf.view(1, K)[bidx, tidx].unsqueeze(1)
         x = x.float().to(dev); x[:, 3:6] = x[:, 3:6] / 1e6
         xn = (torch.cat([x, ns], dim=1) - x_mean) / x_std
+        # Positional node embedding. Training attaches node_id = arange(N)
+        # to every sample (gnn_training._preprocess) and the evaluator does
+        # the same; raw dataset samples carry none, so the probe used to run
+        # the model WITHOUT its node_emb. Measured 2026-09-15 on 16 held-out
+        # designs, this vs GNNEvaluator's path: epoch 8 +0.919 vs +0.992,
+        # epoch 60 +0.589 vs +0.999 -- every "later epochs get worse" reading
+        # from this probe was that missing embedding, not the model.
+        if nid is None and getattr(model, "node_emb", None) is not None \
+                and x.shape[0] == model.node_emb.num_embeddings:
+            nid = torch.arange(x.shape[0], dtype=torch.long)
         gp, _ = model(xn, ei.to(dev), (ea.float().to(dev) - e_mean) / e_std, bidx,
                       tile_idx=tidx, tile_NX=tNX, tile_NY=tNY, tile_NZ=tNZ,
                       tile_x=t_leaf, num_graphs=1,

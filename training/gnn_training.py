@@ -4,6 +4,7 @@ import os
 import re
 import glob
 import time
+import numpy as np
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch_geometric.loader import DataLoader
@@ -28,7 +29,7 @@ def weighted_node_grad_loss(pred, true, batch_idx, scale, power=1.0, cos_weight=
     dg went anti-correlated (cosine -0.360, 82.8% wrong-way mass).
 
     Two corrections, mirroring what already works elsewhere in this file:
-      power     -- per-graph magnitude weighting, exactly weighted_node_mse's
+      power     -- per-graph magnitude weighting, exactly weighted_node_rel_err's
                    scheme but keyed on |dKS/dX| instead of von Mises stress.
                    The composition sums <g_n, dX_n/dt>, so mass-carrying
                    nodes are the ones worth fitting.
@@ -103,31 +104,48 @@ def gnn_log_target_fn(data):
     return torch.log(gnn_target_fn(data).clamp_min(LOG_STRESS_EPS))
 
 
+def _shard_count(path):
+    """Samples in shard_{start:06d}_{end:06d}.pt, read from the name alone."""
+    a_, b_ = os.path.basename(path)[len("shard_"):-len(".pt")].split("_")
+    return int(b_) - int(a_) + 1
+
+
 def gnn_node_target_fn(data):
     # returns [N_total, 1] tensor (node-level von Mises stress)
     return data.node_stress.view(-1, 1)
 
 
-def weighted_node_mse(node_pred, node_targ_norm, node_targ_raw, batch_idx, stress_weight_power=1.0):
-    # Weighted MSE: each node's squared error is scaled by
-    # weight_i = raw_von_mises_stress_i^power / sum(raw_von_mises_stress^power over the same graph),
-    # so higher-stress nodes count more toward that graph's loss. Weights are
-    # computed per graph (not over the whole batch) so samples with more nodes
-    # or an overall higher stress level don't dominate other samples in the batch.
-    #
-    # stress_weight_power (alpha) controls how much high-stress nodes dominate:
-    #   alpha = 0   -> all nodes weighted equally (reduces to plain node-mean MSE)
-    #   alpha = 1   -> weight proportional to raw stress (previous default behavior)
-    #   alpha > 1   -> high-stress nodes dominate more strongly
-    #   0 < alpha < 1 -> softened weighting, less domination than raw stress
-    raw = node_targ_raw.squeeze(-1).clamp_min(0.0)
+def ks_rel_err(graph_pred_raw_mpa, ks_true_mpa):
+    """KS stress loss: mean relative error |KS_pred - KS_true| / KS_true over the
+    batch, so the logged value IS the mean KS stress error (0.043 = 4.3%).
+    Replaced a normalized log-space MSE on 2026-10-01: same percent-error
+    meaning, but its value was not directly readable."""
+    p = graph_pred_raw_mpa.float().view(-1)
+    t = ks_true_mpa.float().view(-1)
+    return ((p - t).abs() / t.clamp_min(LOG_STRESS_EPS)).mean()
+
+
+def weighted_node_rel_err(node_pred_raw_mpa, node_targ_raw, ks_true_mpa, batch_idx, stress_weight_power=1.0):
+    """Node stress loss: per design, the stress-weighted mean node error as a
+    fraction of that design's true KS (peak) stress, then the mean over designs:
+
+        w_i  = sigma_i^alpha / sum_j sigma_j^alpha        (per design, sums to 1)
+        loss = mean_designs  sum_i w_i * |sigma_pred,i - sigma_true,i| / KS_true
+
+    0.02 = nodes are off by 2% of the peak stress on average. Dividing by the
+    design's KS rather than each node's own stress avoids the blow-up on lightly
+    loaded nodes (down to ~1 MPa). alpha = --stress_weight_power: 0 = every node
+    equal, 1 = weight proportional to true stress (on dataset_screened30k the
+    top 10% of nodes then hold 24% of the weight), 2 = 45%. Replaced a weighted
+    MSE in normalized units on 2026-10-01; same weights, readable value."""
+    raw = node_targ_raw.float().squeeze(-1).clamp_min(0.0)
     raw_pow = raw.pow(stress_weight_power)
     graph_totals = scatter(raw_pow, batch_idx, dim=0, reduce="sum")
     weights = raw_pow / (graph_totals[batch_idx] + 1e-8)
-
-    sq_err = (node_pred.squeeze(-1) - node_targ_norm.squeeze(-1)) ** 2
-    per_graph_loss = scatter(weights * sq_err, batch_idx, dim=0, reduce="sum")
-    return per_graph_loss.mean()
+    ks = ks_true_mpa.float().view(-1).clamp_min(LOG_STRESS_EPS)
+    err = (node_pred_raw_mpa.float().squeeze(-1) - raw).abs() / ks[batch_idx]
+    per_graph = scatter(weights * err, batch_idx, dim=0, reduce="sum")
+    return per_graph.mean()
 
 
 # ======================================================
@@ -171,8 +189,13 @@ def train_gnn_model(
     node_grad_power: float = 1.0,
     node_grad_cos_weight: float = 0.0,
     grad_loss_weight: float = 0.1,
-    grad_cos_weight: float = 0.0,
+    grad_sign_loss_weight: float = 0.0,
+    grad_err_mode: str = "slog",
+    grad_sign_delta: float = 0.05,
+    grad_weight_power: float = 0.15,
+    grad_rel_sat: float = 2.0,
     grad_sign_weight: float = 0.0,
+    grad_mass_weight: float = 0.0,
     grad_batch_size: int = None,
 ):
     torch.manual_seed(42)
@@ -242,8 +265,11 @@ def train_gnn_model(
 
     graph_path = os.path.join(os.path.dirname(dataset_path), "graph.pt")
     _graph_node_id, _num_pos_nodes_from_graph = None, 0
+    _graph_edge_index, _graph_tile_idx = None, None
     if os.path.exists(graph_path):
         _g = torch.load(graph_path, weights_only=False)
+        _graph_edge_index = _g["edge_index"].long()
+        _graph_tile_idx = _g["tile_idx"].view(-1).long()
         _graph_node_id = torch.arange(_g["num_nodes"], dtype=torch.long)
         _num_pos_nodes_from_graph = _g["num_nodes"]
 
@@ -261,11 +287,39 @@ def train_gnn_model(
         _strut_perm_inv = torch.argsort(_strut_perm).to(device)
 
     def _preprocess(sample):
+        # Fixed-mesh datasets can ship without per-sample edge_index/tile_idx
+        # (dataset_builder's workers drop them and only the main process
+        # re-attaches; data/hollow_cube_11x11/dataset_screened30k was saved
+        # without them). Both are identical for every sample, so take them
+        # from the graph.pt next to the dataset.
+        if getattr(sample, "edge_index", None) is None or getattr(sample, "tile_idx", None) is None:
+            assert _graph_edge_index is not None and sample.x.shape[0] == _num_pos_nodes_from_graph, (
+                f"sample has no edge_index/tile_idx and no matching graph.pt at {graph_path}")
+            assert sample.edge_attr.shape[0] == _graph_edge_index.shape[1], (
+                f"edge_attr has {sample.edge_attr.shape[0]} edges but graph.pt has {_graph_edge_index.shape[1]}")
+            sample.edge_index = _graph_edge_index
+            sample.tile_idx = _graph_tile_idx
         # convert force to MN / stresses to MPa
         sample.x[:, 3:6] = sample.x[:, 3:6] / 1e+6
         sample.max_stress = sample.max_stress / 1e+6
         sample.ks_stress = sample.ks_stress / 1e+6
         sample.node_stress = sample.node_stress / 1e+6
+        # rho consistency check. The stored ks_stress target was built at the
+        # dataset builder's rho; the model pools its node map with THIS run's
+        # --stress_ks_rho_mpa, and the two must agree or the graph loss fits a
+        # rho-A pool to a rho-B target (found 2026-09-16: dataset at 0.25,
+        # every training run pooled at the 0.15 default -- the model flattened
+        # its stress peak to reconcile them, and every optimizer run inherited
+        # a wrong constraint). Checked on the first few samples only.
+        if not getattr(_preprocess, "_rho_checked", 0) >= 3:
+            _preprocess._rho_checked = getattr(_preprocess, "_rho_checked", 0) + 1
+            _ns = sample.node_stress.float().view(-1); _m = _ns.max()
+            _ks = float(_m + torch.log(torch.exp(stress_ks_rho_mpa * (_ns - _m)).sum()) / stress_ks_rho_mpa)
+            _tgt = float(sample.ks_stress.float().view(-1)[0])
+            _dev = abs(_ks - _tgt) / max(abs(_tgt), 1e-6)
+            tag = "OK" if _dev < 0.02 else "MISMATCH -- dataset was built at a different rho"
+            print(f"[rho-check] rho={stress_ks_rho_mpa}: KS(node_stress)={_ks:.3f} vs stored ks_stress={_tgt:.3f} "
+                  f"({100*_dev:.1f}% off) {tag}", flush=True)
         if hasattr(sample, "grad_dks_dx"):
             # The two --grad_mode builders store this label in DIFFERENT
             # units, so key off which one wrote the sample:
@@ -321,9 +375,11 @@ def train_gnn_model(
             # the same way the single-process path honors it (line ~293) --
             # previously this branch always used every shard regardless of
             # --num_samples, silently training on the full dataset.
-            s, e = os.path.basename(all_shards[0])[len("shard_"):-len(".pt")].split("_")
-            per_shard = int(e) - int(s) + 1
-            n_shards_needed = max(1, -(-num_samples // per_shard))  # ceil div
+            # Sizes come from EVERY shard's name, not the first one's: a
+            # filtered dataset (training/filter_dataset.py) has variable-size
+            # shards, and the first one need not be typical.
+            _cum = np.cumsum([_shard_count(p) for p in all_shards])
+            n_shards_needed = min(len(all_shards), int(np.searchsorted(_cum, num_samples)) + 1)
             all_shards = all_shards[:n_shards_needed]
 
         n_val_shards = max(1, int(len(all_shards) * 0.2))
@@ -354,7 +410,7 @@ def train_gnn_model(
 
         # Approx sample count across all ranks, for the printed summary only
         # (exact global count would need an all_reduce; not worth it here).
-        num_samples = len(train_set) * world_size + len(val_shards) * 100
+        num_samples = len(train_set) * world_size + sum(_shard_count(p) for p in val_shards)
         print(f"Total samples used (approx): {num_samples}")
         print(f"Train (this rank): {len(train_set)}, Val (rank 0 only): {len(val_set) if is_main else 'n/a'}")
 
@@ -634,6 +690,9 @@ def train_gnn_model(
         grad_target_scale = (all_grad_dks_dx.abs().mean() + 1e-8).to(device)
         print(f"[grad-loss] rank={rank} {len(grad_dataset)} samples, M={grad_M} tiles/sample, "
               f"K_tiles={K_tiles}, mean|dks/dx| scale={grad_target_scale.item():.4f} MPa/unit")
+        print(f"[grad-loss] mode={grad_err_mode}" + (f" weight_power={grad_weight_power} rel_sat={grad_rel_sat}"
+              if grad_err_mode == "rel" else f" mass_weight={grad_mass_weight}") + (f" sign_loss_weight={grad_sign_loss_weight} sign_delta={grad_sign_delta}"
+                 if grad_sign_loss_weight > 0.0 else " sign_loss=off"))
         grad_loader = DataLoader(grad_dataset, batch_size=(grad_batch_size or batch_size),
                                  shuffle=True, num_workers=2, persistent_workers=True,
                                  pin_memory=True)
@@ -789,6 +848,41 @@ def train_gnn_model(
     print(f"[compile] torch.compile enabled={compiled}")
     print(f"[ddp] model wrapped={ddp}")
 
+    # ----------------------------------------------------
+    # Baseline normalization of the loss terms. Each term is divided by the
+    # score of a predictor that knows nothing, so every term starts near 1
+    # and equal weights mean equal importance relative to how hard each task
+    # is:
+    #   ks    always predict the median train KS  -> mean |median - KS| / KS
+    #   node  predict 0 at every node             -> mean sum_i w_i sigma_i / KS
+    #   grad  predict 0 for every tile (rel mode) -> exactly 1 / (1 + 1/sat)
+    #   sign  predict 0 / coin flip               -> exactly 0.5
+    # Only the trained total is normalized. The log prints the raw %. Computed
+    # from the training data, not hard-coded, so the same code works on any
+    # dataset. On hollow_cube_11x11/dataset_screened30k (500 samples):
+    # ks 26.1%, node 26.7%, grad 66.7%, sign 0.5.
+    # ----------------------------------------------------
+    _bl_ks = torch.stack([gnn_target_fn(d).float().view(-1)[0] for d in train_set]).to(device)
+    _bl_n, _bl_sum = torch.zeros((), device=device), torch.zeros((), device=device)
+    for d in train_set[:2000]:
+        _n = gnn_node_target_fn(d).float().view(-1).clamp_min(0.0)
+        _k = gnn_target_fn(d).float().view(-1)[0].clamp_min(LOG_STRESS_EPS)
+        _w = _n.pow(stress_weight_power); _w = _w / (_w.sum() + 1e-8)
+        _bl_n += ((_w * _n).sum() / _k).to(device); _bl_sum += 1
+    _bl_med = _bl_ks.median()
+    _bl_k_err = ((_bl_med - _bl_ks).abs() / _bl_ks.clamp_min(LOG_STRESS_EPS)).sum()
+    _bl_k_cnt = torch.tensor(float(_bl_ks.numel()), device=device)
+    if ddp:
+        for _t in (_bl_k_err, _bl_k_cnt, _bl_n, _bl_sum):
+            dist.all_reduce(_t)
+    base_ks = float(_bl_k_err / _bl_k_cnt)
+    base_node = float(_bl_n / _bl_sum)
+    base_grad = (1.0 / (1.0 + 1.0 / grad_rel_sat)) if grad_err_mode == "rel" else 1.0
+    base_sign = 0.5
+    print(f"[loss-norm] baselines: ks {100*base_ks:.1f}%  node {100*base_node:.1f}%  "
+          f"grad {100*base_grad:.1f}%{'' if grad_err_mode == 'rel' else ' (slog mode: not normalized)'}  "
+          f"sign {base_sign:.3f}  -> each loss term is divided by its baseline")
+
     optimizer = torch.optim.AdamW(raw_model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn   = torch.nn.MSELoss()
 
@@ -926,6 +1020,8 @@ def train_gnn_model(
         total_train_node  = 0.0
         total_train_grad  = 0.0
         total_train_gcos  = 0.0
+        total_train_sgnerr = 0.0
+        total_train_sgnl  = 0.0
         total_train_ngrad = 0.0
         total_train_ncos  = 0.0
 
@@ -970,10 +1066,8 @@ def train_gnn_model(
             x_norm = (x - x_mean) / x_std
             edge_attr_norm = (edge_attr - edge_mean) / edge_std
 
-            targ_log = torch.log(gnn_target_fn(batch_data).float().to(device, non_blocking=True).clamp_min(LOG_STRESS_EPS))
-            targ_norm = (targ_log - target_mean) / target_std
+            targ_mpa = gnn_target_fn(batch_data).float().to(device, non_blocking=True)
             node_targ = gnn_node_target_fn(batch_data).float().to(device, non_blocking=True)
-            node_targ_norm = (node_targ - node_target_mean) / node_target_std
             if profile_this_epoch:
                 _sync(); t_now = time.perf_counter(); t_h2d += t_now - t_mark; t_mark = t_now
 
@@ -988,15 +1082,14 @@ def train_gnn_model(
                     graph_pred, node_pred, node_grad_pred = _mo
                 else:
                     graph_pred, node_pred = _mo
-                # graph_pred lives in node-normalized space (see ks_pool) --
-                # de-normalize to raw linear MPa (unchanged, must stay linear
-                # to match ks_pool's physics), then log+normalize to compare
-                # against targ_norm (graph target is log-normalized above).
+                # graph_pred and node_pred live in node-normalized space (see
+                # ks_pool) -- de-normalize both to raw linear MPa, then score
+                # them as relative errors (see ks_rel_err / weighted_node_rel_err).
                 graph_pred_raw_mpa = (graph_pred * node_target_std + node_target_mean).clamp_min(LOG_STRESS_EPS)
-                graph_pred_target_norm = (torch.log(graph_pred_raw_mpa) - target_mean) / target_std
-                graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
-                node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx, stress_weight_power)
-                loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
+                node_pred_raw_mpa = node_pred * node_target_std + node_target_mean
+                graph_loss = ks_rel_err(graph_pred_raw_mpa, targ_mpa)
+                node_loss  = weighted_node_rel_err(node_pred_raw_mpa, node_targ, targ_mpa, batch_idx, stress_weight_power)
+                loss = graph_loss_weight * graph_loss / base_ks + node_loss_weight * node_loss / base_node
 
                 # Node-gradient head: match the ADJOINT NODAL field
                 # dKS/dX directly, then let core/geometric_jacobian.py's
@@ -1089,31 +1182,76 @@ def train_gnn_model(
                 # MSE would be dominated by the largest-magnitude tiles.
                 def _slog(v):
                     return torch.sign(v) * torch.log1p(v.abs() / grad_target_scale)
-                grad_loss = loss_fn(_slog(pred_grad_at_tiles), _slog(g_grad_dks_dx))
-                loss = loss + grad_loss_weight * grad_loss
+                # Mass weighting of the slog MSE. Equal weight per tile means
+                # ~60% of the loss is the near-zero tiles: they carry <0.01% of
+                # the |dg| mass, sit at chance-level sign agreement on TRAINING
+                # designs at every epoch (never learnable from random designs),
+                # and OC never uses them. Meanwhile the top decile (96% of the
+                # mass, the needle OC follows) got 10% of the loss and stayed at
+                # 77-80% train sign agreement from epoch 8 to 43 while the
+                # total grad loss halved -- the epochs were spent polishing
+                # log-magnitudes of tiles that do not matter. w_i mixes uniform
+                # with each tile's share of its sample's |true dg| mass:
+                #   w_i = (1-b) + b * M * |t_i| / sum_j |t_j|      (mean w = 1)
+                # b=1 gives pure mass weighting (top-decile tiles ~10x, near-zero
+                # tiles ~0); the slog transform is kept for its dynamic range.
+                _se = (_slog(pred_grad_at_tiles) - _slog(g_grad_dks_dx)) ** 2
+                if grad_err_mode == "rel":
+                    # Percent-error mode, no log. Per tile:
+                    #   r_i = |pred_i - true_i| / |true_i|        (relative error)
+                    #   e_i = r_i / (1 + r_i / sat)               (smooth saturation)
+                    #   w_i = (|true_i| / sum_j |true_j|) ** p, normalised to mean 1 per sample
+                    # The saturation is there because r explodes on near-zero
+                    # tiles: on the 11x11 trajectory, unbounded r gave the worst
+                    # 1% of tiles 47% of the loss (errors up to 1e4 = 1,000,000%).
+                    # e ~ r for small r and -> sat for large r, with a gradient
+                    # that shrinks but never reaches zero (0.028 of full at
+                    # r=10 for sat=2; a hard cap gives 0, tanh 0.0002). sat=2 is
+                    # exactly an equal-size sign flip. p sets the tile balance:
+                    # at p=0.15, sat=2 the |ccx dg| bands bottom-50% / 50-75 /
+                    # 75-90 / top-10% took 58 / 19 / 12 / 11% of the loss, vs
+                    # 0 / 0 / 0.4 / 99.5% for the old slog + mass-weight 1.0.
+                    _t = g_grad_dks_dx.float()
+                    _r = (pred_grad_at_tiles.float() - _t).abs() / (_t.abs() + 1e-12)
+                    _e = _r / (1.0 + _r / grad_rel_sat)
+                    _w = (_t.abs() / _t.abs().sum(dim=1, keepdim=True).clamp_min(1e-30)) ** grad_weight_power
+                    _w = _w / _w.mean(dim=1, keepdim=True)
+                    grad_loss = (_w * _e).mean()
+                elif grad_mass_weight > 0.0:
+                    _t = g_grad_dks_dx.float().abs()
+                    _w = _t.shape[1] * _t / _t.sum(dim=1, keepdim=True).clamp_min(1e-30)
+                    _w = (1.0 - grad_mass_weight) + grad_mass_weight * _w
+                    grad_loss = (_w * _se).mean()
+                else:
+                    grad_loss = _se.mean()
+                loss = loss + grad_loss_weight * grad_loss / base_grad
 
-                # Direction term. The signed-log MSE above is a MAGNITUDE
-                # objective, and evaluators/probe_dg_alignment.py showed it is
-                # misaligned with what optimization/topopt_optimizer.py's OC
-                # step actually consumes: after 30 epochs the slog term had
-                # fallen 7x (0.191 -> 0.028) while per-sample
-                # cosine(pred_dg, true_dg) stayed at the noise floor (median
-                # +0.019 -> +0.064, i.e. the predicted descent direction is
-                # orthogonal to the true one). Root cause is the target's ~6
-                # decades of dynamic range with 97.6% of the gradient mass in
-                # one decile of tiles: log1p is the only transform that makes
-                # that trainable, and it is exactly the transform that discards
-                # the magnitude structure OC follows.
-                #
-                # Cosine is scale-invariant, so it does not fight the slog
-                # term, and it weights the high-mass tiles automatically --
-                # the subset OC steps along. Computed on the raw (not slog)
-                # vectors for that reason.
-                if grad_cos_weight > 0.0:
+                # Metrics, no gradient: the raw cosine (logged as "cos", kept so
+                # runs stay comparable with earlier ones) and the exact 0/1
+                # wrong-sign rate over every tile (logged as "sgnerr"). The
+                # cosine is NOT a loss any more: every tile's pull on it goes as
+                # |dg|^2, so on hollow_cube_11x11 the single largest tile
+                # carried 73% of it (removed 2026-10-01).
+                with torch.no_grad():
                     grad_cos = (1.0 - torch.nn.functional.cosine_similarity(
                         pred_grad_at_tiles.float(), g_grad_dks_dx.float(), dim=1, eps=1e-12,
                     )).mean()
-                    loss = loss + grad_cos_weight * grad_cos
+                    grad_sgnerr = (torch.sign(pred_grad_at_tiles.float())
+                                   != torch.sign(g_grad_dks_dx.float())).float().mean()
+
+                # Per-tile smooth SIGN loss, averaged over the tiles of each
+                # sample and then over the batch, every tile weighted equally:
+                #   z_i    = p_i * sign(t_i) / |t_i|   (signed fraction of the truth)
+                #   loss_i = 0.5 * (1 - z_i / (delta + |z_i|))
+                # ~0 for a correct sign (0.024 at z=1, delta=0.05), ~1 for a
+                # wrong one (0.976 at z=-1): a trainable version of sgnerr. A
+                # literal 0/1 step has zero gradient everywhere; this rational
+                # form keeps delta/(delta+|z|)^2, which never reaches zero.
+                if grad_sign_loss_weight > 0.0:
+                    _t = g_grad_dks_dx.float()
+                    _z = pred_grad_at_tiles.float() * torch.sign(_t) / (_t.abs() + 1e-12)
+                    grad_sign_loss = (0.5 * (1.0 - _z / (grad_sign_delta + _z.abs()))).mean()
+                    loss = loss + grad_sign_loss_weight * grad_sign_loss / base_sign
 
                 # Mass-weighted SIGN term. Cosine and the slog MSE both leave
                 # the metric OC is most exposed to untouched: the fraction of
@@ -1173,6 +1311,9 @@ def train_gnn_model(
                 total_train_grad += grad_loss.item()
             if grad_cos is not None:
                 total_train_gcos += grad_cos.item()
+                total_train_sgnerr += grad_sgnerr.item()
+                if grad_sign_loss_weight > 0.0:
+                    total_train_sgnl += grad_sign_loss.item()
             if node_grad_weight > 0.0:
                 total_train_ngrad += node_grad_loss.item()
                 if node_grad_cos is not None:
@@ -1196,6 +1337,8 @@ def train_gnn_model(
         avg_train_node  = total_train_node  / n_train_batches
         avg_train_grad  = total_train_grad  / n_train_batches
         avg_train_gcos  = total_train_gcos  / n_train_batches
+        avg_train_sgnerr = total_train_sgnerr / n_train_batches
+        avg_train_sgnl  = total_train_sgnl  / n_train_batches
         avg_train_ngrad = total_train_ngrad / n_train_batches
         avg_train_ncos  = total_train_ncos  / n_train_batches
         train_losses.append(avg_train)
@@ -1250,11 +1393,8 @@ def train_gnn_model(
                     x_norm = (x - x_mean) / x_std
                     edge_attr_norm = (edge_attr - edge_mean) / edge_std
 
-                    targ_log = torch.log(gnn_target_fn(batch_data).float().to(device, non_blocking=True).clamp_min(LOG_STRESS_EPS))
-                    targ_norm = (targ_log - target_mean) / target_std
-
+                    targ_mpa = gnn_target_fn(batch_data).float().to(device, non_blocking=True)
                     node_targ = gnn_node_target_fn(batch_data).float().to(device, non_blocking=True)
-                    node_targ_norm = (node_targ - node_target_mean) / node_target_std
 
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                         graph_pred, node_pred = eval_model(
@@ -1263,10 +1403,10 @@ def train_gnn_model(
                             tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
                         )
                         graph_pred_raw_mpa = (graph_pred * node_target_std + node_target_mean).clamp_min(LOG_STRESS_EPS)
-                        graph_pred_target_norm = (torch.log(graph_pred_raw_mpa) - target_mean) / target_std
-                        graph_loss = loss_fn(graph_pred_target_norm, targ_norm)
-                        node_loss  = weighted_node_mse(node_pred, node_targ_norm, node_targ, batch_idx, stress_weight_power)
-                        loss = graph_loss_weight * graph_loss + node_loss_weight * node_loss
+                        node_pred_raw_mpa = node_pred * node_target_std + node_target_mean
+                        graph_loss = ks_rel_err(graph_pred_raw_mpa, targ_mpa)
+                        node_loss  = weighted_node_rel_err(node_pred_raw_mpa, node_targ, targ_mpa, batch_idx, stress_weight_power)
+                        loss = graph_loss_weight * graph_loss / base_ks + node_loss_weight * node_loss / base_node
 
                     total_val       += loss.item()
                     total_val_graph += graph_loss.item()
@@ -1329,13 +1469,12 @@ def train_gnn_model(
             # -----------------------------
             if avg_val_graph < best_val_graph_loss:
                 best_val_graph_loss = avg_val_graph
-                best_val_graph_rmse_mpa = best_val_graph_loss ** 0.5 * graph_target_std_full.item()
                 best_ckpt = _build_ckpt()
                 best_ckpt["best_epoch"] = epoch
                 best_ckpt["best_val_graph_loss"] = best_val_graph_loss
                 torch.save(best_ckpt, surrogate_path)
-                print(f"[best] new best val ks loss {best_val_graph_loss:.6f} "
-                      f"[{best_val_graph_rmse_mpa:.4f} log MPa] at epoch {epoch} -> {surrogate_path}")
+                print(f"[best] new best val ks err {100*best_val_graph_loss:.2f}% "
+                      f"at epoch {epoch} -> {surrogate_path}")
 
             # -----------------------------
             # Save checkpoint every 10 epochs
@@ -1366,19 +1505,20 @@ def train_gnn_model(
                     }, f, indent=4)
 
             epoch_secs = time.time() - epoch_t0
-            train_graph_rmse_mpa = avg_train_graph ** 0.5 * graph_target_std_full.item()
-            val_graph_rmse_mpa   = avg_val_graph   ** 0.5 * graph_target_std_full.item()
-            grad_str = f" / grad {avg_train_grad:.6f}" if grad_iter is not None else ""
+            grad_str = ((f" / grad {100*avg_train_grad:.1f}%" if grad_err_mode == "rel" else f" / grad {avg_train_grad:.6f}")
+                        if grad_iter is not None else "")
             if node_grad_weight > 0.0:
                 grad_str += f" / ngrad {avg_train_ngrad:.6f}"
                 if node_grad_cos_weight > 0.0:
                     grad_str += f" / ncos {1.0 - avg_train_ncos:+.4f}"
-            if grad_iter is not None and grad_cos_weight > 0.0:
-                grad_str += f" / cos {1.0 - avg_train_gcos:+.4f}"
+            if grad_iter is not None:
+                grad_str += f" / cos {1.0 - avg_train_gcos:+.4f} / sgnerr {100*avg_train_sgnerr:.1f}%"
+                if grad_sign_loss_weight > 0.0:
+                    grad_str += f" / sgnl {avg_train_sgnl:.4f}"
             print(
                 f"Epoch {epoch:03d}/{epochs} | {epoch_secs:6.1f}s | "
-                f"Train: {avg_train:.6f} (g {avg_train_graph:.6f} [{train_graph_rmse_mpa:.4f} log MPa] / n {avg_train_node:.6f}{grad_str}) | "
-                f"Val: {avg_val:.6f} (g {avg_val_graph:.6f} [{val_graph_rmse_mpa:.4f} log MPa] / n {avg_val_node:.6f}) | "
+                f"Train: {avg_train:.4f} (ks {100*avg_train_graph:.2f}% / node {100*avg_train_node:.2f}%{grad_str}) | "
+                f"Val: {avg_val:.4f} (ks {100*avg_val_graph:.2f}% / node {100*avg_val_node:.2f}%) | "
                 f"LR: {optimizer.param_groups[0]['lr']:.2e}"
             )
 
@@ -1509,9 +1649,26 @@ if __name__ == "__main__":
                              "no behavior change.")
     parser.add_argument("--grad_sign_weight", default=0.0, type=float,
                         help="Weight on a mass-weighted sign hinge over the per-tile dg: relu(-pred*sign(true)) weighted by |true| and normalised per sample. A differentiable surrogate for the wrong-way-|dg|-mass fraction, the one metric that has not improved while cosine did. 0 disables it.")
-    parser.add_argument("--grad_cos_weight", default=0.0, type=float,
-                        help="Weight on 1-cos(pred_dg,true_dg), the direction term OC "
-                             "actually consumes. 0 disables it (magnitude-only).")
+    parser.add_argument("--grad_mass_weight", default=0.0, type=float,
+                        help="Blend the per-tile slog gradient MSE toward |true dg| mass weighting: "
+                             "0 = uniform (old behaviour), 1 = each tile weighted by its share of the "
+                             "sample's gradient mass (near-zero tiles ~0, top decile ~10x).")
+    parser.add_argument("--grad_sign_loss_weight", default=0.0, type=float,
+                        help="Weight on the per-tile smooth wrong-sign loss 0.5*(1 - z/(delta+|z|)), "
+                             "z = pred*sign(true)/|true|, averaged over all tiles (~0 right sign, ~1 wrong). "
+                             "0 disables it. Not the old mass-weighted hinge, which is --grad_sign_weight.")
+    parser.add_argument("--grad_sign_delta", default=0.05, type=float,
+                        help="Sign loss sharpness. Smaller = closer to a 0/1 step (0.024 at a perfect "
+                             "tile and 0.976 at an exact flip for 0.05).")
+    parser.add_argument("--grad_err_mode", default="slog", choices=["slog", "rel"],
+                        help="Per-tile gradient error. slog: signed-log MSE (+ --grad_mass_weight). "
+                             "rel: saturated percent error r/(1+r/--grad_rel_sat), r=|pred-true|/|true|, "
+                             "weighted by (|true|/sum|true|)^--grad_weight_power. No log.")
+    parser.add_argument("--grad_weight_power", default=0.15, type=float,
+                        help="rel mode: exponent p on each tile's share of the sample's |dg| mass. "
+                             "0 = every tile equal, 1 = pure mass weighting.")
+    parser.add_argument("--grad_rel_sat", default=2.0, type=float,
+                        help="rel mode: percent error saturates toward this (2.0 = 200%%, an equal-size sign flip).")
     parser.add_argument("--grad_loss_weight", default=0.1, type=float,
                         help="Weight on the gradient-matching loss term (only used when "
                              "--grad_dataset_path is set). Start conservative -- this is a new, "
@@ -1562,7 +1719,12 @@ if __name__ == "__main__":
         node_grad_power=args.node_grad_power,
         node_grad_cos_weight=args.node_grad_cos_weight,
         grad_loss_weight=args.grad_loss_weight,
-        grad_cos_weight=args.grad_cos_weight,
+        grad_sign_loss_weight=args.grad_sign_loss_weight,
+        grad_err_mode=args.grad_err_mode,
+        grad_sign_delta=args.grad_sign_delta,
+        grad_weight_power=args.grad_weight_power,
+        grad_rel_sat=args.grad_rel_sat,
         grad_sign_weight=args.grad_sign_weight,
+        grad_mass_weight=args.grad_mass_weight,
         grad_batch_size=args.grad_batch_size,
     )

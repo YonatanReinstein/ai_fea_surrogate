@@ -135,8 +135,17 @@ def _run_sample_worker(args):
 class GNNEvaluator(BaseEvaluator):
     def __init__(self, geometry_name: str, screenshots: bool = False, processes: int = None, batch_size: int = 128,
                  heatmap: bool = False, heatmap_dir: str = "screenshots", heatmap_base_only: bool = False,
-                 ckpt_path: str = None):
+                 ckpt_path: str = None, stress_ks_rho_mpa: float = None):
         super().__init__(geometry_name)
+        # The KS sharpness the caller (optimizer / labeller / probe) runs at.
+        # It MUST equal the checkpoint's: the model's node map was trained
+        # against KS targets and dKS/dt labels at ONE rho, and the pooled
+        # value does not transfer (0.15-trained model pooled at 0.25 reads
+        # 57 MPa on the uniform design vs ccx 77). Until 2026-09-16 this
+        # argument was silently dropped and the checkpoint value used,
+        # while every optimizer run passed 0.15 -- so nothing ever flagged
+        # that the dataset (and the reference run) were at 0.25.
+        self._requested_rho = stress_ks_rho_mpa
         self.processes = processes
         self.screenshots = screenshots
         self.batch_size = batch_size
@@ -172,6 +181,13 @@ class GNNEvaluator(BaseEvaluator):
         self.target_mean = ckpt["node_target_mean"].to(self.device)
         self.target_std  = ckpt["node_target_std"].to(self.device)
         self.stress_ks_rho_mpa = ckpt.get("stress_ks_rho_mpa", 0.15)
+        if self._requested_rho is not None and abs(self._requested_rho - self.stress_ks_rho_mpa) > 1e-9:
+            raise ValueError(
+                f"KS rho mismatch: run asks for {self._requested_rho} but checkpoint {ckpt_path} was "
+                f"trained/pooled at {self.stress_ks_rho_mpa}. Use a checkpoint trained at the run's rho "
+                f"(training/gnn_training.py --stress_ks_rho_mpa) -- the pooled value does not transfer.")
+        print(f"[gnn] KS rho = {self.stress_ks_rho_mpa}/MPa (checkpoint), run requested "
+              f"{self._requested_rho if self._requested_rho is not None else 'unspecified'}", flush=True)
         self.x_mean = ckpt["x_mean"].to(self.device)
         self.x_std  = ckpt["x_std"].to(self.device)
         self.edge_mean = ckpt["edge_mean"].to(self.device)
@@ -256,6 +272,7 @@ class GNNEvaluator(BaseEvaluator):
 
         self.model.load_state_dict(ckpt["model_state"])
         self.model.eval()
+        self._snapshot_loaded_weights(ckpt_path)
 
         self.listener_thread = threading.Thread(target=listener, daemon=True).start()
 
@@ -467,6 +484,59 @@ class GNNEvaluator(BaseEvaluator):
             "base_heatmap": base_heatmap,  # {"mesh", "stress"} for dims_list[0], or None
         }
 
+
+    def _maybe_hot_reload(self):
+        """Pick up weights republished mid-run by training/online_finetune.py.
+
+        Enabled only when GNN_LIVE_CKPT is set, so ordinary runs keep a fixed
+        model. The trainer publishes with os.replace, so this either sees the
+        whole old file or the whole new one -- never a partial write. Reload is
+        keyed on mtime; a failed load leaves the current weights serving rather
+        than taking the optimiser down mid-generation.
+        """
+        live = os.environ.get("GNN_LIVE_CKPT")
+        if not live or not os.path.exists(live):
+            return
+        try:
+            mt = os.path.getmtime(live)
+        except OSError:
+            return
+        if mt == getattr(self, "_live_mtime", None):
+            return
+        try:
+            ck = torch.load(live, map_location=self.device, weights_only=False)
+            self.model.load_state_dict(ck["model_state"])
+            self.model.eval()
+            self._live_mtime = mt
+            # Bumped on every reload so callers holding predictions from the
+            # OLD weights (e.g. TopologyOptimizer's trust region) can tell the
+            # model changed underneath them and reset their baseline.
+            self.reload_count = getattr(self, "reload_count", 0) + 1
+            print(f"[gnn] hot-reloaded weights from {live} (reload #{self.reload_count})", flush=True)
+            self._snapshot_loaded_weights(live)
+        except Exception as e:
+            print(f"[gnn] hot reload failed, keeping current weights: {e}", flush=True)
+
+    def _snapshot_loaded_weights(self, src):
+        """Copy the checkpoint file that is now serving to
+        $TOPOPT_ARTIFACT_DIR/surrogate_loaded.pt (atomic). The trainer keeps
+        publishing after the optimiser's last reload, so the live file can be
+        newer than what the optimiser actually used for its last generation;
+        a resume that starts from the live file then reads the checkpointed
+        design under different weights (run G's resume: g +0.006 -> +0.080 on
+        the same design, 5 lambda-capped gens, vol 275 -> 340). This file is
+        always the weights that produced the topopt checkpoint."""
+        art = os.environ.get("TOPOPT_ARTIFACT_DIR")
+        if not art:
+            return
+        try:
+            import shutil
+            os.makedirs(art, exist_ok=True)
+            dst = os.path.join(art, "surrogate_loaded.pt")
+            shutil.copyfile(src, dst + ".writing")
+            os.replace(dst + ".writing", dst)
+        except Exception as e:
+            print(f"[gnn] weight snapshot failed: {e}", flush=True)
     def compute_stress_and_gradient(self, dims: dict):
         """Predicted stress AND the model's own d(stress)/d(tile thickness)
         for every tile, from a single forward+backward pass -- no ccx
@@ -494,6 +564,7 @@ class GNNEvaluator(BaseEvaluator):
         """
         assert self._get_tile_grid is not None, \
             "compute_stress_and_gradient needs a geometry with tile_grid()"
+        self._maybe_hot_reload()
         NX, NY, NZ = self._get_tile_grid(dims)
         K = NX * NY * NZ
 

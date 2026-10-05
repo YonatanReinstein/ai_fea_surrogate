@@ -30,7 +30,7 @@ def _log_gpu_info():
         print(f"[gpu] arch_list={torch.cuda.get_arch_list()}")
 
 
-def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, screenshots=False, processes=None, batch_size=28, optimizer="ga", penalty_weight=10.0, constraint_mode="auglag", search_space="logit", sigma0=None, reset_on_stagnation=False, max_unproductive_resets=2, filter_radius=1.5, move_limit=0.2, fd_step=0.02, trust_rel_tol=0.5, min_trust_frac=0.05, untrusted_move_frac=0.1, tr_tol=0.05, tr_min_scale=0.02, g_backoff=0.02, calib_every=5, calib_smooth=0.5, stagnation_gens=0, mesh_threads=4, nproc=1, stress_ks_rho_mpa=0.15, gnn_ckpt_path=None, screenshot_every=1, ccx_gradient="adjoint", ccx_axis_path=None, gradient_nproc=None, mesh_res=None, oc_eta=0.5, init_thickness=None, element_type=None):
+def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, screenshots=False, processes=None, batch_size=28, optimizer="ga", penalty_weight=10.0, constraint_mode="auglag", search_space="logit", sigma0=None, reset_on_stagnation=False, max_unproductive_resets=2, filter_radius=1.5, move_limit=0.2, fd_step=0.02, trust_rel_tol=0.5, min_trust_frac=0.05, untrusted_move_frac=0.1, tr_tol=0.05, tr_min_scale=0.02, g_backoff=0.02, calib_every=5, calib_smooth=0.5, calib_max_dev=2.0, stagnation_gens=0, mesh_threads=4, nproc=1, stress_ks_rho_mpa=0.15, gnn_ckpt_path=None, screenshot_every=1, ccx_gradient="adjoint", ccx_axis_path=None, gradient_nproc=None, mesh_res=None, oc_eta=0.5, init_thickness=None, element_type=None, filter_target="gradient", filter_radius_end=None, filter_decay_gens=0, filter_decay_start=0, proj_eta=None, proj_beta_end=16.0, proj_start_gen=100, proj_end_gen=300, proj_w_max=1.0, sharpen_mode="gate", unsharp_radius=None, skel_tau=0.03, skel_tau_end=None, stop_at_gen=None):
     if mesh_res:
         # Set before anything imports the geometry: data/{geometry}/
         # boundary_conditions.mesh_resolution() reads FEA_MESH_RES, and so do
@@ -101,6 +101,20 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
             seed=0,
             geometry=geometry_name,
             filter_radius=filter_radius,
+            filter_target=filter_target,
+            filter_radius_end=filter_radius_end,
+            filter_decay_gens=filter_decay_gens,
+            filter_decay_start=filter_decay_start,
+            proj_eta=proj_eta,
+            proj_beta_end=proj_beta_end,
+            proj_start_gen=proj_start_gen,
+            proj_end_gen=proj_end_gen,
+            proj_w_max=proj_w_max,
+            sharpen_mode=sharpen_mode,
+            unsharp_radius=unsharp_radius,
+            skel_tau=skel_tau,
+            skel_tau_end=skel_tau_end,
+            stop_at_gen=stop_at_gen,
             move_limit=move_limit,
             oc_eta=oc_eta,
             init_thickness=init_thickness,
@@ -109,6 +123,7 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
             stagnation_gens=stagnation_gens,
             calib_every=calib_every,
             calib_smooth=calib_smooth,
+            calib_max_dev=calib_max_dev,
             tr_tol=tr_tol,
             tr_min_scale=tr_min_scale,
             trust_rel_tol=trust_rel_tol,
@@ -157,6 +172,35 @@ if __name__ == "__main__":
     parser.add_argument("--sigma0", type=float, default=None, help="CMA initial step size (sigma). Defaults to 2.0 for logit space, 0.25 for box/reflect. Larger values increase exploration range.")
     parser.add_argument("--reset_on_stagnation", action="store_true", help="On a soft-stagnation stop (tolstagnation/tolflatfitness), reset CMA covariance and sigma while keeping the current mean, then continue. Real convergence (tolfun/tolx) still exits.")
     parser.add_argument("--max_unproductive_resets", type=int, default=2, help="With --reset_on_stagnation: after this many consecutive resets without improvement in best feasible volume, declare hard stagnation and stop.")
+    parser.add_argument("--filter_target", choices=["gradient", "design", "density", "none"], default="gradient",
+                        help="topopt: apply the spatial filter to the sensitivities (Sigmund, default), to the "
+                             "DESIGN after each OC step (density filter; gradients used raw), or to nothing.")
+    parser.add_argument("--filter_radius_end", type=float, default=None,
+                        help="topopt, filter_target=design: radius to reach after --filter_decay_gens (linear); <=1 = no smoothing.")
+    parser.add_argument("--filter_decay_gens", type=int, default=0,
+                        help="topopt, filter_target=design: generations over which the design-filter radius goes from --filter_radius to --filter_radius_end (0 = constant).")
+    parser.add_argument("--filter_decay_start", type=int, default=0,
+                        help="topopt, filter_target=design/density: generation at which the radius decay begins (constant --filter_radius before it).")
+    parser.add_argument("--proj_eta", type=float, default=None,
+                        help="topopt, filter_target=density: gated-projection threshold as an ABSOLUTE thickness. Filtered tiles below it are driven to the floor as beta grows; above it they keep their thickness. None = no projection (plain density filter with chain rule).")
+    parser.add_argument("--proj_beta_end", type=float, default=16.0,
+                        help="topopt, filter_target=density: final projection sharpness beta (0 = identity gate).")
+    parser.add_argument("--proj_start_gen", type=int, default=100,
+                        help="topopt, filter_target=density: beta is 0 up to this generation, then ramps linearly ...")
+    parser.add_argument("--proj_end_gen", type=int, default=300,
+                        help="... reaching --proj_beta_end at this generation and holding.")
+    parser.add_argument("--stop_at_gen", type=int, default=None,
+                        help="topopt: absolute generation to stop at (exclusive). Overrides --generations, which counts from the resumed start gen.")
+    parser.add_argument("--skel_tau_end", type=float, default=None,
+                        help="topopt, sharpen_mode=skeleton: tau ramps linearly from --skel_tau to this over --proj_start_gen..--proj_end_gen (None = constant).")
+    parser.add_argument("--skel_tau", type=float, default=0.03,
+                        help="topopt, sharpen_mode=skeleton: tiles at or below this thickness never donate material.")
+    parser.add_argument("--sharpen_mode", choices=["gate", "unsharp", "skeleton"], default="gate",
+                        help="topopt, filter_target=design: 'gate' = threshold gate at --proj_eta (erosion when applied post-hoc); 'unsharp' = derivative subtraction x + w*(x - blur(x)), i.e. x - w*Laplacian(x): boosts contrast at member edges only, removes blur not material. Amount w ramps 0 -> --proj_w_max over --proj_start_gen..--proj_end_gen.")
+    parser.add_argument("--unsharp_radius", type=float, default=None,
+                        help="topopt, sharpen_mode=unsharp: radius of the blur subtracted (default: the current design-filter radius).")
+    parser.add_argument("--proj_w_max", type=float, default=1.0,
+                        help="Ceiling of the gate blend weight (ramped 0 -> this over proj_start_gen..proj_end_gen). 1.0 for filter_target=density. With filter_target=design the gate is applied to the design itself after smoothing each generation, so it compounds: use a small erosion rate (0.02-0.05).")
     parser.add_argument("--filter_radius", type=float, default=1.5, help="topopt: Sigmund sensitivity-filter radius in tile-grid units (via data.{geometry}.boundary_conditions.tile_grid()). 0 disables filtering.")
     parser.add_argument("--move_limit", type=float, default=0.2, help="topopt: OC move limit per generation, as a fraction of each dim's (max - min) span.")
     parser.add_argument("--fd_step", type=float, default=0.02, help="topopt: finite-difference perturbation size per generation, as a fraction of each dim's (max - min) span. Larger values push the sensitivity signal further above solver/mesh noise at the cost of local accuracy.")
@@ -175,6 +219,8 @@ if __name__ == "__main__":
                         help="topopt: run one real-solver (fitness_func) solve every N generations and rescale the gradient path's stress AND its sensitivity by the measured ratio. Corrects core/fem_adjoint.py's C3D8 against ccx's C3D8I, which agree to +0.29%% at the uniform starting design but diverge to -5..-12%% (adjoint reads LOW, i.e. optimistically) as tiles thin and C3D8 shear-locks. 0 disables.")
     parser.add_argument("--calib_smooth", type=float, default=0.5,
                         help="topopt: EMA weight for the new ratio in --calib_every's rolling calibration. 1.0 = use the latest ratio outright.")
+    parser.add_argument("--calib_max_dev", type=float, default=2.0,
+                        help="topopt: reject a calibration sample whose ref/adjoint ratio falls outside [1/x, x] as a bad reference solve rather than folding it into the EMA. The real bias is a few per cent; ccx has twice returned a ratio of 8x-68x on an ordinary design (jobs 48454, 183931), and one such sample pins lambda for ~30 generations. 0 disables.")
     parser.add_argument("--stress_ks_rho_mpa", type=float, default=0.15, help="ccx arch: KS aggregation sharpness (1/MPa) for the stress reported to optimizers. Larger = closer to the true hard max (noisier per-tile sensitivities); smaller = smoother sensitivities but more conservative (overestimates the true peak).")
     parser.add_argument("--gnn_ckpt_path", type=str, default=None, help="gnn arch: path to the surrogate checkpoint (.pt) to load. Defaults to data/{geometry}/gnn_surrogate.pt if not given.")
     parser.add_argument("--ccx_gradient", type=str, default="adjoint", choices=["adjoint", "axis", "fd"], help="ccx arch + topopt: how to get per-tile sensitivities. 'adjoint' (default) is core/fem_adjoint.py's exact shape adjoint -- one factorization of our own C3D8 assembly plus two back-substitutions gives the reported stress AND every tile's dG, at any tile count, with d(K_e)/d(x) autodiffed rather than finite-differenced. Scored against the full 1680-solve remesh FD map on hollow_cube's 840 tiles at (3,3,3): sign 824/840, spearman +0.9997, ratio median 0.9985, sum rule x0.9953, 46 s -- where 'axis' gives 56/840, -0.4716, -19.00, x-2.79 in 433 s. 'axis' uses the patched solver's global-axis nodal gradient contracted with the geometric Jacobian -- 4 solves per generation regardless of tile count, and per-tile agreement with remesh FD inside 1.12x (against 31.4x for the older surface-normal projection). Needs the ccx_axis binary from tools/build_ccx_axis.sh. 'fd' restores the old forward-difference sweep: one extra full solve per tile per generation (841 on hollow_cube), no patched binary required.")
@@ -193,4 +239,4 @@ if __name__ == "__main__":
     parser.add_argument("--screenshot_every", type=int, default=1, help="topopt: only render/save a screenshot every Nth generation (gen 0 always included). Each screenshot re-solves the design independently (a real CCX solve when screenshot_heatmap is on) and typically dominates per-generation wall time, so raise this to speed up runs where only the OC trajectory/final design matters.")
     args = parser.parse_args()
 
-    run_optimization(args.geometry, arch=args.arch, pop_size=args.pop_size, generations=args.generations, screenshots=args.screenshots, processes=args.processes, batch_size=args.batch_size, optimizer=args.optimizer, penalty_weight=args.penalty_weight, constraint_mode=args.constraint_mode, search_space=args.search_space, sigma0=args.sigma0, reset_on_stagnation=args.reset_on_stagnation, max_unproductive_resets=args.max_unproductive_resets, filter_radius=args.filter_radius, move_limit=args.move_limit, fd_step=args.fd_step, trust_rel_tol=args.trust_rel_tol, tr_tol=args.tr_tol, tr_min_scale=args.tr_min_scale, g_backoff=args.g_backoff, calib_every=args.calib_every, calib_smooth=args.calib_smooth, stagnation_gens=args.stagnation_gens, min_trust_frac=args.min_trust_frac, untrusted_move_frac=args.untrusted_move_frac, mesh_threads=args.mesh_threads, nproc=args.nproc, stress_ks_rho_mpa=args.stress_ks_rho_mpa, gnn_ckpt_path=args.gnn_ckpt_path, screenshot_every=args.screenshot_every, ccx_gradient=args.ccx_gradient, ccx_axis_path=args.ccx_axis_path, gradient_nproc=args.gradient_nproc, mesh_res=args.mesh_res, oc_eta=args.oc_eta, init_thickness=args.init_thickness, element_type=args.element_type)
+    run_optimization(args.geometry, arch=args.arch, pop_size=args.pop_size, generations=args.generations, screenshots=args.screenshots, processes=args.processes, batch_size=args.batch_size, optimizer=args.optimizer, penalty_weight=args.penalty_weight, constraint_mode=args.constraint_mode, search_space=args.search_space, sigma0=args.sigma0, reset_on_stagnation=args.reset_on_stagnation, max_unproductive_resets=args.max_unproductive_resets, filter_radius=args.filter_radius, move_limit=args.move_limit, fd_step=args.fd_step, trust_rel_tol=args.trust_rel_tol, tr_tol=args.tr_tol, tr_min_scale=args.tr_min_scale, g_backoff=args.g_backoff, calib_every=args.calib_every, calib_smooth=args.calib_smooth, calib_max_dev=args.calib_max_dev, stagnation_gens=args.stagnation_gens, min_trust_frac=args.min_trust_frac, untrusted_move_frac=args.untrusted_move_frac, mesh_threads=args.mesh_threads, nproc=args.nproc, stress_ks_rho_mpa=args.stress_ks_rho_mpa, gnn_ckpt_path=args.gnn_ckpt_path, screenshot_every=args.screenshot_every, ccx_gradient=args.ccx_gradient, ccx_axis_path=args.ccx_axis_path, gradient_nproc=args.gradient_nproc, mesh_res=args.mesh_res, oc_eta=args.oc_eta, init_thickness=args.init_thickness, element_type=args.element_type, filter_target=args.filter_target, filter_radius_end=args.filter_radius_end, filter_decay_gens=args.filter_decay_gens, filter_decay_start=args.filter_decay_start, proj_eta=args.proj_eta, proj_beta_end=args.proj_beta_end, proj_start_gen=args.proj_start_gen, proj_end_gen=args.proj_end_gen, proj_w_max=args.proj_w_max, sharpen_mode=args.sharpen_mode, unsharp_radius=args.unsharp_radius, skel_tau=args.skel_tau, skel_tau_end=args.skel_tau_end, stop_at_gen=args.stop_at_gen)

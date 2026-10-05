@@ -157,6 +157,9 @@ run_part() {
             --field_amplitude_frac_up "${FIELD_AMPLITUDE_FRAC_UP:-0.10}" \
             --field_amplitude_frac_down "${FIELD_AMPLITUDE_FRAC_DOWN:-0.10}" \
             --field_random_base "${FIELD_RANDOM_BASE:-true}" \
+            ${FIELD_SOBOL:+--field_sobol} \
+            ${FIELD_TWO_LEVEL_FRAC:+--field_two_level_frac ${FIELD_TWO_LEVEL_FRAC}} \
+            ${FIELD_AMPLITUDE_RANGE:+--field_amplitude_range ${FIELD_AMPLITUDE_RANGE}} \
             --grad_mode adjoint \
             --grad_store_nodes "${GRAD_STORE_NODES:-true}" \
             >> "${part_log}" 2>&1

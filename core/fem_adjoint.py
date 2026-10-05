@@ -68,6 +68,9 @@ standard 2x2x2 inverse map (the +-sqrt(3) evaluation), then averaged over the
 elements meeting at each node -- CalculiX's own recovery -- and pooled with
 the same KS as Mesh.get_aggregated_stress.
 """
+import os
+import threading
+import weakref
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
@@ -332,8 +335,7 @@ class ShapeAdjoint:
     def solve(self):
         """Factorize once and back-substitute for u. The factorization is kept:
         the adjoint reuses it, so the gradient costs no additional solve."""
-        Kr = self._assemble().tocsc()
-        self._lu = spla.splu(Kr)
+        self._lu = _SPDFactor(self._assemble())
         q = self._lu.solve(self.f_red)
         self.u = torch.tensor(self.T @ q, requires_grad=True)
         return self.u
@@ -494,6 +496,75 @@ class ShapeAdjoint:
             raise AssertionError(
                 f"{len(bad)} rigid-tied nodes have nonzero dX/dt (e.g. {bad[:5]}); "
                 "the tie's own coordinate dependence would have to be differentiated")
+
+
+class _SPDFactor:
+    """Factorization of the reduced stiffness, which is symmetric positive
+    definite (supports eliminated, load through the rigid tie). MKL PARDISO's
+    Cholesky when pypardiso is installed, SciPy's SuperLU otherwise.
+
+    SuperLU is a general unsymmetric LU and was half of every label: on
+    hollow_cube's 145k-DOF K, 26 s of factorization against PARDISO's 1.0 s on
+    one thread. The two solutions agree to 1e-8 relative, which is inside
+    SuperLU's own residual (5e-9), so this changes the speed and not the
+    labels. MKL runs sequential unless MKL_THREADING_LAYER is already set:
+    its OpenMP runtime would otherwise share the process with torch's, and the
+    labellers are one process per core anyway."""
+
+    _local = threading.local()   # one PARDISO handle per thread, reused across labels
+
+    @classmethod
+    def _pardiso(cls):
+        """This thread's PARDISO handle, or None for SuperLU
+        (FEM_ADJOINT_SOLVER=superlu, or pypardiso not installed)."""
+        if os.environ.get("FEM_ADJOINT_SOLVER", "pardiso") == "superlu":
+            return None
+        if getattr(cls._local, "solver", None) is None:
+            os.environ.setdefault("MKL_THREADING_LAYER", "SEQUENTIAL")
+            if "PYPARDISO_MKL_RT" not in os.environ:
+                # pypardiso's fallback when ctypes can't find mkl_rt is a
+                # recursive glob of sys.prefix: 4.8 s per solver in this env
+                import glob, sys
+                hit = sorted(glob.glob(os.path.join(sys.prefix, "lib", "libmkl_rt.so*")))
+                if hit:
+                    os.environ["PYPARDISO_MKL_RT"] = hit[0]
+            try:
+                from pypardiso import PyPardisoSolver
+            except ImportError:
+                return None
+            cls._local.solver = PyPardisoSolver(mtype=2)   # real symmetric positive definite
+        return cls._local.solver
+
+    def __init__(self, K):
+        self._ps = self._pardiso()
+        if self._ps is None:
+            self._lu = spla.splu(K.tocsc())
+            return
+        self._A = sp.triu(K, format="csr")       # PARDISO reads the upper triangle
+        self._A.sort_indices()
+        self._ps.factorize(self._A)
+        self._ps._owner = weakref.ref(self)
+
+    def solve(self, b):
+        if self._ps is None:
+            return self._lu.solve(b)
+        if self._ps._owner() is not self:
+            # another ShapeAdjoint factorized on the shared handle since
+            # (pypardiso would detect it and refactorize; be explicit)
+            self._ps.factorize(self._A)
+            self._ps._owner = weakref.ref(self)
+        return self._ps.solve(self._A, np.asarray(b, dtype=np.float64))
+
+    def __del__(self):
+        # PARDISO's factor lives in MKL's memory, not Python's: release it
+        # (phase 0) once this factorization is dropped, unless a newer one has
+        # already replaced it on the shared handle
+        ps = getattr(self, "_ps", None)
+        if ps is not None and getattr(ps, "_owner", lambda: None)() in (self, None):
+            try:
+                ps.free_memory(everything=False)
+            except Exception:
+                pass
 
 
 def _vm(S):

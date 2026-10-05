@@ -251,11 +251,11 @@ class CCXEvaluator(BaseEvaluator):
             # reproduces ccx's own C3D8 to 5 significant figures (KS 39.1027
             # vs 39.1023 MPa on hollow_cube_one, |u|max identical), so the
             # constraint stays on the same scale the rest of the pipeline uses.
+            _nodes = build_mesh().all_nodes()   # one build, read three times
             sa = ShapeAdjoint(nodes0, elements0,
-                              [n.id for n in build_mesh().all_nodes() if n.anchored],
-                              [n.id for n in build_mesh().all_nodes() if any(n.forces)],
-                              [sum(n.forces[j] for n in build_mesh().all_nodes())
-                               for j in range(3)],
+                              [n.id for n in _nodes if n.anchored],
+                              [n.id for n in _nodes if any(n.forces)],
+                              [sum(n.forces[j] for n in _nodes) for j in range(3)],
                               young, poisson)
             sa.assert_tie_is_fixed(dX_dt)
             sa.solve()

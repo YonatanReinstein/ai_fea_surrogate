@@ -21,7 +21,13 @@ class IritModelBase(abc.ABC):
             self.tmp_dir = "tmp/irit_debug"
             os.makedirs(self.tmp_dir, exist_ok=True)
         else:
-            self.tmp_dir = tempfile.mkdtemp(prefix="irit_", dir="tmp")
+            # IRIT_TMP overrides the scratch parent. The default "tmp" is
+            # RELATIVE, i.e. inside the repo on the NFS home; on a node with a
+            # slow link (newton2 is at 100baseT) dozens of parallel meshers
+            # writing here would saturate it, so point it at local disk there.
+            _tp = os.environ.get("IRIT_TMP", "tmp")
+            os.makedirs(_tp, exist_ok=True)
+            self.tmp_dir = tempfile.mkdtemp(prefix="irit_", dir=_tp)
         self.volume = None
         self._mesh_threads = mesh_threads
         self._debug = debug

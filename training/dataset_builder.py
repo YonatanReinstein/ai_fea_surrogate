@@ -117,8 +117,77 @@ from ansys.mapdl.core import MapdlPool
 from ansys.mapdl.core.errors import MapdlRuntimeError
 
 
+def _sample_two_level(tile_keys, lo, hi, NX, NY, NZ, rng, sigma,
+                       vol_frac, t_thick, beta, t_thin_frac=0.0, back_texture=0.0):
+    """Members-on-a-background design: a correlated field pushed through a soft
+    threshold, so the tile population is BIMODAL (a thin background plus a
+    minority of thick members) instead of a unimodal blob around one anchor.
+
+    Why this exists. The correlated-field sampler varies thickness BETWEEN
+    designs (its anchor is drawn uniform in volume) but only slightly WITHIN
+    one: measured over 200 samples of the 30k set, the median per-design
+    max/min contrast is 3.5, while every design a topopt run reaches sits at
+    ~47 -- floor tiles and 0.30+ members in the SAME design. Raising the field
+    amplitude does not fix the shape: it pushes mass toward BOTH bounds, so the
+    >=0.30 fraction climbs to 32% (target 6%) while the 0.05-0.12 web shrinks
+    to 9% (target 41%). A Gaussian field is unimodal; the designs that matter
+    are strongly right-skewed -- mostly thin, a few thick members. That skew is
+    what the threshold produces.
+
+    Parameters (all DoE factors, see the Sobol block in run_dataset_builder):
+      sigma       correlation length of the underlying field, in tiles
+      vol_frac    fraction of tiles above the threshold (the "member" share)
+      t_thick     thickness the members approach
+      beta        transition sharpness; small = soft/graded, large = crisp.
+                  None = no threshold at all: a monotone rank map onto
+                  [t_back, t_thick] (see below)
+      t_thin_frac background thickness as a fraction of (t_thick - lo)
+      back_texture spread of the background, as a fraction of (t_back - lo).
+                   A flat background puts every non-member tile at one value;
+                   real designs carry a textured thin region (41% of tiles in
+                   0.05-0.12 with only 9% at the floor), so the background is
+                   given its own correlated variation and its own share of
+                   floor-clipped tiles.
+    """
+    pad = int(np.ceil(4.0 * 12.0))
+    dims_shape = (NX, NY, NZ)
+    pads = tuple(pad if d > 1 else 0 for d in dims_shape)
+    modes = tuple("constant" if d > 1 else "reflect" for d in dims_shape)
+    noise = rng.standard_normal(tuple(d + 2 * p for d, p in zip(dims_shape, pads)))
+    field = gaussian_filter(noise, sigma=sigma, mode=modes)
+    field = field[pads[0]:pads[0] + NX, pads[1]:pads[1] + NY, pads[2]:pads[2] + NZ]
+    f = field.reshape(-1)
+    f = (f - f.mean()) / max(f.std(), 1e-12)
+    # threshold at the quantile that leaves exactly vol_frac of tiles above it,
+    # so the member share is a CONTROLLED factor rather than an outcome
+    if beta is None:
+        # NO THRESHOLD: map the field monotonically onto [0, 1] by RANK, so the
+        # design spans exactly [t_back, t_thick] with no level-set step. The
+        # thresholded form puts mass at two plateaus and its "members" come out
+        # as compact blobs (level sets of a smooth field are blobs), which is
+        # visibly not what a real design looks like. The rank map keeps the
+        # spatial correlation but makes the thickness distribution uniform
+        # between the two ends, and -- because the extremes are hit exactly --
+        # it makes per-design contrast t_thick/t_back a DIRECTLY CONTROLLED DoE
+        # factor instead of an outcome of amplitude and clipping.
+        w = np.empty_like(f)
+        w[np.argsort(f)] = np.linspace(0.0, 1.0, f.size)
+    else:
+        thr = np.quantile(f, 1.0 - vol_frac)
+        w = 1.0 / (1.0 + np.exp(-beta * (f - thr)))        # soft membership
+    t_back = lo + t_thin_frac * (t_thick - lo)
+    if back_texture > 0:
+        g = gaussian_filter(rng.standard_normal(tuple(d + 2 * p for d, p in zip(dims_shape, pads))),
+                            sigma=max(sigma * 0.5, 0.8), mode=modes)
+        g = g[pads[0]:pads[0] + NX, pads[1]:pads[1] + NY, pads[2]:pads[2] + NZ].reshape(-1)
+        g = (g - g.mean()) / max(g.std(), 1e-12)
+        t_back = t_back + back_texture * (t_back - lo) * g
+    values = np.clip(t_back + (t_thick - np.maximum(t_back, lo)) * w, lo, hi)
+    return dict(zip(tile_keys, values.tolist()))
+
+
 def _sample_correlated_field(tile_keys, lo, hi, default, NX, NY, NZ, rng,
-                              amplitude_frac_up=0.10, amplitude_frac_down=0.10):
+                              amplitude_frac_up=0.10, amplitude_frac_down=0.10, sigma=None):
     # Per-tile i.i.d. uniform sampling (the plain path below) produces
     # spatially uncorrelated "salt-and-pepper" designs -- nothing like the
     # smooth, spatially-correlated material fields a real structure (or a
@@ -152,7 +221,9 @@ def _sample_correlated_field(tile_keys, lo, hi, default, NX, NY, NZ, rng,
     # more sample-to-sample than at small sigma, where ~840 near-independent
     # cells average tightly back to `default`. That swinging overall volume
     # at large sigma is exactly the coverage this sampler exists to add.
-    sigma = rng.uniform(1.0, 12.0)
+    # sigma is a DoE factor when the caller supplies one (Sobol path); the
+    # internal draw is the fallback for the plain independent-uniform path.
+    sigma = float(sigma) if sigma is not None else rng.uniform(1.0, 12.0)
     # mode="reflect" on the true (NX, NY, NZ) grid inflates variance near
     # any edge -- up to ~2x the interior value right at a corner, verified
     # empirically for this grid shape across sigma in [1, 12] (see
@@ -592,6 +663,9 @@ def build_dataset(
     stress_ks_rho_mpa: float = 0.15,
     field_amplitude_frac_up: float = 0.10,
     field_amplitude_frac_down: float = 0.10,
+    field_amplitude_range: str = None,
+    field_sobol: bool = False,
+    field_two_level_frac: float = 0.0,
     field_base_thickness: float = None,
     field_random_base: bool = False,
     grad_mode=False,
@@ -710,8 +784,73 @@ def build_dataset(
     samples_needed = num_samples - start_idx
     all_dims = []
     num_field_samples = 0
-    for _ in range(dim_offset + samples_needed):
+    amp_lo = amp_hi = None
+    if field_amplitude_range:
+        amp_lo, amp_hi = (float(v) for v in str(field_amplitude_range).split(","))
+        if not (0 < amp_lo <= amp_hi):
+            raise ValueError(f"--field_amplitude_range must be 0 < lo <= hi, got {field_amplitude_range}")
+    amp_log = []
+
+    # ---- DoE over the GENERATOR parameters -------------------------------
+    # The design space is 840-D, where no classical design is possible, but
+    # every sample this builder makes is determined by a handful of numbers:
+    # (anchor volume, sigma, amp_up, amp_down) for the field sampler, and
+    # (sigma, vol_frac, t_thick, beta, t_thin_frac) for the two-level one.
+    # Those low-dimensional boxes ARE designable.
+    #
+    # Drawing them as independent uniforms (the previous behaviour) is Monte
+    # Carlo, not a design: coverage error falls as N^-1/2 and, worse, JOINT
+    # corners are left to chance -- "large sigma AND large amplitude" (a few
+    # big blobs at extreme contrast, structurally the closest thing to a
+    # truss) holds a small probability mass and may be represented by a
+    # handful of samples out of 30k. No marginal histogram reveals that,
+    # which is exactly why the dataset looked adequate while the surrogate
+    # collapsed on real designs. A scrambled Sobol sequence gives every
+    # sub-box its proportional share by construction (error ~N^-1), so the
+    # same sample budget buys uniform coverage and the dataset becomes
+    # auditable: a failure can be localised to a region of the box.
+    #
+    # Sobol's balance is a property of the SEQUENCE, so it is drawn once up
+    # front (which this builder already does for all dims) and is exact at
+    # powers of two -- hence the 2^m padding below.
+    n_draw = dim_offset + samples_needed
+    sob = None
+    if field_sobol:
+        from scipy.stats import qmc
+        m = int(np.ceil(np.log2(max(n_draw, 2))))
+        sob = qmc.Sobol(d=6, scramble=True, seed=seed).random_base2(m)[:n_draw]
+        print(f"[doe] Sobol sequence: {n_draw} points from 2^{m} over a 6-D generator box "
+              f"(anchor, sigma, amp_up, amp_down, vol_frac/t_thick, beta), scrambled seed={seed}",
+              flush=True)
+    def _u(i, k):
+        """coordinate k of draw i in [0,1): Sobol when enabled, else plain RNG"""
+        return float(sob[i, k]) if sob is not None else float(field_rng.random())
+    def _loguni(u, a, b):
+        return float(np.exp(np.log(a) + u * (np.log(b) - np.log(a))))
+    n_two_level = 0
+    for _i in range(dim_offset + samples_needed):
         if field_tile_keys is not None:
+            # A designed share of the dataset comes from the two-level
+            # generator; the rest stays with the correlated field, so one
+            # dataset spans both the smooth and the members-on-background
+            # regimes rather than replacing one with the other.
+            if field_two_level_frac > 0 and _u(_i, 4) < field_two_level_frac:
+                _sig = 1.0 + _u(_i, 1) * 5.0                       # 1-6 tiles
+                _vf = 0.05 + _u(_i, 2) * 0.35                      # 5-40% members
+                _tt = field_lo[0] + (0.25 + 0.75 * _u(_i, 0)) * (field_hi[0] - field_lo[0])
+                # Half the two-level draws use NO threshold (rank map); the
+                # rest keep the soft step. Contrast is then a factor in its own
+                # right rather than a by-product.
+                _beta = None if _u(_i, 5) < 0.5 else _loguni(_u(_i, 5), 2.0, 60.0)
+                # background height: squared so the draw concentrates on the
+                # thin end, where the real designs keep ~75% of their tiles
+                _tf = (_u(_i, 3) ** 2) * 0.45
+                all_dims.append(_sample_two_level(field_tile_keys, field_lo, field_hi,
+                                                  NX, NY, NZ, field_rng, _sig, _vf, _tt, _beta, _tf,
+                                                  back_texture=0.3 + 0.5 * _u(_i, 4) / max(field_two_level_frac, 1e-9)
+                                                                if field_two_level_frac > 0 else 0.5))
+                num_field_samples += 1; n_two_level += 1
+                continue
             if field_random_base:
                 # Single scalar anchor per sample (tile bounds are uniform
                 # across the grid for hollow_cube -- field_lo/field_hi are
@@ -719,20 +858,51 @@ def build_dataset(
                 # correlated noise is layered on top. Drawn uniform in VOLUME
                 # (via the inverted thickness->volume lookup) rather than
                 # uniform in thickness -- see _build_or_load_volume_inverse.
-                sample_volume = field_rng.uniform(volume_lo, volume_hi)
+                sample_volume = volume_lo + _u(_i, 0) * (volume_hi - volume_lo)
                 sample_base = float(volume_inverse(sample_volume))
                 this_default = np.full(len(field_tile_keys), sample_base)
             else:
                 this_default = field_default
+            # WITHIN-design contrast as a sampled DoE factor, not a constant.
+            # With a fixed amplitude of 0.10 the field only swings +/-0.046
+            # around this sample's anchor, so a design is globally thin OR
+            # globally thick: measured on 200 training samples, the median
+            # per-design max/min contrast is 3.5, while every design the
+            # topopt optimiser reaches sits at ~47 (floor tiles and 0.3+
+            # members in the SAME design). The marginal thickness histogram
+            # matches; the within-design structure does not, and that is the
+            # distribution gap behind the surrogate's collapse on the second
+            # half of a trajectory (dG cosine +0.04 at gen 600 vs +0.78 for a
+            # constant-direction control). Drawing the amplitude log-uniformly
+            # per sample spans both regimes in one dataset; up and down are
+            # drawn independently so thinning-dominated and thickening-
+            # dominated designs both appear.
+            if amp_lo is not None:
+                a_up = _loguni(_u(_i, 2), amp_lo, amp_hi)
+                a_dn = _loguni(_u(_i, 3), amp_lo, amp_hi)
+            else:
+                a_up, a_dn = field_amplitude_frac_up, field_amplitude_frac_down
+            amp_log.append((a_up, a_dn))
             all_dims.append(_sample_correlated_field(field_tile_keys, field_lo, field_hi, this_default,
                                                        NX, NY, NZ, field_rng,
-                                                       amplitude_frac_up=field_amplitude_frac_up,
-                                                       amplitude_frac_down=field_amplitude_frac_down))
+                                                       amplitude_frac_up=a_up,
+                                                       amplitude_frac_down=a_dn,
+                                                       sigma=(1.0 + _u(_i, 1) * 11.0) if sob is not None else None))
             num_field_samples += 1
         else:
             all_dims.append({k: random.uniform(v["min"], v["max"]) for k, v in dims_template.items()})
     print(f"Generated dims [{dim_offset}..{dim_offset + samples_needed - 1}] (offset={dim_offset}), "
           f"{num_field_samples} correlated-field / {len(all_dims) - num_field_samples} i.i.d.", flush=True)
+    if amp_log or n_two_level:
+        _a = np.array(amp_log) if amp_log else np.zeros((1, 2))
+        _con = np.array([max(d.values()) / max(min(d.values()), 1e-9) for d in all_dims[:2000]])
+        print(f"[doe] two-level designs: {n_two_level}/{num_field_samples} "
+              f"({100.0*n_two_level/max(num_field_samples,1):.0f}%)", flush=True)
+        print(f"[doe] amplitude up {_a[:,0].min():.3f}-{_a[:,0].max():.3f} (median {np.median(_a[:,0]):.3f}), "
+              f"down {_a[:,1].min():.3f}-{_a[:,1].max():.3f} (median {np.median(_a[:,1]):.3f}); "
+              f"per-design contrast max/min: median {np.median(_con):.1f}, "
+              f"p10 {np.percentile(_con,10):.1f}, p90 {np.percentile(_con,90):.1f} "
+              f"(fixed-amplitude datasets sit at ~3.5; topopt designs at ~47)", flush=True)
 
     if engine == "ccx":
         print(f"Running with CalculiX (ccx_path={ccx_path}), pool_size={pool_size}, nproc={nproc}", flush=True)
@@ -1240,6 +1410,26 @@ if __name__ == "__main__":
     parser.add_argument("--mesh_threads", type=int, default=4, help="OMP threads per meshing call (engine=ccx only).")
     parser.add_argument("--stress_ks_rho_mpa", type=float, default=0.15, help="KS aggregation sharpness (1/MPa) for the ks_stress graph target; see core/mesh.py:get_aggregated_stress. Matches ccx_evaluator.py's default.")
     parser.add_argument("--field_amplitude_frac_up", type=float, default=0.10, help="Amplitude for the correlated-field sampler on the thickening (above-default) side only, as a fraction of each tile's (max-min) span, applied after normalizing out sigma's expected per-cell std (so contrast is comparable across all sigma -- see _sample_correlated_field). Thickening has sharply diminishing returns on stress, so this is usually kept modest.")
+    parser.add_argument("--field_sobol", action="store_true",
+                        help="DoE: draw the generator parameters (anchor volume, sigma, the two amplitudes, "
+                             "and the two-level factors) from a scrambled 6-D Sobol sequence instead of "
+                             "independent uniforms. Same sample budget, but every sub-box of the generator "
+                             "space gets its proportional share -- independent uniforms leave JOINT corners "
+                             "(e.g. large sigma AND large amplitude) to chance, which no marginal histogram "
+                             "reveals. Balance is exact at powers of two, so the sequence is drawn from 2^m.")
+    parser.add_argument("--field_two_level_frac", type=float, default=0.0,
+                        help="DoE: fraction of field samples drawn from the TWO-LEVEL generator (a correlated "
+                             "field through a soft threshold: a thin background plus a controlled share of "
+                             "thick members). The correlated-field sampler is unimodal and cannot produce the "
+                             "right-skewed floor+member structure topopt designs have, at any amplitude. "
+                             "0 = off (correlated field only), 0.5 = half the dataset from each.")
+    parser.add_argument("--field_amplitude_range", type=str, default=None,
+                        help="DoE: draw the correlated-field amplitude LOG-UNIFORMLY per sample from 'lo,hi' "
+                             "(e.g. '0.02,0.5') instead of holding it at --field_amplitude_frac_up/down. The up "
+                             "and down sides are drawn independently. A fixed amplitude gives every design the "
+                             "same small within-design swing (median max/min contrast 3.5 measured on the 30k "
+                             "set) while topopt designs sit at ~47, so the dataset covers the marginal thickness "
+                             "distribution but not the bimodal floor+member structure the optimiser reaches.")
     parser.add_argument("--field_amplitude_frac_down", type=float, default=0.10, help="Same as --field_amplitude_frac_up but for the thinning (below-default) side. This is what actually drives stress up and creates low-volume/thin-design coverage -- raise this (independently of the up side) to get more of that regime.")
     parser.add_argument("--field_base_thickness", type=float, default=None, help="Overrides the uniform anchor the field sampler centers each tile on (see _sample_correlated_field's `default` arg), independently of dims.json's own per-tile default (which stays untouched -- it's also the optimizer's real starting point). Use to shift the sampled stress distribution: a thinner anchor raises typical stress. Defaults to dims.json's default if unset. Ignored if --field_random_base is set.")
     def _bool(s):
@@ -1258,6 +1448,8 @@ if __name__ == "__main__":
         engine=args.engine, ccx_path=args.ccx_path, mesh_threads=args.mesh_threads,
         stress_ks_rho_mpa=args.stress_ks_rho_mpa,
         field_amplitude_frac_up=args.field_amplitude_frac_up, field_amplitude_frac_down=args.field_amplitude_frac_down,
+        field_amplitude_range=args.field_amplitude_range,
+        field_sobol=args.field_sobol, field_two_level_frac=args.field_two_level_frac,
         field_base_thickness=args.field_base_thickness, field_random_base=args.field_random_base,
         grad_mode=args.grad_mode, grad_store_nodes=args.grad_store_nodes, grad_tiles_per_sample=args.grad_tiles_per_sample, grad_fd_frac=args.grad_fd_frac,
     )

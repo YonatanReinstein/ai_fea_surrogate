@@ -12,7 +12,8 @@ def get_evaluator(geometry_name, arch="mlp", screenshots: bool = False, processe
         return MLPEvaluator(geometry_name)
     elif arch == "gnn":
         return GNNEvaluator(geometry_name, screenshots=screenshots, processes=processes, batch_size=batch_size,
-                             heatmap_base_only=heatmap_base_only, ckpt_path=gnn_ckpt_path)
+                             heatmap_base_only=heatmap_base_only, ckpt_path=gnn_ckpt_path,
+                             stress_ks_rho_mpa=stress_ks_rho_mpa)
     elif arch == "mapdl":
         return MAPDLEvaluator(geometry_name)
     elif arch == "ccx":
