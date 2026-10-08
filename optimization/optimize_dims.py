@@ -137,43 +137,42 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
                 dV[_lk] = dG[_lk] = 0.0
                 return v, s, y, dV, dG
             print(f"[optimize_dims] loaded tile {lk} tied to the mean of {nbrs} (not a design variable)", flush=True)
+        # Options of the pre-simplification optimizer (commit 7bf07d9). Still
+        # accepted on the command line so old job scripts run, but ignored.
+        removed = {"fd_step": (fd_step, 0.02), "trust_rel_tol": (trust_rel_tol, 0.5),
+                   "min_trust_frac": (min_trust_frac, 0.05), "untrusted_move_frac": (untrusted_move_frac, 0.1),
+                   "calib_every": (calib_every, 5), "calib_smooth": (calib_smooth, 0.5),
+                   "calib_max_dev": (calib_max_dev, 2.0), "filter_radius_end": (filter_radius_end, None),
+                   "filter_decay_gens": (filter_decay_gens, 0), "filter_decay_start": (filter_decay_start, 0),
+                   "proj_eta": (proj_eta, None), "proj_beta_end": (proj_beta_end, 16.0),
+                   "proj_start_gen": (proj_start_gen, 100), "proj_end_gen": (proj_end_gen, 300),
+                   "proj_w_max": (proj_w_max, 1.0), "sharpen_mode": (sharpen_mode, "gate"),
+                   "unsharp_radius": (unsharp_radius, None), "skel_tau": (skel_tau, 0.03),
+                   "skel_tau_end": (skel_tau_end, None)}
+        set_removed = [k for k, (v, d) in removed.items() if v != d]
+        if set_removed:
+            print(f"[optimize_dims] topopt: ignoring removed options {set_removed} "
+                  "(the simplified optimizer has no trust sets, calibration, FD sweep, "
+                  "projection or sharpening; commit 7bf07d9 has them)", flush=True)
+        if gradient_func is None:
+            raise ValueError(f"topopt needs exact gradients: arch=gnn, or arch=ccx with --ccx_gradient "
+                             f"adjoint/axis (got arch={arch}, ccx_gradient={ccx_gradient})")
         opt = TopologyOptimizer(
             fitness_func=fitness_func,
             dims_dict=dims_dict,
-            pop_size=pop_size,
+            gradient_func=gradient_func,
             generations=generations,
-            seed=0,
             geometry=geometry_name,
-            filter_radius=filter_radius,
-            filter_target=filter_target,
-            filter_radius_end=filter_radius_end,
-            filter_decay_gens=filter_decay_gens,
-            filter_decay_start=filter_decay_start,
-            proj_eta=proj_eta,
-            proj_beta_end=proj_beta_end,
-            proj_start_gen=proj_start_gen,
-            proj_end_gen=proj_end_gen,
-            proj_w_max=proj_w_max,
-            sharpen_mode=sharpen_mode,
-            unsharp_radius=unsharp_radius,
-            skel_tau=skel_tau,
-            skel_tau_end=skel_tau_end,
-            stop_at_gen=stop_at_gen,
             move_limit=move_limit,
             oc_eta=oc_eta,
-            init_thickness=init_thickness,
-            fd_step=fd_step,
-            g_backoff=g_backoff,
-            stagnation_gens=stagnation_gens,
-            calib_every=calib_every,
-            calib_smooth=calib_smooth,
-            calib_max_dev=calib_max_dev,
+            filter_target=filter_target,
+            filter_radius=filter_radius,
             tr_tol=tr_tol,
             tr_min_scale=tr_min_scale,
-            trust_rel_tol=trust_rel_tol,
-            min_trust_frac=min_trust_frac,
-            untrusted_move_frac=untrusted_move_frac,
-            gradient_func=gradient_func,
+            g_backoff=g_backoff,
+            stagnation_gens=stagnation_gens,
+            init_thickness=init_thickness,
+            stop_at_gen=stop_at_gen,
             screenshot_every=screenshot_every,
         )
         if load_tie is not None:
