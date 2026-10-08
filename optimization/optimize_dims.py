@@ -6,6 +6,23 @@ from evaluators.factory import get_evaluator
 from .genetic_algorithm import GeneticAlgorithm
 from .fitness_functions import make_fitness
 
+
+def _load_tile_neighbours(geometry_name, dims_keys):
+    """(load_key, [neighbour keys]) for the geometry's loaded tile: the free-end
+    tile in boundary_conditions.load_row() (IRIT tile index (NX-1) + NX*row),
+    and its in-grid face neighbours."""
+    import importlib
+    from core.tile_sensitivity import tile_index_to_dims_key
+    bc = importlib.import_module(f"data.{geometry_name}.boundary_conditions")
+    NX, NY, NZ = bc.tile_grid(None)
+    if NZ != 1:
+        raise ValueError("load-tile tie implemented for planar (NZ = 1) grids only")
+    ix, iy = NX - 1, bc.load_row()
+    key = lambda a, b: tile_index_to_dims_key(a + NX * b, NX, NY, NZ, dims_keys)
+    nbrs = [key(a, b) for a, b in ((ix - 1, iy), (ix + 1, iy), (ix, iy - 1), (ix, iy + 1))
+            if 0 <= a < NX and 0 <= b < NY]
+    return key(ix, iy), nbrs
+
 def load_dims_config(geometry_name):
     dims_path = f"data/{geometry_name}/CAD_model/dims.json"
     with open(dims_path, "r") as f:
@@ -93,6 +110,33 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
         # the patched binary isn't built on this machine.
         use_grad = arch == "gnn" or (arch == "ccx" and ccx_gradient in ("adjoint", "axis"))
         gradient_func = evaluator.compute_topopt_gradient if use_grad else None
+        # TOPOPT_LOAD_TILE_MEAN=1: the loaded tile is not a design variable;
+        # its thickness is always the mean of its in-grid face neighbours.
+        # It is fixed in dims_dict (min == max), every design gets the tie
+        # applied (opt.dims_transform below), and its sensitivity is
+        # chain-ruled onto the neighbours: d/dt_j += (1/k) d/dt_load.
+        load_tie = None
+        if os.environ.get("TOPOPT_LOAD_TILE_MEAN") == "1":
+            if gradient_func is None:
+                raise ValueError("TOPOPT_LOAD_TILE_MEAN needs a gradient_func path (gnn, or ccx adjoint/axis)")
+            load_tie = _load_tile_neighbours(geometry_name, list(dims_dict))
+            lk, nbrs = load_tie
+            dims_dict = {k: dict(v) for k, v in dims_dict.items()}
+            dims_dict[lk]["min"] = dims_dict[lk]["max"] = dims_dict[lk]["default"]
+            _raw_grad = gradient_func
+
+            def gradient_func(d, _raw=_raw_grad, _lk=lk, _nbrs=nbrs):
+                r = _raw(d)
+                if r is None:
+                    return None
+                v, s, y, dV, dG = r
+                dV, dG = dict(dV), dict(dG)
+                for nb in _nbrs:
+                    dV[nb] += dV[_lk] / len(_nbrs)
+                    dG[nb] += dG[_lk] / len(_nbrs)
+                dV[_lk] = dG[_lk] = 0.0
+                return v, s, y, dV, dG
+            print(f"[optimize_dims] loaded tile {lk} tied to the mean of {nbrs} (not a design variable)", flush=True)
         opt = TopologyOptimizer(
             fitness_func=fitness_func,
             dims_dict=dims_dict,
@@ -132,6 +176,14 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
             gradient_func=gradient_func,
             screenshot_every=screenshot_every,
         )
+        if load_tie is not None:
+            lk, nbrs = load_tie
+
+            def _tie(d, _lk=lk, _nbrs=nbrs):
+                d = dict(d)
+                d[_lk] = sum(d[nb] for nb in _nbrs) / len(_nbrs)
+                return d
+            opt.dims_transform = _tie
     else:
         opt = GeneticAlgorithm(
             fitness_func=fitness_func,

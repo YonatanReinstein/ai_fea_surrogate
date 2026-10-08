@@ -71,6 +71,14 @@ class TopologyOptimizer:
         # design bookkeeping elsewhere and must remain compatible with it.
         self.fitness_func = fitness_func
         self.gradient_func = gradient_func
+        # Optional dims -> dims map applied to every design this optimizer
+        # hands out (_vec_to_dims): gradient calls, fitness, screenshots,
+        # best/final designs. Used for tied (dependent) dims, e.g. the
+        # loaded tile held at the mean of its neighbours (optimize_dims,
+        # TOPOPT_LOAD_TILE_MEAN); the tied dim itself must be fixed (min ==
+        # max) and the gradient_func must already chain-rule its sensitivity
+        # onto the dims it depends on.
+        self.dims_transform = None
         self.dims_dict = dims_dict
         self.geometry = geometry
         self.generations = generations
@@ -585,6 +593,8 @@ class TopologyOptimizer:
     def _vec_to_dims(self, x):
         d = {n: float(x[i]) for i, n in enumerate(self.free_names)}
         d.update(self.fixed)
+        if self.dims_transform is not None:
+            d = self.dims_transform(d)
         return d
 
     # ------------------------------------------------------------------
@@ -1387,7 +1397,8 @@ class TopologyOptimizer:
                     # The labeller solves and differentiates the PHYSICAL design;
                     # dg_raw here is d/dx_phys (pre chain rule) so the two compare.
                     np.savez(_tmp, free_names=np.array(self.free_names), x=x_phys,
-                             dg_raw=dg_phys, v0=v0, s0=s0, gen=gen)
+                             dg_raw=dg_phys, v0=v0, s0=s0, gen=gen,
+                             t_spool=__import__("time").time())   # pipeline timing
                     # publish atomically -- the labeller must never claim a
                     # half-written file
                     os.replace(_tmp, os.path.join(_spool, f"gen_{gen:06d}.npz"))
@@ -1436,7 +1447,8 @@ class TopologyOptimizer:
                                               self.lo, self.hi)
                             _t2 = os.path.join(_spool, f".gen_{gen:06d}_p{_k:02d}.npz")
                             np.savez(_t2, free_names=np.array(self.free_names), x=_xp,
-                                     dg_raw=np.zeros(0), v0=v0, s0=s0, gen=gen)
+                                     dg_raw=np.zeros(0), v0=v0, s0=s0, gen=gen,
+                                     t_spool=__import__("time").time())
                             os.replace(_t2, os.path.join(_spool, f"gen_{gen:06d}_p{_k:02d}.npz"))
 
                     # Deterministic lagged pipeline: TOPOPT_LABEL_LAG=L makes gen i
