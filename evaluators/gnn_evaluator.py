@@ -135,8 +135,14 @@ def _run_sample_worker(args):
 class GNNEvaluator(BaseEvaluator):
     def __init__(self, geometry_name: str, screenshots: bool = False, processes: int = None, batch_size: int = 128,
                  heatmap: bool = False, heatmap_dir: str = "screenshots", heatmap_base_only: bool = False,
-                 ckpt_path: str = None, stress_ks_rho_mpa: float = None):
+                 ckpt_path: str = None, stress_ks_rho_mpa: float = None,
+                 load_tile: int = None, load_force=(0.0, -5e7, 0.0)):
         super().__init__(geometry_name)
+        # Tile-load models (checkpoint key tile_load_input) take the load as a
+        # tile input: load_tile is the IRIT tile index carrying load_force (N).
+        # None = the middle free-end tile, i.e. where the production
+        # force_pattern puts its load. Ignored by single-load models.
+        self._load_tile_arg, self._load_force_arg = load_tile, tuple(load_force)
         # The KS sharpness the caller (optimizer / labeller / probe) runs at.
         # It MUST equal the checkpoint's: the model's node map was trained
         # against KS targets and dKS/dt labels at ONE rho, and the pooled
@@ -227,6 +233,9 @@ class GNNEvaluator(BaseEvaluator):
             else:  # cnn
                 model_kwargs["coarse_dim"] = ckpt.get("coarse_dim")
                 model_kwargs["cnn_depth"] = ckpt.get("cnn_depth", 3)
+            model_kwargs["tile_in_dim"] = ckpt.get("tile_in_dim", 1)
+        self.tile_load_input = bool(ckpt.get("tile_load_input", False))
+        self.tile_load_scale_n = float(ckpt.get("tile_load_scale_n", 5e7))
         self.model = ModelClass(**model_kwargs).to(self.device)
 
         # Frozen-graph fast path: if graph.pt exists, workers reuse its constant
@@ -269,6 +278,34 @@ class GNNEvaluator(BaseEvaluator):
             # freshly-constructed model until this runs.
             NX, NY, NZ = self._get_tile_grid(None)
             self.model.set_tile_grid(NX, NY, NZ)
+        if self.tile_load_input:
+            NX, NY, NZ = self._get_tile_grid(None)
+            # default: the free-end tile in the row the geometry's force_pattern
+            # loads (its load_row(), i.e. FEA_LOAD_ROW or the middle row)
+            _row = module.load_row() if hasattr(module, "load_row") else NY // 2
+            self.load_tile = (self._load_tile_arg if self._load_tile_arg is not None
+                              else (NX - 1) + NX * _row)
+            assert 0 <= self.load_tile < NX * NY * NZ, f"load_tile {self.load_tile} outside the grid"
+            self._load_vec = torch.tensor(self._load_force_arg, dtype=torch.float) / self.tile_load_scale_n
+            print(f"[GNNEvaluator] tile-load model: load {self._load_force_arg} N on tile {self.load_tile}",
+                  flush=True)
+        # KS mask: a model trained on labels that leave the loaded tile out of
+        # KS (checkpoint ks_exclude == "load_tile") must pool the same nodes.
+        # The mesh topology is fixed, so the excluded node rows -- every node of
+        # the loaded tile's elements, as in build_tile_load_dataset -- are the
+        # same for every design: computed once from the nominal mesh.
+        self.ks_mask = None
+        if self.tile_load_input and ckpt.get("ks_exclude") == "load_tile":
+            tmpl = json.load(open(f"{model_dir}/dims.json"))
+            _cad = IritCModel(self.model_path, dims_dict={k: v["default"] for k, v in tmpl.items()},
+                              fixed_dims=self.fixed_dims)
+            _nodes, _elems, _e2t = _cad.create_mesh(U=self.U, V=self.V, W=self.W)
+            assert list(_nodes) == list(range(1, len(_nodes) + 1)), "graph rows assume node ids 1..N"
+            self.ks_mask = torch.ones(len(_nodes), dtype=torch.bool)
+            for eid, nl in _elems.items():
+                if _e2t[eid] == self.load_tile:
+                    self.ks_mask[[n - 1 for n in nl]] = False
+            print(f"[GNNEvaluator] KS excludes the loaded tile: {int((~self.ks_mask).sum())} nodes", flush=True)
 
         self.model.load_state_dict(ckpt["model_state"])
         self.model.eval()
@@ -282,6 +319,24 @@ class GNNEvaluator(BaseEvaluator):
         self.pool = Pool(processes=self.processes)
 
 
+
+    def _prepare_inputs(self, batch_data):
+        """Node/tile inputs exactly as training's _preprocess builds them:
+        single-load models keep the node force feature (in MN); tile-load
+        models drop it and append [Fx, Fy, Fz] / tile_load_scale_n per tile,
+        non-zero on self.load_tile only. Thickness stays tile_x column 0."""
+        if not self.tile_load_input:
+            batch_data.x[:, 3:6] = batch_data.x[:, 3:6] / 1e+6
+            return batch_data
+        x = batch_data.x
+        batch_data.x = torch.cat([x[:, :3], x[:, 6:]], dim=1)
+        G = batch_data.num_graphs
+        K = batch_data.tile_x.shape[0] // G
+        load = torch.zeros(G, K, 3)
+        load[:, self.load_tile] = self._load_vec
+        batch_data.tile_x = torch.cat([batch_data.tile_x.float().view(G * K, -1)[:, :1],
+                                       load.view(G * K, 3)], dim=1)
+        return batch_data
 
     def evaluate(self, dims_list: list[dict]):
         #print("start evaluation of batch size:", len(dims_list))
@@ -341,10 +396,9 @@ class GNNEvaluator(BaseEvaluator):
                 if self.node_id is not None and g.x.shape[0] == self.node_id.shape[0]:
                     g.node_id = self.node_id
                 graph_list.append(g)
-            batch_data = Batch.from_data_list(graph_list)
+            batch_data = self._prepare_inputs(Batch.from_data_list(graph_list))
 
             x, edge_index, edge_attr, batch, _ti, _nx, _ny, _nz, _tx, node_id = gnn_input_fn(batch_data)
-            x[:, 3:6] = x[:, 3:6] / 1e+6   # scale force vector (Fx,Fy,Fz) to match training (gnn_training.py:95)
 
             x = x.to(self.device)
             edge_attr = edge_attr.float().to(self.device)
@@ -382,6 +436,8 @@ class GNNEvaluator(BaseEvaluator):
                     x, edge_index, edge_attr, batch,
                     tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
                     tile_x=tile_x, node_id=node_id,
+                    ks_mask=self.ks_mask.repeat(batch_data.num_graphs).to(self.device)
+                    if self.ks_mask is not None else None,
                 )
 
             # Denormalize
@@ -576,12 +632,11 @@ class GNNEvaluator(BaseEvaluator):
         g = Data(**{k: torch.from_numpy(v) for k, v in graph_dict.items()})
         if self.node_id is not None and g.x.shape[0] == self.node_id.shape[0]:
             g.node_id = self.node_id
-        batch_data = Batch.from_data_list([g])
+        batch_data = self._prepare_inputs(Batch.from_data_list([g]))
 
         x, edge_index, edge_attr, batch, tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, node_id = \
             gnn_input_fn(batch_data)
         x = x.float().to(self.device)
-        x[:, 3:6] = x[:, 3:6] / 1e+6  # force vector -> MN, matches training's _preprocess
         edge_index = edge_index.to(self.device)
         edge_attr = edge_attr.float().to(self.device)
         batch = batch.to(self.device)
@@ -596,7 +651,10 @@ class GNNEvaluator(BaseEvaluator):
         # rebuild x's own strut column from the SAME leaf so the gradient
         # captures both paths thickness enters the model through (matches
         # gnn_training.py's gradient-matching loss).
-        t_leaf = tile_x.float().to(self.device).clone().requires_grad_(True)
+        # thickness only (column 0); a tile-load model's load columns ride along
+        tile_x = tile_x.float().to(self.device)
+        t_leaf = tile_x[:, :1].clone().requires_grad_(True)
+        tile_x_in = torch.cat([t_leaf, tile_x[:, 1:]], dim=1)
         node_strut = t_leaf.view(-1)[tile_idx].unsqueeze(1)
         x_grad = torch.cat([x[:, :-1], node_strut], dim=1)
         x_norm = (x_grad - self.x_mean) / self.x_std
@@ -607,7 +665,8 @@ class GNNEvaluator(BaseEvaluator):
         graph_pred, _ = self.model(
             x_norm, edge_index, edge_attr_norm, batch,
             tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
-            tile_x=t_leaf, node_id=node_id,
+            tile_x=tile_x_in, node_id=node_id,
+            ks_mask=self.ks_mask.to(self.device) if self.ks_mask is not None else None,
         )
         self.model.train(was_training)
 

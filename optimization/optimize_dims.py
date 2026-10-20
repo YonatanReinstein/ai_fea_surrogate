@@ -23,6 +23,22 @@ def _load_tile_neighbours(geometry_name, dims_keys):
             if 0 <= a < NX and 0 <= b < NY]
     return key(ix, iy), nbrs
 
+def _load_tile_block(geometry_name, dims_keys):
+    """(load_key, [keys of every in-grid tile touching it]) -- the 3x3 block
+    around the loaded tile, diagonals included (5 neighbours on the free-end
+    edge)."""
+    import importlib
+    from core.tile_sensitivity import tile_index_to_dims_key
+    bc = importlib.import_module(f"data.{geometry_name}.boundary_conditions")
+    NX, NY, NZ = bc.tile_grid(None)
+    if NZ != 1:
+        raise ValueError("load-tile block implemented for planar (NZ = 1) grids only")
+    ix, iy = NX - 1, bc.load_row()
+    key = lambda a, b: tile_index_to_dims_key(a + NX * b, NX, NY, NZ, dims_keys)
+    nbrs = [key(ix + a, iy + b) for a in (-1, 0, 1) for b in (-1, 0, 1)
+            if (a, b) != (0, 0) and 0 <= ix + a < NX and 0 <= iy + b < NY]
+    return key(ix, iy), nbrs
+
 def load_dims_config(geometry_name):
     dims_path = f"data/{geometry_name}/CAD_model/dims.json"
     with open(dims_path, "r") as f:
@@ -71,6 +87,14 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
     fitness_func = make_fitness(evaluator, material_properties["yield_strength"])
     dims_path = f"data/{geometry_name}/CAD_model/dims.json"
     dims_dict = json.loads(Path(dims_path).read_text())
+    # TOPOPT_T_MIN: lower every free tile's floor (dims.json's min, 0.01 on
+    # cross4) for the optimizer only -- dims.json itself is also the dataset
+    # builder's sampling range. 0.001 builds and meshes on cross4; 0.0001 does
+    # not (the colored Jacobian's 1e-4 bump changes the mesh topology there).
+    if os.environ.get("TOPOPT_T_MIN"):
+        t_min = float(os.environ["TOPOPT_T_MIN"])
+        dims_dict = {k: (dict(v, min=t_min) if v["max"] > v["min"] else v) for k, v in dims_dict.items()}
+        print(f"[optimize_dims] tile floor lowered to {t_min} (TOPOPT_T_MIN)", flush=True)
 
     if optimizer == "cma":
         from .cma_optimizer import CMAOptimizer
@@ -108,13 +132,36 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
         # See each evaluator's compute_topopt_gradient docstring.
         # --ccx_gradient fd restores the FD sweep for the ccx arch, e.g. when
         # the patched binary isn't built on this machine.
-        use_grad = arch == "gnn" or (arch == "ccx" and ccx_gradient in ("adjoint", "axis"))
+        use_grad = arch in ("gnn", "gnn_multiload", "gnn_dsig") or (arch == "ccx" and ccx_gradient in ("adjoint", "axis"))
         gradient_func = evaluator.compute_topopt_gradient if use_grad else None
         # TOPOPT_LOAD_TILE_MEAN=1: the loaded tile is not a design variable;
         # its thickness is always the mean of its in-grid face neighbours.
         # It is fixed in dims_dict (min == max), every design gets the tie
         # applied (opt.dims_transform below), and its sensitivity is
         # chain-ruled onto the neighbours: d/dt_j += (1/k) d/dt_load.
+        # TOPOPT_FIX_LOAD_NBHD=<t>: the loaded tile and every in-grid tile
+        # touching it (3x3 block, diagonals included) are fixed at thickness t
+        # for the whole run (not design variables). Pair it
+        # with TOPOPT_KS_EXCLUDE=load_nbhd so the stress constraint is set by
+        # the structure, not by the load introduction these tiles carry.
+        # TOPOPT_FIX_LOAD_TILE=<t>: freeze just the loaded tile at t (e.g. with a
+        # distributed void load, FEA_LOAD_MODE=void_traction, whose loaded
+        # surface must not move under the adjoint's fixed nodal forces).
+        if os.environ.get("TOPOPT_FIX_LOAD_TILE"):
+            lk, _ = _load_tile_neighbours(geometry_name, list(dims_dict))
+            t_fix = float(os.environ["TOPOPT_FIX_LOAD_TILE"])
+            dims_dict = {k: dict(v) for k, v in dims_dict.items()}
+            dims_dict[lk]["min"] = dims_dict[lk]["max"] = dims_dict[lk]["default"] = t_fix
+            print(f"[optimize_dims] loaded tile {lk} fixed at t={t_fix}", flush=True)
+        fix_t = os.environ.get("TOPOPT_FIX_LOAD_NBHD")
+        if fix_t:
+            if os.environ.get("TOPOPT_LOAD_TILE_MEAN") == "1":
+                raise ValueError("TOPOPT_FIX_LOAD_NBHD and TOPOPT_LOAD_TILE_MEAN both set the loaded tile")
+            lk, nbrs = _load_tile_block(geometry_name, list(dims_dict))
+            dims_dict = {k: dict(v) for k, v in dims_dict.items()}
+            for k in [lk] + nbrs:
+                dims_dict[k]["min"] = dims_dict[k]["max"] = dims_dict[k]["default"] = float(fix_t)
+            print(f"[optimize_dims] loaded tile {lk} and neighbours {nbrs} fixed at t={float(fix_t)}", flush=True)
         load_tie = None
         if os.environ.get("TOPOPT_LOAD_TILE_MEAN") == "1":
             if gradient_func is None:
@@ -142,18 +189,16 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
         removed = {"fd_step": (fd_step, 0.02), "trust_rel_tol": (trust_rel_tol, 0.5),
                    "min_trust_frac": (min_trust_frac, 0.05), "untrusted_move_frac": (untrusted_move_frac, 0.1),
                    "calib_every": (calib_every, 5), "calib_smooth": (calib_smooth, 0.5),
-                   "calib_max_dev": (calib_max_dev, 2.0), "filter_radius_end": (filter_radius_end, None),
-                   "filter_decay_gens": (filter_decay_gens, 0), "filter_decay_start": (filter_decay_start, 0),
+                   "calib_max_dev": (calib_max_dev, 2.0),
                    "proj_eta": (proj_eta, None), "proj_beta_end": (proj_beta_end, 16.0),
-                   "proj_start_gen": (proj_start_gen, 100), "proj_end_gen": (proj_end_gen, 300),
-                   "proj_w_max": (proj_w_max, 1.0), "sharpen_mode": (sharpen_mode, "gate"),
-                   "unsharp_radius": (unsharp_radius, None), "skel_tau": (skel_tau, 0.03),
-                   "skel_tau_end": (skel_tau_end, None)}
+                   "unsharp_radius": (unsharp_radius, None)}
+        if sharpen_mode not in ("gate", "skeleton"):      # "gate" without proj_eta was a no-op
+            removed["sharpen_mode"] = (sharpen_mode, "gate")
         set_removed = [k for k, (v, d) in removed.items() if v != d]
         if set_removed:
             print(f"[optimize_dims] topopt: ignoring removed options {set_removed} "
                   "(the simplified optimizer has no trust sets, calibration, FD sweep, "
-                  "projection or sharpening; commit 7bf07d9 has them)", flush=True)
+                  "projection gate or unsharp mask; commit 7bf07d9 has them)", flush=True)
         if gradient_func is None:
             raise ValueError(f"topopt needs exact gradients: arch=gnn, or arch=ccx with --ccx_gradient "
                              f"adjoint/axis (got arch={arch}, ccx_gradient={ccx_gradient})")
@@ -162,12 +207,33 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
             dims_dict=dims_dict,
             gradient_func=gradient_func,
             generations=generations,
+            reference_gradient=getattr(evaluator, "reference_gradient", None),
             geometry=geometry_name,
             move_limit=move_limit,
             oc_eta=oc_eta,
             filter_target=filter_target,
             filter_radius=filter_radius,
+            filter_radius_end=filter_radius_end,
+            filter_decay_start=filter_decay_start,
+            filter_decay_gens=filter_decay_gens,
+            # skeleton sharpening, scheduled by the old proj_* flags
+            sharpen="skeleton" if (sharpen_mode == "skeleton" and filter_target in ("design", "density")) else "none",
+            sharpen_start=proj_start_gen,
+            sharpen_end=proj_end_gen,
+            sharpen_w_max=proj_w_max,
+            skel_tau=skel_tau,
+            skel_tau_end=skel_tau_end,
             tr_tol=tr_tol,
+            # TOPOPT_TILE_MOVE=1: per-tile step limits damped on sign reversal
+            tile_move_adapt=os.environ.get("TOPOPT_TILE_MOVE") == "1",
+            # TOPOPT_FIXED_MOVE=1: full move limit every step, no rejections
+            adapt_move=os.environ.get("TOPOPT_FIXED_MOVE") != "1",
+            # TOPOPT_UPDATE=mma: Method of Moving Asymptotes instead of OC
+            update=os.environ.get("TOPOPT_UPDATE", "oc"),
+            # TOPOPT_MMA_ASY_INIT: starting asymptote distance, fraction of the bound span
+            mma_asy_init=float(os.environ.get("TOPOPT_MMA_ASY_INIT", "0.5")),
+            # TOPOPT_MMA_LOW_MIN: floor for the lower asymptotes (e.g. 0)
+            mma_low_min=(float(os.environ["TOPOPT_MMA_LOW_MIN"]) if os.environ.get("TOPOPT_MMA_LOW_MIN") else None),
             tr_min_scale=tr_min_scale,
             g_backoff=g_backoff,
             stagnation_gens=stagnation_gens,
@@ -195,7 +261,12 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
             geometry=geometry_name,
         )
 
-    best_dims = opt.run()
+    try:
+        best_dims = opt.run()
+    finally:
+        # evaluators holding worker pools (gnn_dsig's fine-tune labellers) must
+        # release them, or the interpreter waits on them forever at exit
+        getattr(evaluator, "close", lambda: None)()
 
     names = list(dims_dict.keys())
     print("Optimized Dimensions:")

@@ -145,7 +145,7 @@ class HierarchicalGNNMP(nn.Module):
 
     def forward(self, x, edge_index, edge_attr, batch,
                 tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
-                num_graphs=None, node_id=None):
+                num_graphs=None, node_id=None, ks_mask=None):
         N = x.size(0)
         if num_graphs is None:
             num_graphs = int(batch.max().item()) + 1 if N > 0 else 0
@@ -257,5 +257,6 @@ class HierarchicalGNNMP(nn.Module):
 
         node_pred = self.head(h)
         graph_pred = ks_pool(node_pred, batch, num_graphs, self.node_target_mean,
-                              self.node_target_std, self.stress_ks_rho_mpa)
+                              self.node_target_std, self.stress_ks_rho_mpa,
+                              ks_mask=ks_mask)
         return graph_pred, node_pred

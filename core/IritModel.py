@@ -25,7 +25,13 @@ class IritModelBase(abc.ABC):
             # RELATIVE, i.e. inside the repo on the NFS home; on a node with a
             # slow link (newton2 is at 100baseT) dozens of parallel meshers
             # writing here would saturate it, so point it at local disk there.
-            _tp = os.environ.get("IRIT_TMP", "tmp")
+            # Default: local RAM (/dev/shm) when available -- on the NFS home
+            # every mesh waited on I/O (cpu/wall 0.5, 2.5 s vs 1.2 s per mesh)
+            # and parallel meshers queued on the network (11 meshes: 13-20 s
+            # vs 3.6 s). Folders are removed in __del__; only killed runs
+            # leave any behind.
+            _shm = f"/dev/shm/irit_{os.environ.get('USER', 'user')}"
+            _tp = os.environ.get("IRIT_TMP") or (_shm if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else "tmp")
             os.makedirs(_tp, exist_ok=True)
             self.tmp_dir = tempfile.mkdtemp(prefix="irit_", dir=_tp)
         self.volume = None

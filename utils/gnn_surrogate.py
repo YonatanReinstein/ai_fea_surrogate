@@ -7,7 +7,7 @@ from torch_geometric.nn.models import MLP
 from torch_geometric.utils import scatter
 
 
-def ks_pool(node_pred, batch, num_graphs, node_target_mean, node_target_std, rho_mpa):
+def ks_pool(node_pred, batch, num_graphs, node_target_mean, node_target_std, rho_mpa, ks_mask=None):
     """KS (Kreisselmeier-Steinhauser) smooth-max pool over per-graph node
     predictions, matching core/mesh.py:get_aggregated_stress.
 
@@ -21,6 +21,10 @@ def ks_pool(node_pred, batch, num_graphs, node_target_mean, node_target_std, rho
     gnn_evaluator.py) is unaffected -- it just sees a different graph_pred.
     """
     raw = node_pred.squeeze(-1) * node_target_std.squeeze() + node_target_mean.squeeze()
+    if ks_mask is not None:
+        # nodes outside the mask (tile-load datasets: the loaded tile) do not
+        # count toward KS -- the same rule the labels were built with
+        raw = torch.where(ks_mask.view(-1).bool(), raw, torch.full_like(raw, -1e30))
     per_graph_max = scatter(raw, batch, dim=0, dim_size=num_graphs, reduce="max")
     shifted = raw - per_graph_max[batch]
     sum_exp = scatter(torch.exp(rho_mpa * shifted), batch, dim=0, dim_size=num_graphs, reduce="sum")
@@ -84,7 +88,7 @@ class GNN(nn.Module):
 
     def forward(self, x, edge_index, edge_attr, batch,
                 tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
-                num_graphs=None, node_id=None):
+                num_graphs=None, node_id=None, ks_mask=None):
         # node_id accepted for API parity with HierarchicalGNN; unused here.
         h = self.encoder(x)
 
@@ -118,7 +122,8 @@ class GNN(nn.Module):
         h = h_aug[:N]
         node_pred = self.head(h)
         graph_pred = ks_pool(node_pred, batch, num_graphs, self.node_target_mean,
-                              self.node_target_std, self.stress_ks_rho_mpa)
+                              self.node_target_std, self.stress_ks_rho_mpa,
+                              ks_mask=ks_mask)
         return graph_pred, node_pred
 
 
@@ -242,7 +247,7 @@ class HierarchicalGNN(nn.Module):
 
     def forward(self, x, edge_index, edge_attr, batch,
                 tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
-                num_graphs=None, node_id=None):
+                num_graphs=None, node_id=None, ks_mask=None):
         N = x.size(0)
         if num_graphs is None:
             num_graphs = int(batch.max().item()) + 1 if N > 0 else 0
@@ -342,5 +347,6 @@ class HierarchicalGNN(nn.Module):
         h = h_aug[:N]
         node_pred = self.head(h)
         graph_pred = ks_pool(node_pred, batch, num_graphs, self.node_target_mean,
-                              self.node_target_std, self.stress_ks_rho_mpa)
+                              self.node_target_std, self.stress_ks_rho_mpa,
+                              ks_mask=ks_mask)
         return graph_pred, node_pred

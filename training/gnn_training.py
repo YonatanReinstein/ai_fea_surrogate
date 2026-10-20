@@ -80,6 +80,14 @@ def gnn_input_fn(data):
             tile_idx, tile_NX, tile_NY, tile_NZ, tile_x, node_id)
 
 
+def batch_ks_mask(data, device):
+    """Per-node KS mask of a (batched) sample, or None. Tile-load datasets
+    leave the loaded tile out of the KS label (build_tile_load_dataset
+    --ks_exclude); the model's KS pool must leave out the same nodes."""
+    m = getattr(data, "ks_mask", None)
+    return m.to(device, non_blocking=True) if m is not None else None
+
+
 def gnn_target_fn(data):
     # returns [batch_size, 1] tensor (graph-level). KS-aggregated stress
     # (core/mesh.py:get_aggregated_stress), not the hard max -- see
@@ -98,6 +106,10 @@ def gnn_target_fn(data):
 # calibrated in raw physical MPa (rho_mpa matches core/mesh.py's units) and
 # must stay linear for that physics to be correct -- see ks_pool's docstring.
 LOG_STRESS_EPS = 1e-6
+
+# Tile-load models (see _preprocess) feed the load as tile_x columns 1-3 in
+# units of this force, so the production -5e7 N load reads as -1.
+TILE_LOAD_SCALE_N = 5e7
 
 
 def gnn_log_target_fn(data):
@@ -299,8 +311,16 @@ def train_gnn_model(
                 f"edge_attr has {sample.edge_attr.shape[0]} edges but graph.pt has {_graph_edge_index.shape[1]}")
             sample.edge_index = _graph_edge_index
             sample.tile_idx = _graph_tile_idx
-        # convert force to MN / stresses to MPa
-        sample.x[:, 3:6] = sample.x[:, 3:6] / 1e+6
+        # Tile-load samples (training/build_tile_load_dataset.py) carry the
+        # load as a TILE input instead: drop the per-node force columns here,
+        # and the load goes into tile_x below. Older single-load datasets keep
+        # the node force feature, converted to MN.
+        tile_load = hasattr(sample, "load_tile")
+        if tile_load:
+            sample.x = torch.cat([sample.x[:, :3], sample.x[:, 6:]], dim=1)
+        else:
+            sample.x[:, 3:6] = sample.x[:, 3:6] / 1e+6
+        # stresses to MPa
         sample.max_stress = sample.max_stress / 1e+6
         sample.ks_stress = sample.ks_stress / 1e+6
         sample.node_stress = sample.node_stress / 1e+6
@@ -313,7 +333,10 @@ def train_gnn_model(
         # a wrong constraint). Checked on the first few samples only.
         if not getattr(_preprocess, "_rho_checked", 0) >= 3:
             _preprocess._rho_checked = getattr(_preprocess, "_rho_checked", 0) + 1
-            _ns = sample.node_stress.float().view(-1); _m = _ns.max()
+            _ns = sample.node_stress.float().view(-1)
+            if hasattr(sample, "ks_mask"):
+                _ns = _ns[sample.ks_mask.view(-1).bool()]
+            _m = _ns.max()
             _ks = float(_m + torch.log(torch.exp(stress_ks_rho_mpa * (_ns - _m)).sum()) / stress_ks_rho_mpa)
             _tgt = float(sample.ks_stress.float().view(-1)[0])
             _dev = abs(_ks - _tgt) / max(abs(_tgt), 1e-6)
@@ -348,7 +371,17 @@ def train_gnn_model(
                        else tile_struts_dims_key_order)
         strut_param = tile_struts[sample.tile_idx].unsqueeze(1)
         sample.x = torch.cat([sample.x, strut_param], dim=1)
-        sample.tile_x = tile_struts.view(-1, 1)
+        if tile_load:
+            # tile_x = [thickness, Fx, Fy, Fz] per tile, the force in units of
+            # TILE_LOAD_SCALE_N on the loaded tile and 0 elsewhere. load_tile
+            # is the IRIT tile index, i.e. tile_idx-native order like tile_x.
+            # Column 0 must stay the thickness: the gradient loss
+            # differentiates it alone.
+            load = torch.zeros(K, 3)
+            load[int(sample.load_tile)] = sample.load_force.view(3).float() / TILE_LOAD_SCALE_N
+            sample.tile_x = torch.cat([tile_struts.view(-1, 1), load], dim=1)
+        else:
+            sample.tile_x = tile_struts.view(-1, 1)
         if _graph_node_id is not None and sample.x.shape[0] == _num_pos_nodes_from_graph:
             sample.node_id = _graph_node_id
         return sample
@@ -531,11 +564,25 @@ def train_gnn_model(
         if num_samples is None or num_samples > total_samples:
             num_samples = total_samples
 
-        # Random train/val split (instead of slicing in order)
-        indices = torch.randperm(total_samples)[:num_samples]
-        n_train = int(num_samples * 0.8)
-        train_idx = indices[:n_train]
-        val_idx   = indices[n_train:]
+        # Random train/val split (instead of slicing in order). Tile-load
+        # datasets hold several samples (one per load tile) of each design:
+        # split by design, so no design has loads on both sides.
+        if hasattr(dataset[0], "geometry_idx"):
+            geo = torch.tensor([int(d.geometry_idx) for d in dataset])
+            designs = geo.unique()[torch.randperm(len(geo.unique()))]
+            order = torch.cat([torch.nonzero(geo == g).view(-1) for g in designs])[:num_samples]
+            n_train = int(num_samples * 0.8)
+            # move the cut to a design boundary
+            while 0 < n_train < len(order) and geo[order[n_train]] == geo[order[n_train - 1]]:
+                n_train += 1
+            train_idx, val_idx = order[:n_train], order[n_train:]
+            print(f"[split] by design: {len(geo[train_idx].unique())} train / "
+                  f"{len(geo[val_idx].unique())} val designs")
+        else:
+            indices = torch.randperm(total_samples)[:num_samples]
+            n_train = int(num_samples * 0.8)
+            train_idx = indices[:n_train]
+            val_idx   = indices[n_train:]
         train_set = [dataset[i] for i in train_idx]
         val_set   = [dataset[i] for i in val_idx]
 
@@ -739,8 +786,12 @@ def train_gnn_model(
         node_target_std=node_target_std,
         stress_ks_rho_mpa=stress_ks_rho_mpa,
     )
+    tile_in_dim = int(example.tile_x.shape[1]) if hierarchical else 1
+    tile_load_input = hasattr(example, "load_tile")
     if hierarchical:
+        model_kwargs["tile_in_dim"] = tile_in_dim
         model_kwargs["checkpoint_fine_only"] = checkpoint_fine_only
+        print(f"[model] tile_in_dim={tile_in_dim} tile_load_input={tile_load_input}")
         if coarse_arch == "transformer":
             model_kwargs["transformer_heads"] = transformer_heads
             model_kwargs["transformer_ff_mult"] = transformer_ff_mult
@@ -959,6 +1010,15 @@ def train_gnn_model(
             "model_state": raw_model.state_dict(),
             "node_in_dim": node_in_dim,
             "edge_in_dim": edge_in_dim,
+            # tile_x = [thickness] (1) or, for tile-load models,
+            # [thickness, Fx, Fy, Fz / tile_load_scale_n] (4); node x then
+            # has no force columns. Loaders must build inputs the same way.
+            "tile_in_dim": tile_in_dim,
+            "tile_load_input": tile_load_input,
+            "tile_load_scale_n": TILE_LOAD_SCALE_N,
+            # KS leaves out the loaded tile (labels built with --ks_exclude
+            # load_tile); evaluators must pass the same mask to ks_pool.
+            "ks_exclude": "load_tile" if hasattr(example, "ks_mask") else None,
             "hidden_dim": hidden_dim,
             "coarse_dim": raw_model.coarse_dim if hierarchical and coarse_arch in ("gnn", "cnn") else None,
             "cnn_depth": cnn_depth if hierarchical and coarse_arch == "cnn" else None,
@@ -1076,6 +1136,7 @@ def train_gnn_model(
                     x_norm, edge_index, edge_attr_norm, batch_idx,
                     tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
                     tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
+                    ks_mask=batch_ks_mask(batch_data, device),
                     **({"return_node_grad": True} if node_grad_weight > 0.0 else {}),
                 )
                 if node_grad_weight > 0.0:
@@ -1157,7 +1218,11 @@ def train_gnn_model(
                 # _preprocess) and tile_x (coarse embedding) -- rebuilding
                 # both from one leaf is required so the sensitivity captures
                 # both paths, not just tile_x's.
-                t_leaf = g_tile_x.detach().clone().requires_grad_(True)  # [g_num_graphs*K_tiles, 1]
+                # Only the thickness column (0) is a design variable; tile-load
+                # models carry the load in columns 1-3, which ride along as
+                # constants so d_pred stays one value per tile.
+                t_leaf = g_tile_x[:, :1].detach().clone().requires_grad_(True)  # [g_num_graphs*K_tiles, 1]
+                g_tile_x_in = torch.cat([t_leaf, g_tile_x[:, 1:]], dim=1)
                 node_strut = t_leaf.view(g_num_graphs, K_tiles)[g_batch_idx, g_tile_idx].unsqueeze(1)
                 g_x_grad = torch.cat([g_x[:, :-1], node_strut], dim=1)
                 g_x_norm = (g_x_grad - x_mean) / x_std
@@ -1167,7 +1232,8 @@ def train_gnn_model(
                     g_graph_pred, _ = model(
                         g_x_norm, g_edge_index, g_edge_attr_norm, g_batch_idx,
                         tile_idx=g_tile_idx, tile_NX=g_tile_NX, tile_NY=g_tile_NY, tile_NZ=g_tile_NZ,
-                        tile_x=t_leaf, num_graphs=g_num_graphs, node_id=g_node_id,
+                        tile_x=g_tile_x_in, num_graphs=g_num_graphs, node_id=g_node_id,
+                        ks_mask=batch_ks_mask(gbatch, device),
                     )
                     g_graph_pred_raw_mpa = (g_graph_pred * node_target_std + node_target_mean).clamp_min(LOG_STRESS_EPS)
 
@@ -1401,6 +1467,7 @@ def train_gnn_model(
                             x_norm, edge_index, edge_attr_norm, batch_idx,
                             tile_idx=tile_idx, tile_NX=tile_NX, tile_NY=tile_NY, tile_NZ=tile_NZ,
                             tile_x=tile_x, num_graphs=num_graphs, node_id=node_id,
+                            ks_mask=batch_ks_mask(batch_data, device),
                         )
                         graph_pred_raw_mpa = (graph_pred * node_target_std + node_target_mean).clamp_min(LOG_STRESS_EPS)
                         node_pred_raw_mpa = node_pred * node_target_std + node_target_mean

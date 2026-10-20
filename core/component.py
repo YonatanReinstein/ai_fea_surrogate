@@ -27,6 +27,12 @@ class Component:
         }
         self.mesh = Mesh(nodes, elements)
         self.elem_to_tile = elem_to_tile  # elem_id -> 0-based tile index
+        # TOPOPT_STIFF_PENALTY: soften thin tiles (see core.mesh.element_stiffness_scales)
+        from .mesh import element_stiffness_scales
+        scales = element_stiffness_scales(self.CAD_model.dims_template, elem_to_tile,
+                                          getattr(self.CAD_model, "_fixed_dims", {}) or {})
+        if scales:
+            self.mesh.elem_scale = scales
         
     def ansys_sim(self,  mapdl = None, screenshot_path: str = None):
         if self.mesh is None:

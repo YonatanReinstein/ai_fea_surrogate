@@ -108,23 +108,42 @@ def _elastic(E, nu):
     return D
 
 
+# (Voigt row, local dof, derivative axis) -> 1 for the strain-displacement
+# pattern, Voigt order (xx, yy, zz, xy, xz, yz) -- CalculiX's own.
+_VOIGT = ((0, 0, 0), (1, 1, 1), (2, 2, 2), (3, 0, 1), (3, 1, 0),
+          (4, 0, 2), (4, 2, 0), (5, 1, 2), (5, 2, 1))
+_SEL = {}
+
+
+def _selector(n):
+    """Constant (6, 3n, n, 3) 0/1 tensor with B[k, 3i+c] = dNdx[i, a] where
+    (k, c, a) is in _VOIGT. Building B as ONE contraction with it, instead of
+    81 in-place slice writes, keeps autograd out of CopySlices: the slice-write
+    version copied the whole B on every write in the backward pass, which was
+    72% of ShapeAdjoint.gradient's time (cross4 at 6,6,4: 311 s single-thread)."""
+    if n not in _SEL:
+        S = torch.zeros(6, 3 * n, n, 3, dtype=torch.float64)
+        for i in range(n):
+            for k, c, a in _VOIGT:
+                S[k, 3 * i + c, i, a] = 1.0
+        _SEL[n] = S
+    return _SEL[n]
+
+
 def _B(dNdx):
-    """Strain-displacement matrix from dN/dx (…,8,3) -> (…,6,24), Voigt order
+    """Strain-displacement matrix from dN/dx (…,n,3) -> (…,6,3n), Voigt order
     (xx, yy, zz, xy, xz, yz) -- CalculiX's own."""
-    sh = dNdx.shape[:-2]
-    B = dNdx.new_zeros(sh + (6, 24))
-    for i in range(8):
-        c = 3 * i
-        B[..., 0, c + 0] = dNdx[..., i, 0]
-        B[..., 1, c + 1] = dNdx[..., i, 1]
-        B[..., 2, c + 2] = dNdx[..., i, 2]
-        B[..., 3, c + 0] = dNdx[..., i, 1]
-        B[..., 3, c + 1] = dNdx[..., i, 0]
-        B[..., 4, c + 0] = dNdx[..., i, 2]
-        B[..., 4, c + 2] = dNdx[..., i, 0]
-        B[..., 5, c + 1] = dNdx[..., i, 2]
-        B[..., 5, c + 2] = dNdx[..., i, 1]
-    return B
+    return torch.einsum("...ia,kcia->...kc", dNdx, _selector(dNdx.shape[-2]).to(dNdx))
+
+
+def _btdb(B1, D, B2, w):
+    """sum_p w_mp B1_mp^T D B2_mp, (M,P,6,i) x (6,6) x (M,P,6,j) -> (M,i,j), as
+    one batched matmul. torch.einsum("mpki,mpkl,mplj,mp->mij") with D
+    expanded per element contracted this as many small bmm calls (84% of
+    element_stiffness's time); this is the same sum in two dense products."""
+    M, P = B1.shape[:2]
+    DB2 = torch.matmul(D, B2) * w[:, :, None, None]                 # (M,P,6,j)
+    return torch.bmm(B1.reshape(M, P * 6, -1).transpose(1, 2), DB2.reshape(M, P * 6, -1))
 
 
 def _geom(coords):
@@ -155,14 +174,13 @@ def element_stiffness(coords, E, nu, incompatible=True):
     D = _elastic(E, nu).to(coords)
     B, detJ = _geom(coords)
     w = detJ                                        # unit Gauss weights
-    Kuu = torch.einsum("mpki,mpkl,mplj,mp->mij", B, D.expand(B.shape[0], B.shape[1], 6, 6), B, w)
+    Kuu = _btdb(B, D, B, w)
     if not incompatible:
         return Kuu
 
     Ba = _bubble_B(coords)
-    De = D.expand(B.shape[0], B.shape[1], 6, 6)
-    Kua = torch.einsum("mpki,mpkl,mplj,mp->mij", B, De, Ba, w)
-    Kaa = torch.einsum("mpki,mpkl,mplj,mp->mij", Ba, De, Ba, w)
+    Kua = _btdb(B, D, Ba, w)
+    Kaa = _btdb(Ba, D, Ba, w)
     return Kuu - Kua @ torch.linalg.solve(Kaa, Kua.transpose(1, 2))
 
 
@@ -195,8 +213,7 @@ def _pairing(coords, ue, le, E, nu, incompatible):
     Ba = _bubble_B(coords)
     Au = torch.einsum("mpki,mpk->mi", Ba, torch.einsum("kl,mpl,mp->mpk", D, Bu, detJ))
     Al = torch.einsum("mpki,mpk->mi", Ba, torch.einsum("kl,mpl,mp->mpk", D, Bl, detJ))
-    De = D.expand(Ba.shape[0], Ba.shape[1], 6, 6)
-    Kaa = torch.einsum("mpki,mpkl,mplj,mp->mij", Ba, De, Ba, detJ)
+    Kaa = _btdb(Ba, D, Ba, detJ)
     return val - torch.einsum("mi,mi->", Al, torch.linalg.solve(Kaa, Au[..., None])[..., 0])
 
 
@@ -217,19 +234,7 @@ def _bubble_B(coords):
     for a in range(3):
         dNa[:, a, a] = -2.0 * xi[:, a]
     dNadx = torch.einsum("pab,mcb->mpac", dNa, invJ0)
-    Ba = dNadx.new_zeros(dNadx.shape[0], dNadx.shape[1], 6, 9)
-    for a in range(3):
-        c = 3 * a
-        Ba[..., 0, c + 0] = dNadx[..., a, 0]
-        Ba[..., 1, c + 1] = dNadx[..., a, 1]
-        Ba[..., 2, c + 2] = dNadx[..., a, 2]
-        Ba[..., 3, c + 0] = dNadx[..., a, 1]
-        Ba[..., 3, c + 1] = dNadx[..., a, 0]
-        Ba[..., 4, c + 0] = dNadx[..., a, 2]
-        Ba[..., 4, c + 2] = dNadx[..., a, 0]
-        Ba[..., 5, c + 1] = dNadx[..., a, 2]
-        Ba[..., 5, c + 2] = dNadx[..., a, 1]
-    return Ba
+    return _B(dNadx)                               # same Voigt pattern, 3 modes -> (M,P,6,9)
 
 
 class ShapeAdjoint:
@@ -254,7 +259,7 @@ class ShapeAdjoint:
 
     def __init__(self, nodes, elements, anchored_ids, force_nodes, total_force,
                  young, poisson, incompatible=True, chunk=4096,
-                 rigid_tie=True, nodal_forces=None):
+                 rigid_tie=True, nodal_forces=None, e_scale=None, stress_scale=None):
         self.ids = sorted(nodes)
         self.index = {nid: i for i, nid in enumerate(self.ids)}
         self.N = len(self.ids)
@@ -262,7 +267,20 @@ class ShapeAdjoint:
         self.eids = sorted(elements)
         self.conn = np.array([[self.index[n] for n in elements[e][:8]]
                               for e in self.eids], dtype=np.int64)
+        self.e_scale = (np.ones(len(self.eids)) if e_scale is None
+                        else np.asarray(e_scale, dtype=float))
+        # stress_scale: per-element multiplier of the stress counted in KS,
+        # applied to the REAL material's stress (E, not the penalized s E):
+        # the separate stress relaxation. None: the counted stress is the
+        # penalized one (multiplier = e_scale, relaxation tied to stiffness).
+        self.stress_scale = None if stress_scale is None else np.asarray(stress_scale, dtype=float)
+        self.gE = None
+        self.gW = None
         self.young, self.poisson = float(young), float(poisson)
+        # e_scale: per-element Young's modulus multiplier, self.eids order
+        # (stiffness penalty, TOPOPT_STIFF_PENALTY). K_e and the element's
+        # stress are both linear in it; gradient() also returns d KS / d scale
+        # per element in self.gE.
         self.incompatible = incompatible
         self.chunk = chunk
 
@@ -310,6 +328,10 @@ class ShapeAdjoint:
             self.f_red = self.T.T @ f_full
 
         self._lu = None
+        # Optional KS node mask (bool, self.ids order; True = counts). Nodes
+        # left out -- e.g. the load-introduction zone -- get zero weight in
+        # ks() and gradient() alike, so value and gradient stay one functional.
+        self.ks_mask = None
         self.u = None
         with torch.no_grad():
             _, detJ = _geom(self.X[self.conn[:min(len(self.conn), 20000)]])
@@ -323,6 +345,7 @@ class ShapeAdjoint:
             with torch.no_grad():
                 Ke = element_stiffness(self.X[blk], self.young, self.poisson,
                                         self.incompatible).numpy()
+            Ke = Ke * self.e_scale[a:a + self.chunk][:, None, None]
             dof = (3 * blk[:, :, None] + np.arange(3)[None, None, :]).reshape(len(blk), 24)
             rows.append(np.repeat(dof, 24, axis=1).ravel())
             cols.append(np.tile(dof, (1, 24)).ravel())
@@ -341,7 +364,7 @@ class ShapeAdjoint:
         return self.u
 
     # ------------------------------------------------------- stress and KS
-    def _nodal_stress_terms(self, blk, coords, ue):
+    def _nodal_stress_terms(self, blk, coords, ue, scale=None):
         """Extrapolated stress tensors at each element's own 8 corners,
         (m,8,6), for one chunk.
 
@@ -364,14 +387,16 @@ class ShapeAdjoint:
         eps = torch.einsum("mplj,mj->mpl", B, ue)                   # (m,P,6)
         if self.incompatible:
             Ba = _bubble_B(coords)
-            De = D.expand(B.shape[0], B.shape[1], 6, 6)
-            Kua = torch.einsum("mpki,mpkl,mplj,mp->mij", B, De, Ba, detJ)
-            Kaa = torch.einsum("mpki,mpkl,mplj,mp->mij", Ba, De, Ba, detJ)
+            Kua = _btdb(B, D, Ba, detJ)
+            Kaa = _btdb(Ba, D, Ba, detJ)
             rhs = torch.einsum("mij,mi->mj", Kua, ue)               # Kua^T ue
             ae = -torch.linalg.solve(Kaa, rhs[..., None])[..., 0]   # (m,9)
             eps = eps + torch.einsum("mplj,mj->mpl", Ba, ae)
         sig_gp = torch.einsum("kl,mpl->mpk", D, eps)                # (m,P,6)
-        return torch.einsum("np,mpk->mnk", gauss_to_node().to(coords), sig_gp)
+        out = torch.einsum("np,mpk->mnk", gauss_to_node().to(coords), sig_gp)
+        if scale is not None:                       # stiffness penalty: sigma = s E eps
+            out = out * scale[:, None, None]
+        return out
 
     def nodal_stress(self):
         """Node id -> von Mises, from the element-averaged stress tensor --
@@ -381,7 +406,9 @@ class ShapeAdjoint:
         with torch.no_grad():
             for a in range(0, len(self.conn), self.chunk):
                 blk = self.conn[a:a + self.chunk]
-                s = self._nodal_stress_terms(blk, self.X[blk], self.u[self._dof(blk)])
+                mult = self.e_scale if self.stress_scale is None else self.stress_scale
+                s = self._nodal_stress_terms(blk, self.X[blk], self.u[self._dof(blk)],
+                                             torch.as_tensor(mult[a:a + self.chunk]))
                 flat = torch.as_tensor(blk.reshape(-1))
                 acc.index_add_(0, flat, s.reshape(-1, 6))
                 cnt.index_add_(0, flat, torch.ones(len(flat)))
@@ -394,6 +421,8 @@ class ShapeAdjoint:
 
     def ks(self, rho_mpa=0.15):
         _, vm = self.nodal_stress()
+        if self.ks_mask is not None:
+            vm = vm[torch.as_tensor(self.ks_mask, dtype=torch.bool)]
         rho = rho_mpa * 1e-6
         m = vm.max()
         return float(m + torch.log(torch.exp(rho * (vm - m)).sum()) / rho)
@@ -409,6 +438,9 @@ class ShapeAdjoint:
         """
         S, vm = self.nodal_stress()
         rho = rho_mpa * 1e-6
+        if self.ks_mask is not None:                      # excluded nodes: zero weight
+            vm = torch.where(torch.as_tensor(self.ks_mask, dtype=torch.bool), vm,
+                             torch.full_like(vm, -float("inf")))
         w = torch.softmax(rho * vm, dim=0)               # @KS/@sigma_i
         Sg = S.clone().requires_grad_(True)
         _vm(Sg).mul(w).sum().backward()
@@ -424,9 +456,12 @@ class ShapeAdjoint:
             self.X.grad = None
         if self.u.grad is not None:
             self.u.grad = None
+        Es = torch.tensor(self.e_scale, requires_grad=True)
+        Ws = Es if self.stress_scale is None else torch.tensor(self.stress_scale, requires_grad=True)
         for a in range(0, len(self.conn), self.chunk):
             blk = self.conn[a:a + self.chunk]
-            s = self._nodal_stress_terms(blk, self.X[blk], self.u[self._dof(blk)])
+            s = self._nodal_stress_terms(blk, self.X[blk], self.u[self._dof(blk)],
+                                         Ws[a:a + self.chunk])
             (s * dn[torch.as_tensor(blk)]).sum().backward()
         gX_explicit = self.X.grad.clone()
         g_u = self.u.grad.detach().numpy()
@@ -437,8 +472,15 @@ class ShapeAdjoint:
         for a in range(0, len(self.conn), self.chunk):
             blk = self.conn[a:a + self.chunk]
             dof = self._dof(blk)
-            (-_pairing(self.X[blk], self.u[dof].detach(), lam[dof],
+            # lambda_e scaled by the element's stiffness scale: the pairing is
+            # sum_e s_e lambda_e^T K_e(E) u_e, so this is -lambda^T (dK/dX) u
+            # for the penalized K, and its Es-gradient the implicit d KS / d s_e
+            (-_pairing(self.X[blk], self.u[dof].detach(),
+                       lam[dof] * Es[a:a + self.chunk][:, None],
                        self.young, self.poisson, self.incompatible)).backward()
+        self.gE = Es.grad.detach().numpy().copy()     # d KS / d e_scale, per element
+        self.gW = (None if self.stress_scale is None    # d KS / d stress_scale
+                   else Ws.grad.detach().numpy().copy())
         return gX_explicit + self.X.grad
 
     def tile_gradient(self, dX_dt, elem_to_tile, tile_keys, NX, NY, NZ,

@@ -12,6 +12,113 @@ warnings.filterwarnings("ignore")
 
 pv.OFF_SCREEN = True
 
+# ---------------------------------------------------------------------------
+# Stiffness penalty for thin tiles (TOPOPT_STIFF_PENALTY = t_s, e.g. 0.03)
+# ---------------------------------------------------------------------------
+# A tile of thickness t gets Young's modulus E * s(t), s(t) = 1 - exp(-(t/t_s)^p) (p = TOPOPT_STIFF_P, default 3):
+# 1 for normal tiles (s(2 t_s) = 0.9997), 0.036 at t = t_s / 3. A near-floor
+# tile then carries almost no load -- the clean-up check on
+# cross11_mean_tilenodes_F5e6_t20_mma_fixtile found its 52 floor tiles (t =
+# 0.01, full stiffness) carrying real load: deleting them tripled the peak
+# (100 -> 312 MPa). Stress is computed from each element's own softened
+# material, sigma = s(t) E eps, so a near-empty tile's stress fades with it --
+# the stress relaxation (exponent q = p) that lets such tiles leave the stress
+# constraint. Smooth in t, so gradients and MMA keep working.
+def stiffness_penalty_ts():
+    import os
+    v = os.environ.get("TOPOPT_STIFF_PENALTY")
+    return float(v) if v not in (None, "") else None
+
+
+def stiffness_exponent():
+    """TOPOPT_STIFF_P, default 3. Use a steep exponent (e.g. 6) with
+    TOPOPT_STRESS_RELAX so the stiffness drop and the stress relaxation switch
+    on over the SAME narrow band above the floor: a tile that is soft but whose
+    real-material stress counts in full overstates that stress by ~1/s (soft ->
+    large strain); t_s 0.03, p 3 with relaxation read 436 MPa on a design whose
+    honest full-stiffness peak was 144."""
+    import os
+    return float(os.environ.get("TOPOPT_STIFF_P") or 3.0)
+
+
+def stiffness_scale(t, ts):
+    import math
+    p = stiffness_exponent()
+    return 1.0 - math.exp(-(t / ts) ** p)
+
+
+def stiffness_scale_dt(t, ts):
+    import math
+    p = stiffness_exponent()
+    return p * t ** (p - 1) / ts ** p * math.exp(-(t / ts) ** p)
+
+
+def element_stiffness_scales(dims, elem_to_tile, fixed_dims, dims_keys=None):
+    """elem id -> s(t of its tile), or None when TOPOPT_STIFF_PENALTY is unset.
+    dims: {key: t} (or {key: {"default": t}}); fixed_dims gives the tile grid
+    (d1 = NX, d2 = NY, d3 = NZ); elem_to_tile maps to IRIT's 0-based tile index."""
+    ts = stiffness_penalty_ts()
+    if ts is None:
+        return None
+    from .tile_sensitivity import tile_index_to_dims_key
+    keys = list(dims_keys) if dims_keys is not None else list(dims)
+    val = {k: float(v["default"] if isinstance(v, dict) else v) for k, v in dims.items()}
+    NX, NY, NZ = (int(fixed_dims[k]) for k in ("d1", "d2", "d3"))
+    tile_s = {}
+    out = {}
+    for eid, ti in elem_to_tile.items():
+        if ti not in tile_s:
+            tile_s[ti] = stiffness_scale(val[tile_index_to_dims_key(ti, NX, NY, NZ, keys)], ts)
+        out[eid] = tile_s[ti]
+    return out
+
+
+# Stress relaxation separate from the stiffness penalty (TOPOPT_STRESS_RELAX =
+# t_w, e.g. 0.004; floor TOPOPT_RELAX_TMIN, default 0.01). The stress counted
+# in the constraint becomes w(t) * (the stress the REAL material would carry at
+# that deformation), w(t) = 1 - exp(-((t - tmin) / t_w)^2) for t > tmin, else 0:
+# zero at the floor, 0.79 at tmin + t_w, ~1 by tmin + 2.5 t_w. Without it the
+# stress is the penalized s(t) E eps, which also relaxes thin STRUCTURAL tiles:
+# the cross run cross11_..._stiff03 read 100 MPa but 143.8 MPa at full
+# stiffness, its peak in a 0.01-0.03 tile beside the load.
+def stress_relax_params():
+    import os
+    v = os.environ.get("TOPOPT_STRESS_RELAX")
+    if v in (None, ""):
+        return None
+    return float(v), float(os.environ.get("TOPOPT_RELAX_TMIN") or 0.01)
+
+
+def stress_weight(t, tw, tmin):
+    import math
+    return 0.0 if t <= tmin else 1.0 - math.exp(-((t - tmin) / tw) ** 2)
+
+
+def stress_weight_dt(t, tw, tmin):
+    import math
+    if t <= tmin:
+        return 0.0
+    a = (t - tmin) / tw
+    return 2.0 * a / tw * math.exp(-a * a)
+
+
+def element_stress_weights(dims, elem_to_tile, fixed_dims, dims_keys=None):
+    """elem id -> w(t of its tile), or None when TOPOPT_STRESS_RELAX is unset."""
+    prm = stress_relax_params()
+    if prm is None:
+        return None
+    from .tile_sensitivity import tile_index_to_dims_key
+    keys = list(dims_keys) if dims_keys is not None else list(dims)
+    val = {k: float(v["default"] if isinstance(v, dict) else v) for k, v in dims.items()}
+    NX, NY, NZ = (int(fixed_dims[k]) for k in ("d1", "d2", "d3"))
+    cache, out = {}, {}
+    for eid, ti in elem_to_tile.items():
+        if ti not in cache:
+            cache[ti] = stress_weight(val[tile_index_to_dims_key(ti, NX, NY, NZ, keys)], *prm)
+        out[eid] = cache[ti]
+    return out
+
+
 class Mesh:
     def __init__(self, nodes, elements, tolerance=1e-9):
         self.nodes = nodes
@@ -203,12 +310,24 @@ class Mesh:
             if len(ids) > 15:
                 lines.append(", ".join(ids[15:]))
 
-        lines += [
-            "*MATERIAL, NAME=MAT1",
-            "*ELASTIC",
-            f"{young!r}, {poisson!r}",
-            "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT1",
-        ]
+        scales = getattr(self, "elem_scale", None)
+        if not scales:
+            lines += [
+                "*MATERIAL, NAME=MAT1",
+                "*ELASTIC",
+                f"{young!r}, {poisson!r}",
+                "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT1",
+            ]
+        else:
+            # stiffness penalty: one material per distinct scale (per tile)
+            groups = {}
+            for e in self.all_elements():
+                groups.setdefault(scales[e.id], []).append(e.id)
+            for g, (sc, eids) in enumerate(sorted(groups.items())):
+                lines.append(f"*ELSET, ELSET=EP{g}")
+                lines += [", ".join(str(x) for x in eids[i:i + 16]) for i in range(0, len(eids), 16)]
+                lines += [f"*MATERIAL, NAME=MP{g}", "*ELASTIC", f"{young * sc!r}, {poisson!r}",
+                          f"*SOLID SECTION, ELSET=EP{g}, MATERIAL=MP{g}"]
 
         anchored = [n for n in self.all_nodes() if n.anchored]
         if anchored:
@@ -218,7 +337,10 @@ class Mesh:
         force_nodes = [n for n in self.all_nodes() if any(n.forces)]
         pilot_id = None
         total_force = (0.0, 0.0, 0.0)
-        if force_nodes:
+        # A distributed surface load (apply_force_by_pattern's surface_load)
+        # is applied node by node by the caller's step (_cload_lines), not
+        # through a rigid tie: tying the loaded surface would make it rigid.
+        if force_nodes and getattr(self, "rigid_load", True):
             total_force = (
                 sum(n.forces[0] for n in force_nodes),
                 sum(n.forces[1] for n in force_nodes),
@@ -248,8 +370,27 @@ class Mesh:
 
         return lines, pilot_id, total_force
 
+    def _cload_lines(self, pilot_id, total_force):
+        """*CLOAD lines for a *STATIC step: the resultant on the rigid tie's
+        pilot node, or -- for a distributed surface load (rigid_load False)
+        -- each loaded node's own force."""
+        lines = []
+        if pilot_id is not None:
+            lines.append("*CLOAD")
+            for dof, val in zip((1, 2, 3), total_force):
+                if val != 0.0:
+                    lines.append(f"{pilot_id}, {dof}, {val!r}")
+        elif not getattr(self, "rigid_load", True):
+            lines.append("*CLOAD")
+            for n in self.all_nodes():
+                for dof, val in zip((1, 2, 3), n.forces):
+                    if val != 0.0:
+                        lines.append(f"{n.id}, {dof}, {val!r}")
+        return lines
+
     def solve_ccx(self, young: float, poisson: float, ccx_path: str = "ccx",
-                  nproc: int = 1, work_dir: str = None, keep_files: bool = False):
+                  nproc: int = 1, work_dir: str = None, keep_files: bool = False,
+                  element_type: str = "C3D8I"):
         """Linear static solve via CalculiX (ccx), as a free/open-source
         alternative to solve()'s MAPDL path. Writes an Abaqus-style .inp deck,
         runs ccx, and parses the .frd result file into the same node
@@ -282,14 +423,10 @@ class Mesh:
         job_name = "job"
         inp_path = os.path.join(work_dir, f"{job_name}.inp")
 
-        lines, pilot_id, total_force = self._ccx_base_deck(young, poisson)
+        lines, pilot_id, total_force = self._ccx_base_deck(young, poisson, element_type=element_type)
 
         lines += ["*STEP", "*STATIC"]
-        if pilot_id is not None:
-            lines.append("*CLOAD")
-            for dof, val in zip((1, 2, 3), total_force):
-                if val != 0.0:
-                    lines.append(f"{pilot_id}, {dof}, {val!r}")
+        lines += self._cload_lines(pilot_id, total_force)
         lines += ["*NODE FILE", "U", "*EL FILE", "S", "*END STEP"]
 
         with open(inp_path, "w") as f:
@@ -400,11 +537,7 @@ class Mesh:
         ]
 
         lines += ["*STEP", "*STATIC"]
-        if pilot_id is not None:
-            lines.append("*CLOAD")
-            for dof, val in zip((1, 2, 3), total_force):
-                if val != 0.0:
-                    lines.append(f"{pilot_id}, {dof}, {val!r}")
+        lines += self._cload_lines(pilot_id, total_force)
         lines += ["*NODE FILE", "U", "*EL FILE", "S", "*END STEP"]
 
         # ccx's KS operates on stress normalized by sigma_ref, and rejects
@@ -640,7 +773,121 @@ class Mesh:
         was built from, the midside nodes being the rest."""
         return {n.id for e in self.elements.values() for n in e.nodes[:8]}
 
+    # corner-node faces of an 8-node hex, in the element's node order
+    _HEX_FACES = ((0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4),
+                  (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7))
+
+    def _apply_surface_traction(self, spec):
+        """Uniform traction over the free INNER surface of a region.
+
+        spec = {"box": ((x0, x1), (y0, y1), (z0, z1)), "total": (Fx, Fy, Fz)}.
+        The region is every element whose centroid lies in the box (e.g. one
+        tile); its loaded surface is each element face that is free (belongs
+        to no other element) and does not lie on the part's bounding-box
+        planes -- for a hollow-cube tile, the void's inner walls. The total
+        is spread by area (force per unit area constant), each face passing
+        a quarter of its share to each of its 4 corner nodes, which is the
+        exact consistent load of a uniform traction on a bilinear face.
+        The loaded nodes are NOT tied together (rigid_load = False)."""
+        import numpy as np
+        if self.hex_order() != 8:
+            raise NotImplementedError("surface_load: 8-node hexes only")
+        (x0, x1), (y0, y1), (z0, z1) = spec["box"]
+        total = np.asarray(spec["total"], dtype=float)
+        tol = 1e-6
+        allx = np.array([n.coords for n in self.all_nodes()])
+        lo, hi = allx.min(axis=0), allx.max(axis=0)
+        counts, owner = {}, {}
+        for e in self.all_elements():
+            ids = [n.id for n in e.nodes][:8]
+            c = np.mean([n.coords for n in e.nodes][:8], axis=0)
+            inside = x0 <= c[0] <= x1 and y0 <= c[1] <= y1 and z0 <= c[2] <= z1
+            for f in self._HEX_FACES:
+                key = tuple(sorted(ids[i] for i in f))
+                counts[key] = counts.get(key, 0) + 1
+                if inside:
+                    owner[key] = [ids[i] for i in f]
+        faces, areas = [], []
+        for key, ordered in owner.items():
+            if counts[key] != 1:
+                continue
+            P = np.array([self.nodes[i].coords for i in ordered])
+            on_box = any(np.all(np.abs(P[:, a] - lo[a]) < tol) or np.all(np.abs(P[:, a] - hi[a]) < tol)
+                         for a in range(3))
+            if on_box:
+                continue
+            area = 0.5 * (np.linalg.norm(np.cross(P[1] - P[0], P[2] - P[0]))
+                          + np.linalg.norm(np.cross(P[2] - P[0], P[3] - P[0])))
+            faces.append(ordered)
+            areas.append(area)
+        if not faces:
+            raise ValueError(f"surface_load: no free inner face in box {spec['box']}")
+        A = float(np.sum(areas))
+        for ordered, a in zip(faces, areas):
+            share = total * (a / A) / 4.0
+            for nid in ordered:
+                f = self.nodes[nid].forces
+                self.nodes[nid].forces = [f[j] + share[j] for j in range(3)]
+        self.rigid_load = False
+        self.surface_load_area = A
+
+    def _apply_node_load(self, spec):
+        """Distribute a total force over every node of a region, weighted by
+        distance from a centre point.
+
+        spec = {"box": ((x0, x1), (y0, y1), (z0, z1)), "total": (Fx, Fy, Fz),
+                "center": (cx, cy, cz), "axes": (1, 2)}.
+        The region's nodes are all nodes of the elements whose centroid lies
+        in the box (interior and faces). Each node gets the weight
+        w = 1 - r / r_max, r = its distance from `center` measured over
+        `axes` only (default y and z, the part's plane), r_max = the
+        farthest such node: largest at the centre, linearly down to zero at
+        the farthest node. Per node, not per volume, so it follows the
+        mesh's node density. No rigid tie (rigid_load = False)."""
+        import numpy as np
+        (x0, x1), (y0, y1), (z0, z1) = spec["box"]
+        total = np.asarray(spec["total"], dtype=float)
+        axes = list(spec.get("axes", (1, 2)))
+        ids = set()
+        for e in self.all_elements():
+            c = np.mean([n.coords for n in e.nodes], axis=0)
+            if x0 <= c[0] <= x1 and y0 <= c[1] <= y1 and z0 <= c[2] <= z1:
+                ids.update(n.id for n in e.nodes)
+        if not ids:
+            raise ValueError(f"node_load: no element in box {spec['box']}")
+        ids = sorted(ids)
+        P = np.array([self.nodes[i].coords for i in ids])
+        d = P[:, axes] - np.asarray(spec["center"], dtype=float)[axes]
+        if spec.get("weight") == "pyramid":
+            # 1 - max_i |d_i| / half_i: zero on the whole region boundary,
+            # not just at its farthest node (FEA_LOAD_WEIGHT=pyramid)
+            w = np.clip(1.0 - np.max(np.abs(d) / np.asarray(spec["half"], dtype=float), axis=1), 0.0, None)
+        else:
+            r = np.linalg.norm(d, axis=1)
+            w = 1.0 - r / r.max()
+        w /= w.sum()
+        for nid, wi in zip(ids, w):
+            f = self.nodes[nid].forces
+            self.nodes[nid].forces = [f[j] + wi * total[j] for j in range(3)]
+        self.rigid_load = False
+        self.node_load_count = len(ids)
+
     def apply_force_by_pattern(self, force_pattern: Callable[[Node, float], List]):
+        # A geometry's force_pattern may instead carry a distributed surface
+        # load (FEA_LOAD_MODE=void_traction on hollow_cube_11x11): see
+        # _apply_surface_traction. The resultant is then exact by construction.
+        surface = getattr(force_pattern, "surface_load", None)
+        if surface is not None:
+            self.clear_forces()
+            self._apply_surface_traction(surface)
+            return
+        # ...or a load spread over a region's nodes by distance from its
+        # centre (FEA_LOAD_MODE=tile_nodes on cross4): see _apply_node_load.
+        node_load = getattr(force_pattern, "node_load", None)
+        if node_load is not None:
+            self.clear_forces()
+            self._apply_node_load(node_load)
+            return
         for node in self.all_nodes():
             force = force_pattern(node, self.tolerance)
             self.apply_force_on_node(node.id, force)
@@ -664,6 +911,21 @@ class Mesh:
                 want = sum(n.forces[j] for n in self.all_nodes() if n.id in corners)
                 if have and want:
                     k = want / have
+                    for n in self.all_nodes():
+                        n.forces[j] *= k
+
+        # Opt-in exact resultant: a force_pattern carrying a `resultant`
+        # attribute (Fx, Fy, Fz) is rescaled to it, so the total no longer
+        # depends on the node count the pattern assumes for the loaded face
+        # (cross4's padded load face is three boxes, not one n x n patch).
+        target = getattr(force_pattern, "resultant", None)
+        if target is not None:
+            for j in range(3):
+                have = sum(n.forces[j] for n in self.all_nodes())
+                if target[j] and not have:
+                    raise ValueError("force_pattern.resultant set but no node was loaded")
+                if have:
+                    k = target[j] / have
                     for n in self.all_nodes():
                         n.forces[j] *= k
 
@@ -793,12 +1055,14 @@ class Mesh:
 
     def plot_stress_heatmap(self, node_stress: dict, save_path=None, resolution=(3840, 2160),
                              aa_type="msaa", banner: str = None, cmap="jet",
-                             clim=None, title="Von Mises Stress (MPa)"):
+                             clim=None, title="Von Mises Stress (MPa)", marks=None):
         """Render the mesh colored by per-node stress, matching Ansys's nodal
         equivalent-stress plot style (same camera as plot_mesh).
 
         node_stress: dict mapping mesh node id -> scalar stress value.
         Missing node ids default to 0.0.
+        marks: optional list of (node_id, label, colour) drawn as labelled
+        dots on top of the mesh (always visible), e.g. the max-stress node.
         """
         import numpy as np
         import pyvista as pv
@@ -823,7 +1087,8 @@ class Mesh:
         grid = pv.UnstructuredGrid(np.array(cells), np.array(cell_types), points)
         grid.point_data[title] = scalars
 
-        grid.rotate_z(270, point=grid.center, inplace=True)
+        centre = grid.center
+        grid.rotate_z(270, point=centre, inplace=True)
 
         off_screen = save_path is not None
         plotter = pv.Plotter(off_screen=off_screen, window_size=resolution)
@@ -837,6 +1102,23 @@ class Mesh:
             clim=clim,
             scalar_bar_args={"title": title, "vertical": True},
         )
+
+        # marks: a sphere on BOTH depth faces (the node may sit mid-depth,
+        # hidden inside the material; one face is the one the camera sees)
+        # and its label lifted a little so it does not cover the sphere
+        x_lo, x_hi = float(points[:, 0].min()), float(points[:, 0].max())
+        span = float(np.ptp(points[:, 1:], axis=0).max()) or 1.0
+        for nid, label, colour in (marks or []):
+            x, y, z = self.nodes[nid].coords
+            for xf in (x_lo - 0.02 * span, x_hi + 0.02 * span):
+                sph = pv.Sphere(radius=0.012 * span, center=(xf, y, z))
+                sph.rotate_z(270, point=centre, inplace=True)
+                plotter.add_mesh(sph, color=colour)
+            lab = pv.PolyData(np.array([[x_hi + 0.02 * span, y + 0.04 * span, z]], dtype=float))
+            lab.rotate_z(270, point=centre, inplace=True)
+            plotter.add_point_labels(lab, [label], show_points=False, always_visible=True,
+                                     font_size=40, text_color=colour, shape_color="white",
+                                     shape_opacity=0.8, margin=6)
 
         if banner is not None:
             plotter.add_text(banner, position="upper_left", font_size=20, color="black")

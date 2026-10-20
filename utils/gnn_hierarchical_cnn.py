@@ -81,8 +81,14 @@ class HierarchicalGNNCNN(nn.Module):
                  use_checkpoint=False, checkpoint_fine_only=False,
                  num_pos_nodes=0, dropout=0.0, node_target_mean=0.0, node_target_std=1.0,
                  stress_ks_rho_mpa=0.15, coarse_dim=None, cnn_depth=3,
-                 predict_node_grad=False):
+                 predict_node_grad=False, node_out_dim=1):
         super().__init__()
+        # node_out_dim: per-node outputs. 1 = von Mises stress, pooled to the
+        # graph KS by ks_pool (every checkpoint before 2026-10-13). >1 (the
+        # multi-load surrogate: displacement 3 + stress tensor 6) returns the
+        # raw per-node prediction and graph_pred=None -- the caller derives
+        # von Mises / KS from the predicted tensor.
+        self.node_out_dim = int(node_out_dim)
         # num_layers is accepted (unused) for constructor-signature parity with
         # HierarchicalGNN/HierarchicalGNNMP -- checkpoint reconstruction always
         # passes it regardless of coarse_arch. U-Net depth is its own knob
@@ -103,7 +109,7 @@ class HierarchicalGNNCNN(nn.Module):
             nn.init.normal_(self.node_emb.weight, std=0.02)
 
         self.encoder = MLP([node_in_dim, hidden_dim, hidden_dim], norm=None, dropout=dropout)
-        self.head = MLP([hidden_dim, hidden_dim, 1], norm=None, dropout=dropout)
+        self.head = MLP([hidden_dim, hidden_dim, self.node_out_dim], norm=None, dropout=dropout)
         # Per-node dKS/dX head. Predicts the ADJOINT NODAL gradient field
         # (3 components/node) off the same final hidden state the stress
         # head reads, so it costs one small MLP and no second forward.
@@ -210,7 +216,7 @@ class HierarchicalGNNCNN(nn.Module):
 
     def forward(self, x, edge_index, edge_attr, batch,
                 tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
-                num_graphs=None, node_id=None, return_node_grad=False):
+                num_graphs=None, node_id=None, return_node_grad=False, ks_mask=None):
         N = x.size(0)
         if num_graphs is None:
             num_graphs = int(batch.max().item()) + 1 if N > 0 else 0
@@ -296,8 +302,12 @@ class HierarchicalGNNCNN(nn.Module):
             h = h_aug[:N]
 
         node_pred = self.head(h)
-        graph_pred = ks_pool(node_pred, batch, num_graphs, self.node_target_mean,
-                              self.node_target_std, self.stress_ks_rho_mpa)
+        if self.node_out_dim != 1:
+            graph_pred = None
+        else:
+            graph_pred = ks_pool(node_pred, batch, num_graphs, self.node_target_mean,
+                                  self.node_target_std, self.stress_ks_rho_mpa,
+                                  ks_mask=ks_mask)
         if return_node_grad:
             assert self.grad_head is not None, (
                 "return_node_grad=True but the model was built with "

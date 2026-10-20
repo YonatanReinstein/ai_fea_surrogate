@@ -37,16 +37,44 @@ def screenshot(geometry: str, dims: dict, save_path: str, banner: str = None,
     if heatmap:
         component.ccx_sim(ccx_path=ccx_path, nproc=nproc)
         node_stress_mpa = {nid: node.stress / 1e6 for nid, node in component.mesh.nodes.items()}
+        marks, banner = _max_stress_marks(component, model_dir, node_stress_mpa, banner)
         component.mesh.plot_stress_heatmap(
             node_stress_mpa, save_path=save_path, banner=banner,
             resolution=resolution, aa_type="ssaa",
-            clim=(0.0, material_properties["yield_strength"]),
+            clim=(0.0, material_properties["yield_strength"]), marks=marks,
         )
     else:
         component.mesh.plot_mesh(save_path=save_path, banner=banner, resolution=resolution)
 
 
 import numpy as np
+
+def _max_stress_marks(component, model_dir, node_stress_mpa, banner):
+    """Marks for the max-stress node among the nodes KS counts (magenta) and,
+    if higher, the max in the KS-excluded region (grey; TOPOPT_KS_EXCLUDE,
+    e.g. the pads), with the values appended to the banner."""
+    from evaluators.ccx_evaluator import _ks_excluded_node_ids
+    mesh = component.mesh
+    try:
+        excl = _ks_excluded_node_ids(
+            model_dir, {e.id: [n.id for n in e.nodes] for e in mesh.all_elements()},
+            component.elem_to_tile, {n.id: n.coords for n in mesh.all_nodes()})
+    except Exception as e:
+        print(f"[screenshot] KS exclusion unavailable ({e}); marking the global max", flush=True)
+        excl = set()
+    counted = [nid for nid in node_stress_mpa if nid not in excl]
+    nid = max(counted, key=node_stress_mpa.get)
+    x, y, z = mesh.nodes[nid].coords
+    v = node_stress_mpa[nid]
+    marks = [(nid, f"max {v:.1f} MPa", "magenta")]
+    text = f"max stress {v:.1f} MPa at (y {y:.2f}, z {z:.2f}), tile ({int(z)},{int(y)})"
+    if excl:
+        nx = max(excl, key=lambda k: node_stress_mpa.get(k, 0.0))
+        if node_stress_mpa.get(nx, 0.0) > v:
+            marks.append((nx, f"excluded {node_stress_mpa[nx]:.1f}", "grey"))
+            text += f" | excluded region max {node_stress_mpa[nx]:.1f} MPa"
+    return marks, (f"{banner}\n{text}" if banner else text)
+
 
 def vector_to_dict(vec, dim_names):
     """Convert vector → {dim_name: value}"""
