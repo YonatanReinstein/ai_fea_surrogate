@@ -81,6 +81,14 @@ RUN=onpolicy/${RUN_NAME:-dense_$SLURM_JOB_ID}
 SPOOL=$RUN/spool; LABELS=$RUN/labels; LIVE=$RUN/live
 ART=optimization/artifacts_${RUN_NAME:-dense_$SLURM_JOB_ID}
 mkdir -p "$SPOOL" "$LABELS" "$LIVE" "$ART" optimization/screenshots
+# LAB_THREADS: torch threads per labeller for the adjoint backward (PARDISO
+# stays sequential). Measured on hollow_cube, one design: 1 -> 21.3 s/label,
+# 2 -> 16.7 s, 4 -> 14.9 s, 8 -> 13.2 s, results identical to 3e-11. torch
+# reads MKL_NUM_THREADS as well as OMP_NUM_THREADS, so both are set.
+LAB_THREADS=${LAB_THREADS:-2}
+# UPDATE_EVERY: labels per trainer update (default LABEL_SAMPLES = one update per
+# generation). 2*LABEL_SAMPLES trains once per two generations at the same
+# --steps, i.e. half the training per generation.
 NLAB=${NLAB:-10}   # labellers; each uses ~4 threads (2 workers x 2 mesh threads). Override cpus with `sbatch -c <4*NLAB+8>`.
 BASE=${BASE_CKPT:-data/hollow_cube/checkpoints_sobolev_lowlr/epoch_008.pt}
 # RESUME=1: continue a run in place. Everything a stop/continue needs is on disk:
@@ -117,11 +125,12 @@ if [ "${RESUME:-0}" = "1" ]; then
   echo "[job] RESUME from $BASE, topopt checkpoint: $(ls -la "$ART/topopt_checkpoint.pkl" 2>/dev/null | awk '{print $6,$7,$8}')"
 fi
 export IRIT_TMP=/tmp/irit_$SLURM_JOB_ID TMPDIR=/tmp; mkdir -p "$IRIT_TMP"
-echo "[job] replay_frac=${REPLAY_FRAC:-0.8} ks_w=${KS_W:-0.25} base=$BASE lag=${LABEL_LAG:-8} samples=${LABEL_SAMPLES:-10} move_limit=${MOVE_LIMIT:-0.05} rho=${RHO:-0.15} stress_gate_abs=${STRESS_GATE_ABS:-0.03} dg_calib=${DG_CALIB:-0} filter_target=${FILTER_TARGET:-gradient} filter_end=${FILTER_END:-const} filter_decay=${FILTER_DECAY:-0} filter_decay_start=${FILTER_DECAY_START:-0} proj_eta=${PROJ_ETA:-off} proj_beta=${PROJ_BETA:-32} proj_gens=${PROJ_START:-100}-${PROJ_END:-300} proj_wmax=${PROJ_WMAX:-1.0} sharpen_mode=${SHARPEN_MODE:-gate} unsharp_r=${UNSHARP_R:-design} skel_tau=${SKEL_TAU:-0.03}->${SKEL_TAU_END:-const} steps=${TRAIN_STEPS:-100} batch=${TRAIN_BATCH:-4} traj_buf=${TRAJ_BUFFER:-0} val_every=${VAL_EVERY:-0} node_emb_lr=${NODE_EMB_LR_SCALE:-1} anchor=${ANCHOR_L2:-0} jitter=${LABEL_JITTER:-0.05}/dir${LABEL_JITTER_DIR:-0} nlab=${NLAB:-10} shot_every=${SHOT_EVERY:-10}"
+echo "[job] replay_frac=${REPLAY_FRAC:-0.8} ks_w=${KS_W:-0.25} base=$BASE lag=${LABEL_LAG:-8} samples=${LABEL_SAMPLES:-10} move_limit=${MOVE_LIMIT:-0.05} rho=${RHO:-0.15} stress_gate_abs=${STRESS_GATE_ABS:-0.03} dg_calib=${DG_CALIB:-0} filter_target=${FILTER_TARGET:-gradient} filter_end=${FILTER_END:-const} filter_decay=${FILTER_DECAY:-0} filter_decay_start=${FILTER_DECAY_START:-0} proj_eta=${PROJ_ETA:-off} proj_beta=${PROJ_BETA:-32} proj_gens=${PROJ_START:-100}-${PROJ_END:-300} proj_wmax=${PROJ_WMAX:-1.0} sharpen_mode=${SHARPEN_MODE:-gate} unsharp_r=${UNSHARP_R:-design} skel_tau=${SKEL_TAU:-0.03}->${SKEL_TAU_END:-const} steps=${TRAIN_STEPS:-100} batch=${TRAIN_BATCH:-4} traj_buf=${TRAJ_BUFFER:-0} val_every=${VAL_EVERY:-0} node_emb_lr=${NODE_EMB_LR_SCALE:-1} anchor=${ANCHOR_L2:-0} jitter=${LABEL_JITTER:-0.05}/dir${LABEL_JITTER_DIR:-0} nlab=${NLAB:-10} lab_threads=${LAB_THREADS:-2} train_gpus=${TRAIN_GPUS:-1} update_every=${UPDATE_EVERY:-${LABEL_SAMPLES:-10}} trainer_poll=${TRAINER_POLL:-1} shot_every=${SHOT_EVERY:-10}"
 
 echo "[job] $NLAB labellers on $SLURM_CPUS_PER_TASK cpus ($(hostname)), spool=$SPOOL"
 PIDS=()
 for i in $(seq 1 $NLAB); do
+  OMP_NUM_THREADS=$LAB_THREADS MKL_NUM_THREADS=$LAB_THREADS \
   python -u -m training.trajectory_labeller --geometry "$GEOM" --spool "$SPOOL" --labels "$LABELS" \
       --workers 2 --nproc 1 --mesh_threads 2 --claim_order fifo --max_lag 0 --idle_exit 1800 \
       --stress_ks_rho_mpa "${RHO:-0.15}" >> "$RUN/labeller_$i.log" 2>&1 &
@@ -131,16 +140,26 @@ sleep 3
 # TRAIN_GPUS=N trains data-parallel over N GPUs (submit with --gres=gpu:N): each
 # update's batches are split across them, ~N x faster on the trainer, which is
 # the pipeline's bottleneck once labels are fast. The optimiser stays on GPU 0.
+# With MORE GPUs than TRAIN_GPUS (e.g. --gres=gpu:3, TRAIN_GPUS=2) the optimiser
+# gets the first spare GPU to itself. Sharing GPU 0 with trainer rank 0 slowed
+# its surrogate evaluation from ~3.6 s to 4.4-6 s per generation (job 1433768).
+IFS=, read -ra _GPUS <<< "${CUDA_VISIBLE_DEVICES:-}"
+TRAINER_GPUS_ENV=""; OPT_GPUS_ENV=""
+if [ "${#_GPUS[@]}" -gt "${TRAIN_GPUS:-1}" ]; then
+  TRAINER_GPUS_ENV=$(IFS=,; echo "${_GPUS[*]:0:${TRAIN_GPUS:-1}}")
+  OPT_GPUS_ENV=${_GPUS[${TRAIN_GPUS:-1}]}
+  echo "[job] GPUs: trainer on $TRAINER_GPUS_ENV, optimiser on $OPT_GPUS_ENV"
+fi
 if [ "${TRAIN_GPUS:-1}" -gt 1 ]; then
   TRAINER_LAUNCH="torchrun --standalone --nproc_per_node ${TRAIN_GPUS} -m training.online_finetune"
 else
   TRAINER_LAUNCH="python -u -m training.online_finetune"
 fi
-$TRAINER_LAUNCH --geometry "$GEOM" --replay_dataset data/$GEOM/${REPLAY:-replay_screened}/dataset.pt --holdout_dataset data/$GEOM/${HOLDOUT:-audit_screened}/dataset.pt --labels "$LABELS" --base_ckpt "$BASE" \
-    --live_ckpt "$LIVE_CKPT" --lr 2e-4 --update_every "${LABEL_SAMPLES:-10}" --steps "${TRAIN_STEPS:-100}" --batch_size "${TRAIN_BATCH:-4}" ${FREEZE:+--freeze "$FREEZE"} ${TRAJ_BUFFER:+--traj_buffer $TRAJ_BUFFER} ${VAL_EVERY:+--val_every $VAL_EVERY} ${VAL_GATE:+--val_gate} ${NODE_EMB_LR_SCALE:+--node_emb_lr_scale $NODE_EMB_LR_SCALE} ${ANCHOR_L2:+--anchor_l2 $ANCHOR_L2} ${ANCHOR_ALL:+--anchor_all} \
+CUDA_VISIBLE_DEVICES=${TRAINER_GPUS_ENV:-$CUDA_VISIBLE_DEVICES} $TRAINER_LAUNCH --geometry "$GEOM" --replay_dataset data/$GEOM/${REPLAY:-replay_screened}/dataset.pt --holdout_dataset data/$GEOM/${HOLDOUT:-audit_screened}/dataset.pt --labels "$LABELS" --base_ckpt "$BASE" \
+    --live_ckpt "$LIVE_CKPT" --lr 2e-4 --update_every "${UPDATE_EVERY:-${LABEL_SAMPLES:-10}}" --steps "${TRAIN_STEPS:-100}" --batch_size "${TRAIN_BATCH:-4}" ${FREEZE:+--freeze "$FREEZE"} ${TRAJ_BUFFER:+--traj_buffer $TRAJ_BUFFER} ${VAL_EVERY:+--val_every $VAL_EVERY} ${VAL_GATE:+--val_gate} ${NODE_EMB_LR_SCALE:+--node_emb_lr_scale $NODE_EMB_LR_SCALE} ${ANCHOR_L2:+--anchor_l2 $ANCHOR_L2} ${ANCHOR_ALL:+--anchor_all} \
     --replay_frac "${REPLAY_FRAC:-0.8}" --holdout_n 24 --max_stress_drift 0.01 \
     --graph_loss_weight "${KS_W:-0.25}" --grad_loss_weight 0.25 --grad_sign_loss_weight 0.25 \
-    --grad_weight_power 0.15 --grad_rel_sat 2.0 --grad_sign_delta 0.05 --max_stress_abs "${STRESS_GATE_ABS:-0.03}" --idle_exit 3600 $TRAINER_EXTRA >> "$RUN/trainer.log" 2>&1 &
+    --grad_weight_power 0.15 --grad_rel_sat 2.0 --grad_sign_delta 0.05 --max_stress_abs "${STRESS_GATE_ABS:-0.03}" --idle_exit 3600 --poll "${TRAINER_POLL:-1}" $TRAINER_EXTRA >> "$RUN/trainer.log" 2>&1 &
 PIDS+=($!)
 sleep 5
 echo "[job] trainer + labellers up, starting topopt"
@@ -159,7 +178,7 @@ export TOPOPT_CCX_REF=1
 export TOPOPT_DG_CALIB="${DG_CALIB:-0}"   # 1 = scale dg_raw by smoothed |ccx|/|surrogate| from the reference solves
 export STRESS_KS_RHO_MPA="${RHO:-0.15}"
 
-python -u -m optimization.optimize_dims --geometry "$GEOM" --arch gnn --optimizer topopt \
+CUDA_VISIBLE_DEVICES=${OPT_GPUS_ENV:-$CUDA_VISIBLE_DEVICES} python -u -m optimization.optimize_dims --geometry "$GEOM" --arch gnn --optimizer topopt \
     --gnn_ckpt_path "$BASE" \
     --generations "${GENS:-300}" ${STOP_AT:+--stop_at_gen $STOP_AT} --screenshot_every "${SHOT_EVERY:-10}" --processes 6 --batch_size 4 \
     --filter_radius 2 --filter_target "${FILTER_TARGET:-gradient}" ${FILTER_END:+--filter_radius_end $FILTER_END --filter_decay_gens ${FILTER_DECAY:-150}} ${FILTER_DECAY_START:+--filter_decay_start $FILTER_DECAY_START} \

@@ -6,7 +6,7 @@ import json
 
 def screenshot(geometry: str, dims: dict, save_path: str, banner: str = None,
                heatmap: bool = False, ccx_path: str = "ccx", nproc: int = 1,
-               resolution=(5120, 2880)):
+               resolution=(5120, 2880), stress_fn=None):
     """Render a design to save_path.
 
     heatmap=False (default): plain gray wireframe mesh (component geometry
@@ -35,8 +35,16 @@ def screenshot(geometry: str, dims: dict, save_path: str, banner: str = None,
     component.mesh.apply_force_by_pattern(force_pattern)
 
     if heatmap:
-        component.ccx_sim(ccx_path=ccx_path, nproc=nproc)
-        node_stress_mpa = {nid: node.stress / 1e6 for nid, node in component.mesh.nodes.items()}
+        if stress_fn is not None:
+            # stress_fn(dims, node_ids, coords) -> nodal von Mises MPa (e.g. a
+            # surrogate's prediction): colours the mesh without a ccx solve
+            ids = list(component.mesh.nodes)
+            X = np.array([component.mesh.nodes[i].coords for i in ids], dtype=np.float64)
+            vm = stress_fn(dims, ids, X)
+            node_stress_mpa = {nid: float(v) for nid, v in zip(ids, vm)}
+        else:
+            component.ccx_sim(ccx_path=ccx_path, nproc=nproc)
+            node_stress_mpa = {nid: node.stress / 1e6 for nid, node in component.mesh.nodes.items()}
         marks, banner = _max_stress_marks(component, model_dir, node_stress_mpa, banner)
         component.mesh.plot_stress_heatmap(
             node_stress_mpa, save_path=save_path, banner=banner,

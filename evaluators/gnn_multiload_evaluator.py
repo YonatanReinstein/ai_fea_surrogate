@@ -8,8 +8,7 @@ total FEA_LOAD_N (the model was trained at the dataset's load_N; stress is
 scaled linearly, which is exact for linear elasticity).
 
 Value: von Mises from the predicted tensor -> KS (rho, nodes of the loaded
-tile excluded, as in the training filter); STRESS_KS_NORMALIZE=max/smooth
-scale value and gradient by c ~ peak/KS exactly as the ccx evaluator does.
+tile excluded, as in the training filter), the constraint as in the ccx evaluator.
 
 Gradient: everything that depends on the design is rebuilt inside autograd --
 node coordinates X, edge vectors/lengths, the per-node load weights (they
@@ -189,20 +188,7 @@ class GNNMultiLoadEvaluator(BaseEvaluator):
         gX = X.grad.detach().cpu().double().numpy()
         gt = t.grad.detach().cpu().double().numpy()
         ks_mpa = float(ks) / 1e6
-        # STRESS_KS_NORMALIZE as in CCXEvaluator: "max" reports the peak and
-        # scales the KS gradient by c = peak/KS; "smooth" lets c follow
-        # peak/KS at STRESS_KS_C_RATE per call and reports c * KS.
-        scale = 1.0
-        mode = os.environ.get("STRESS_KS_NORMALIZE")
-        if mode == "max":
-            scale = float(m) / float(ks)
-        elif mode == "smooth":
-            ratio = float(m) / float(ks)
-            c_prev = getattr(self, "_ks_c", None)
-            rate = float(os.environ.get("STRESS_KS_C_RATE", "0.2"))
-            self._ks_c = ratio if c_prev is None else c_prev + rate * (ratio - c_prev)
-            scale = self._ks_c
-        value_mpa = scale * ks_mpa
+        # the constraint is the raw KS, as in CCXEvaluator; the peak is only logged
         # volume = sum of hex Gauss-point detJ (unit weights), same mesh
         Xv = torch.tensor(Xnp, dtype=torch.float64, requires_grad=True)
         conn = torch.as_tensor(self.static.elements)
@@ -217,14 +203,14 @@ class GNNMultiLoadEvaluator(BaseEvaluator):
             d = D_tile.get(k, {})
             geo_g = sum(float(gX[row[n]] @ np.asarray(v)) for n, v in d.items())
             geo_v = sum(float(gV[row[n]] @ np.asarray(v)) for n, v in d.items())
-            dG[k] = scale * (geo_g + gt[i]) / 1e6 / yld
+            dG[k] = (geo_g + gt[i]) / 1e6 / yld
             dV[k] = geo_v
-        print(f"[GNNMultiLoad] KS {ks_mpa:.2f} MPa, peak {float(m) / 1e6:.2f} MPa, c {scale:.4f} -> "
-              f"constraint {value_mpa:.2f} MPa, volume {float(vol):.3f}", flush=True)
+        print(f"[GNNMultiLoad] KS {ks_mpa:.2f} MPa, peak {float(m) / 1e6:.2f} MPa, volume {float(vol):.3f}",
+              flush=True)
         self._calls += 1
         if self.ccx_every and (self._calls - 1) % self.ccx_every == 0:
             self._ccx_check(dims, float(m) / 1e6, dG)
-        return float(vol), value_mpa, yld, dV, dG
+        return float(vol), ks_mpa, yld, dV, dG
 
     def _ccx_solve(self, dims):
         """Exact ccx adjoint at dims -> (true peak MPa, dG dict, same units as
@@ -237,15 +223,8 @@ class GNNMultiLoadEvaluator(BaseEvaluator):
             from .ccx_evaluator import CCXEvaluator
             self._ccx = CCXEvaluator(self.geometry, max_workers=4, mesh_threads=8,
                                      stress_ks_rho_mpa=self.rho * 1e6, gradient_source="adjoint")
-        prev = os.environ.get("STRESS_KS_NORMALIZE")
-        os.environ["STRESS_KS_NORMALIZE"] = "max"            # ccx then returns its true peak
-        try:
-            _, peak_ccx, _, _, g = self._ccx.compute_topopt_gradient(dict(zip(self.dims_keys, key)))
-        finally:
-            if prev is None:
-                os.environ.pop("STRESS_KS_NORMALIZE", None)
-            else:
-                os.environ["STRESS_KS_NORMALIZE"] = prev
+        _, _, _, _, g = self._ccx.compute_topopt_gradient(dict(zip(self.dims_keys, key)))
+        peak_ccx = self._ccx.last_peak_mpa
         self._ccx_last = (key, (peak_ccx, g))
         return peak_ccx, g
 

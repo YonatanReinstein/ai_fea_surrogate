@@ -54,6 +54,7 @@ def load_model(ckpt_path, geometry, device):
     )
     if hierarchical:
         model_kwargs["num_pos_nodes"] = ckpt.get("num_pos_nodes", 0)
+        model_kwargs["tile_in_dim"] = ckpt.get("tile_in_dim", 1)
         if coarse_arch == "transformer":
             model_kwargs["transformer_heads"] = ckpt["transformer_heads"]
             model_kwargs["transformer_ff_mult"] = ckpt["transformer_ff_mult"]
@@ -82,6 +83,10 @@ def load_model(ckpt_path, geometry, device):
 
     model.load_state_dict(ckpt["model_state"])
     model.eval()
+    # how the checkpoint expects its load (read by probe_dg_alignment)
+    model.tile_load_input = bool(ckpt.get("tile_load_input", False))
+    model.tile_load_scale_n = float(ckpt.get("tile_load_scale_n", 5e7))
+    model.ks_exclude = ckpt.get("ks_exclude")
     return model, (x_mean, x_std, edge_mean, edge_std, node_target_mean, node_target_std)
 
 

@@ -110,16 +110,16 @@ CALIB_DEV=${CALIB_DEV:-2.0}             # reject a calibration ratio outside [1/
 export STRESS_KS_RHO_MPA=$RHO
 
 # The radius-decay and sharpening flags only mean anything for
-# filter_target=design. With "none" (no smoothing at all, the control that shows
+# filter_target=design or density (density: x = H y, sharpening acts on y). With "none" (no smoothing at all, the control that shows
 # what the filter is actually buying) or "gradient" (the classic Sigmund
 # sensitivity filter the 250/279 reference used) they are omitted entirely, so
 # params.env and topopt_params.jsonl record "off" rather than values that were
 # parsed and ignored.
-if [ "$FILTER_TARGET" = "design" ]; then
+if [ "$FILTER_TARGET" = "design" ] || [ "$FILTER_TARGET" = "density" ]; then
     SCHED_FLAGS="--filter_radius_end $FILT_R_END --filter_decay_start $FILT_START --filter_decay_gens $FILT_GENS"
     SCHED_FLAGS="$SCHED_FLAGS --sharpen_mode $SHARPEN --proj_start_gen $SH_START --proj_end_gen $SH_END"
     SCHED_FLAGS="$SCHED_FLAGS --proj_w_max $SH_W --skel_tau $TAU --skel_tau_end $TAU_END"
-    SCHED_DESC="smoothing r $FILT_R -> $FILT_R_END over gens $FILT_START-$((FILT_START+FILT_GENS)); sharpening $SHARPEN w 0 -> $SH_W, tau $TAU -> $TAU_END over gens $SH_START-$SH_END"
+    SCHED_DESC="$FILTER_TARGET filter r $FILT_R -> $FILT_R_END over gens $FILT_START-$((FILT_START+FILT_GENS)); sharpening $SHARPEN w 0 -> $SH_W, tau $TAU -> $TAU_END over gens $SH_START-$SH_END"
 else
     SCHED_FLAGS=""
     SCHED_DESC="filter_target=$FILTER_TARGET -- no design smoothing schedule, no sharpening"
@@ -155,21 +155,23 @@ MIN_TRUST_FRAC=0.05
 UNTRUSTED_MOVE_FRAC=0.1
 TR_TOL=0.05
 TR_MIN_SCALE=0.02
-G_BACKOFF=0.02
+G_BACKOFF=${G_BACKOFF:-0.02}
 CALIB_EVERY=$CALIB
 CALIB_SMOOTH=0.5
 CALIB_MAX_DEV=$CALIB_DEV
 STAGNATION_GENS=0
 SHOT_EVERY=$SHOT_EVERY
 MESH_RES=default_3_3_3
-INIT_THICKNESS=default_0.30
+INIT_THICKNESS=${INIT_T:-default_0.30}
 PARAMS
 
 echo "[job] $RUN_NAME geom=$GEOM art=$ART node=$(hostname) cpus=$SLURM_CPUS_PER_TASK gens=$GENS rho=$RHO move=$MOVE"
 echo "[job] $SCHED_DESC"
 echo "[job] screenshot + gradient grid every $SHOT_EVERY gen(s) -> $ART/screenshots"
 
-python -u -m optimization.optimize_dims \
+# OPTIMIZE_MODULE=optimization.optimize_dims_legacy runs the pre-simplification
+# optimizer (commit 7bf07d9) for comparison.
+python -u -m ${OPTIMIZE_MODULE:-optimization.optimize_dims} \
     --geometry "$GEOM" --arch ccx --optimizer topopt --ccx_gradient adjoint \
     --generations "$GENS" --stress_ks_rho_mpa "$RHO" \
     --processes 2 --mesh_threads 16 --nproc 8 \
@@ -177,9 +179,9 @@ python -u -m optimization.optimize_dims \
     $SCHED_FLAGS \
     --move_limit "$MOVE" --oc_eta "$ETA" --fd_step 0.04 \
     --trust_rel_tol 0.5 --min_trust_frac 0.05 --untrusted_move_frac 0.1 \
-    --tr_tol 0.05 --tr_min_scale 0.02 --g_backoff 0.02 \
+    --tr_tol 0.05 --tr_min_scale 0.02 --g_backoff "${G_BACKOFF:-0.02}" \
     --calib_every "$CALIB" --calib_smooth 0.5 --calib_max_dev "$CALIB_DEV" --stagnation_gens 0 \
-    --screenshot_every "$SHOT_EVERY"
+    --screenshot_every "$SHOT_EVERY" ${INIT_T:+--init_thickness "$INIT_T"}
 
 echo "TOPOPT_DONE rc=$?"
 rm -rf "$IRIT_TMP"

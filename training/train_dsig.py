@@ -8,6 +8,11 @@ any load combination, and dKS/dt of the combination is one backward pass.
 
     python -m training.train_dsig --run_dir training/runs/cross4_dsig_sobolev_v1
 
+--arch load_linear: the model is exactly linear in the load by construction
+(utils/gnn_load_linear.py) -- one learned operator A(t) applied to each row's
+force vector, all rows of a design in one forward (--designs_per_step whole
+designs per step) -- instead of a per-row prediction conditioned on the row.
+
 Data: designs whose KS is <= --ks_max_mpa on EVERY row (a weak row would make
 that design's basis wrong in every combination); the filter runs before the
 train / validation split, which is by design.
@@ -30,6 +35,8 @@ control; single loads also report the directional dS relative error.
 Every epoch is saved as epoch_NNN.pt; best.pt = best combination median cosine.
 """
 import argparse
+import collections
+import copy
 import json
 import math
 import os
@@ -43,6 +50,15 @@ from training.dsig_data import (DsigStatic, DesignDataset, available_designs, de
                                 mirror_case, mirror_maps)
 from training.train_multiload import von_mises
 from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
+from utils.gnn_load_linear import LoadLinearGNNCNN
+
+
+def build_model(model_kwargs, **extra):
+    """Model from a checkpoint's model_kwargs; arch "load_linear" (stress exactly
+    linear in the load, utils/gnn_load_linear.py) or the per-row hierarchical CNN."""
+    kw = dict(model_kwargs)
+    cls = LoadLinearGNNCNN if kw.pop("arch", "hier") == "load_linear" else HierarchicalGNNCNN
+    return cls(**kw, **extra)
 
 
 class Batcher:
@@ -77,6 +93,8 @@ class Batcher:
 
     def forward(self, model, t, load_w, rows):
         """t (B,K) dims order, load_w (B,N) -> predicted stress (B,N,6) in MPa."""
+        if getattr(model, "load_linear", False):
+            return self.forward_rows(model, t, load_w[:, None])[:, 0]
         st, B, N, K = self.st, t.size(0), self.s.N, self.s.K
         tn = (t[:, self.perm] - st["t_mean"]) / st["t_std"]                      # (B,K) IRIT order
         x = torch.cat([self.ref.expand(B, N, 3), (load_w / st["lw_scale"])[..., None],
@@ -99,6 +117,24 @@ class Batcher:
                         tile_NX=self.s.NX, tile_NY=self.s.NY, tile_NZ=1, tile_x=tile_x,
                         num_graphs=B, node_id=g["node_id"])
         return pred.float().view(B, N, 6) * st["y_std"] + st["y_mean"]
+
+    def forward_rows(self, model, t, load_w):
+        """Load-linear model (utils/gnn_load_linear.py): t (B,K) dims order, load_w
+        (B,R,N) -> stress (B,R,N,6) in MPa, R load cases from ONE geometry forward
+        per design. The geometry stream sees no load; the force (-y, the dataset's
+        direction) enters only the linear stream, and the output is only scaled
+        (no y_mean shift), so the prediction is exactly linear in load_w."""
+        st, B, R, N, K = self.st, t.size(0), load_w.size(1), self.s.N, self.s.K
+        tn = (t[:, self.perm] - st["t_mean"]) / st["t_std"]                      # (B,K) IRIT order
+        x = torch.cat([self.ref.expand(B, N, 3), self.anch.expand(B, N, 1),
+                       tn[:, self.node_tile][..., None]], dim=2).reshape(B * N, 5)
+        lw = (load_w / st["lw_scale"]).permute(0, 2, 1).reshape(B * N, R)
+        f = torch.stack([torch.zeros_like(lw), -lw, torch.zeros_like(lw)], dim=2)   # (B*N,R,3)
+        g = self.topo(B)
+        pred = model(x, g["edge_index"], g["edge_attr"], g["batch"], f, tile_idx=g["tile_idx"],
+                     tile_NX=self.s.NX, tile_NY=self.s.NY, tile_NZ=1, tile_x=tn.reshape(B * K, 1),
+                     num_graphs=B, node_id=g["node_id"], t_node=t[:, self.perm][:, self.node_tile].reshape(B * N))
+        return pred.float().view(B, N, R, 6).permute(0, 2, 1, 3) * st["y_std"]
 
     def ks(self, S, rho):
         """KS (rho per MPa) of von Mises over non-pad nodes; S (...,N,6) MPa."""
@@ -151,9 +187,14 @@ def uniform_check(model, bt, uni, rho):
     tmir = (ix * NY + (NY - 1 - iy)).reshape(-1)
     model.eval()
     lw = torch.as_tensor(np.stack([s.load_weights(uni["coords"], r) for r in s.rows]), dtype=torch.float32, device=dev)
-    t = torch.full((C, K), float(uni["t"]), dtype=torch.float32, device=dev, requires_grad=True)
-    ks = bt.ks(bt.forward(model, t, lw, s.rows), rho)
-    g, = torch.autograd.grad(ks.sum(), t)
+    if getattr(model, "load_linear", False):        # one geometry forward, per-row grads from it
+        t = torch.full((1, K), float(uni["t"]), dtype=torch.float32, device=dev, requires_grad=True)
+        ks = bt.ks(bt.forward_rows(model, t, lw[None])[0], rho)
+        g = torch.stack([torch.autograd.grad(ks[c], t, retain_graph=True)[0][0] for c in range(C)])
+    else:
+        t = torch.full((C, K), float(uni["t"]), dtype=torch.float32, device=dev, requires_grad=True)
+        ks = bt.ks(bt.forward(model, t, lw, s.rows), rho)
+        g, = torch.autograd.grad(ks.sum(), t)
     model.train()
     g, ks = g.double().cpu().numpy(), ks.detach().cpu().numpy()
     cc = np.array([ccos_np(g[c], uni["dks"][c]) for c in range(C)])
@@ -171,6 +212,109 @@ def grad_metrics(p, t):
     wrong = torch.sign(p) != torch.sign(t)
     mass = (t.abs() * wrong).sum(1) / t.abs().sum(1).clamp_min(1e-30)
     return cos, mass, (~wrong).float().mean(1)
+
+
+TILE_CNN = ("down_blocks", "up_blocks", "bottleneck", "tile_input_encoder", "encode_conv", "decode_conv", "tile_emb")
+
+
+def grad_split(model, g_value):
+    """Pre-clip gradient norms by loss term and module group. g_value: the value
+    term's grads by parameter name; the parameters' .grad hold the Sobolev term's.
+    Groups: the geometry tile CNN (where the Sobolev gradient blew up in every
+    load_linear run), the rest of the geometry stream, and the load stream with
+    its gate heads (load_linear); for the per-row model everything outside the
+    tile CNN is "rest"."""
+    ll = getattr(model, "load_linear", False)
+
+    def group(n):
+        parts = n.split(".")
+        if (parts[1] if ll and parts[0] == "geo" else parts[0]) in TILE_CNN:
+            return "tile_cnn"
+        return ("geo_rest" if parts[0] == "geo" else "load_stream") if ll else "rest"
+
+    sq = {}
+    for n, p_ in model.named_parameters():
+        for term, g in (("value", g_value.get(n)), ("sob", p_.grad)):
+            if g is not None:
+                k = f"{term}:{group(n)}"
+                sq[k] = sq.get(k, 0.0) + float(g.float().pow(2).sum())
+    return {k: v ** 0.5 for k, v in sorted(sq.items())}
+
+
+class RollbackGuard:
+    """Every load_linear run trained to a good peak, then the Sobolev gradient
+    grew 10-1000x and the run never recovered: halving the lr only slowed the
+    slide. The pre-clip grad norm starts rising 1-2k steps before validation
+    collapses, so: keep a CPU snapshot of model + optimizer every `every` steps
+    (the last 3); once the mean grad norm over the last `window` steps exceeds k
+    x the median of the healthy history, restore the OLDEST snapshot (2-3k steps
+    back, before the rise began) and halve the lr. Steps with a grad norm above
+    2x the healthy median are kept out of that history, so a slow drift cannot
+    raise its own threshold."""
+
+    def __init__(self, k, every=1000, window=200, hist=2000, min_hist=1000):
+        self.k, self.every = k, every
+        self.recent = collections.deque(maxlen=window)
+        self.hist = collections.deque(maxlen=hist)
+        self.min_hist = min_hist
+        self.snaps = collections.deque(maxlen=3)
+        self.count = 0
+
+    def snapshot(self, step, model, opt):
+        cpu = lambda d: {k: (v.detach().cpu().clone() if torch.is_tensor(v) else copy.deepcopy(v)) for k, v in d.items()}
+        opt_sd = opt.state_dict()
+        self.snaps.append((step, cpu(model.state_dict()),
+                           {"state": {i: cpu(st) for i, st in opt_sd["state"].items()},
+                            "param_groups": copy.deepcopy(opt_sd["param_groups"])}))
+
+    def check(self, gnorm, step, active):
+        """True when a rollback is due."""
+        self.recent.append(gnorm)
+        if not active:
+            return False
+        base = float(np.median(self.hist)) if len(self.hist) >= self.min_hist else None
+        if base is None or gnorm < 2 * base:
+            self.hist.append(gnorm)
+        return (base is not None and len(self.recent) == self.recent.maxlen and self.snaps
+                and float(np.mean(self.recent)) > self.k * base)
+
+    def restore(self, model, opt):
+        step0, msd, osd = self.snaps[0]
+        model.load_state_dict(msd)
+        opt.load_state_dict(osd)
+        self.snaps = collections.deque([self.snaps[0]], maxlen=3)
+        self.recent.clear()
+        self.count += 1
+        return step0
+
+
+def case_clipped_backward(model, per_case, hist, k, active):
+    """Backward of per_case.mean() with each case's gradient smoothly capped:
+    g_b <- g_b / sqrt(1 + (|g_b| / c)^2), c = k x the median of the last
+    len(hist) per-case norms (uncapped while not `active`, i.e. during the lr
+    warmup, when the norms move too fast for a running median). The Sobolev
+    gradient is heavy-tailed across designs -- at the best load_linear checkpoint
+    the top 1% of designs (thin tiles, |dS/dt| up to ~1e4) carried 27% of its
+    squared norm, ~10x the median design, while fit no worse than average -- so
+    one such case set the direction of a whole clipped step. Costs one backward
+    per case. Returns the uncapped norms and the scales applied."""
+    P = [p for p in model.parameters() if p.requires_grad]
+    B = per_case.numel()
+    c = k * float(np.median(hist)) if active and hist else float("inf")
+    acc = [torch.zeros_like(p) for p in P]
+    norms, scales = [], []
+    for b in range(B):
+        gs = torch.autograd.grad(per_case[b] / B, P, retain_graph=b < B - 1, allow_unused=True)
+        n = float(torch.linalg.vector_norm(torch.stack([x.norm() for x in gs if x is not None]))) * B
+        sc = 1.0 / (1.0 + (n / c) ** 2) ** 0.5
+        for a, x in zip(acc, gs):
+            if x is not None:
+                a.add_(x, alpha=sc)
+        norms.append(n); scales.append(sc)
+    hist.extend(norms)
+    for p, a in zip(P, acc):
+        p.grad = a
+    return norms, scales
 
 
 def case_batches(loader, rows, B, pool_size, rng, mirror=None):
@@ -224,6 +368,20 @@ def case_batches(loader, rows, B, pool_size, rng, mirror=None):
         yield pack(cases)
 
 
+def design_batches(loader, B):
+    """Load-linear training: batches of B whole designs, every row of each
+    (t (B,K), load_w (B,C,N), S (B,C,N,6), dS (B,C,K,N,6) f16). The loader is
+    shuffled, so each step mixes B different designs."""
+    buf = []
+    for d in loader:
+        buf.append(d)
+        if len(buf) == B:
+            yield tuple(torch.stack([x[k] for x in buf]) for k in ("t", "load_w", "S", "dS"))
+            buf = []
+    if buf:
+        yield tuple(torch.stack([x[k] for x in buf]) for k in ("t", "load_w", "S", "dS"))
+
+
 def compute_stats(static, ids, rng):
     ys, ts, lws = [], [], []
     for i in rng.sample(ids, min(40, len(ids))):
@@ -270,12 +428,18 @@ def validate(model, loader, bt, args, dev, ctrl):
         t0 = d["t"].to(dev)
         lw, S_t = d["load_w"].to(dev), d["S"].to(dev)
         dS = d["dS"].to(dev)                                                     # (C,K,N,6) f16
-        t = t0.expand(C, -1).clone().requires_grad_(True)
+        lin = getattr(model, "load_linear", False)
+        # load_linear: one geometry forward, every row from one t (1,K) -- as in
+        # training; 11 per-row forwards with retained graphs ran out of memory
+        t = (t0[None] if lin else t0.expand(C, -1)).clone().requires_grad_(True)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bool(args.amp)):
-            S_p = bt.forward(model, t, lw, rows)
+            S_p = bt.forward_rows(model, t, lw[None])[0] if lin else bt.forward(model, t, lw, rows)
         # --- single loads ---
         ks_p = bt.ks(S_p, rho)
-        g_p = torch.autograd.grad(ks_p.sum(), t, retain_graph=True)[0]           # (C,K)
+        if lin:
+            g_p = torch.stack([torch.autograd.grad(ks_p[c], t, retain_graph=True)[0][0] for c in range(C)])
+        else:
+            g_p = torch.autograd.grad(ks_p.sum(), t, retain_graph=True)[0]       # (C,K)
         ks_t = d["ks"].to(dev)
         vp, vt = von_mises(S_p), von_mises(S_t)
         a = agg["single"]
@@ -287,9 +451,10 @@ def validate(model, loader, bt, args, dev, ctrl):
         for k, v in zip(("ctrl_cos", "ctrl_mass", "ctrl_sign"), grad_metrics(ctrl.to(dev), g_t)):
             a[k] += v.tolist()
         gen = torch.Generator(device=dev).manual_seed(int(d["id"]))
-        dirs = [torch.randn(C, bt.s.K, device=dev, generator=gen) for _ in range(args.sob_dirs)]
-        for v, Jv in zip(dirs, directional(S_p, t, dirs)):
-            Jt = torch.stack([torch.einsum("k,knc->nc", v[c], dS[c].float()) for c in range(C)])
+        dirs = [torch.randn(t.size(0), bt.s.K, device=dev, generator=gen) for _ in range(args.sob_dirs)]
+        for v, Jv in zip(dirs, directional(S_p[None] if lin else S_p, t, dirs)):
+            Jv = Jv[0] if lin else Jv                                            # (C,N,6); lin: one v for all rows
+            Jt = torch.stack([torch.einsum("k,knc->nc", v[0 if lin else c], dS[c].float()) for c in range(C)])
             a["dS_rel"] += rel_l2(Jv.detach(), Jt).tolist()
         # --- combinations ---
         W = combo_weights(args.val_combos, C, int(d["id"])).to(dev)              # (n,C)
@@ -362,6 +527,34 @@ def main():
                         "designs per step from a pool of N (case_batches)")
     p.add_argument("--mirror_aug", type=float, default=0.0,
                    help="probability each training case is replaced by its exact y-mirror image (0 = off)")
+    p.add_argument("--arch", default="hier", choices=["hier", "load_linear"],
+                   help="hier: one forward per (design, row), load as an input feature; load_linear: stress "
+                        "exactly linear in the load (utils/gnn_load_linear.py), all rows of a design in one forward")
+    p.add_argument("--lin_dim", type=int, default=32, help="load_linear: channels per load case in the linear stream")
+    p.add_argument("--lin_layers", type=int, default=2, help="load_linear: fine linear message-passing layers before "
+                                                              "and after the tile U-Net (each)")
+    p.add_argument("--gate_bound", type=float, default=0.0,
+                   help="load_linear: gates 1 + a tanh(z/a) in (1-a, 1+a); 0 = unbounded 1 + z")
+    p.add_argument("--tile_gate_bound", type=float, default=0.0,
+                   help="load_linear: tile gates exp(b tanh(z/b)) in (e^-b, e^b); 0 = same form as --gate_bound")
+    p.add_argument("--thick_power", type=float, default=0.0,
+                   help="load_linear: stress x (t_node/0.2)^-n, n > 0 learned per component from this init (0 = off)")
+    p.add_argument("--geo_spectral_norm", type=int, default=0,
+                   help="load_linear: spectral norm on the geometry tile CNN convs + thickness encoder")
+    p.add_argument("--full_readout", type=int, default=0,
+                   help="load_linear: stress = R(geometry) u with a full per-node matrix instead of gate + shared matrix")
+    p.add_argument("--lin_act", type=int, default=0,
+                   help="load_linear DIAGNOSTIC: GELU in the load stream (breaks linearity)")
+    p.add_argument("--rollback_k", type=float, default=0.0,
+                   help="roll back when the 200-step mean pre-clip grad norm exceeds k x its healthy median: "
+                        "restore the snapshot from 2-3k steps earlier and halve the lr (0 = off); see RollbackGuard")
+    p.add_argument("--case_clip", type=float, default=0.0,
+                   help="--case_batching: smoothly cap each case's gradient at k x the running median of "
+                        "per-case gradient norms before averaging the batch (0 = off); see case_clipped_backward")
+    p.add_argument("--case_batching", type=int, default=0,
+                   help="load_linear: batch like the per-row model (--graphs_per_step cases from different designs, "
+                        "--mix_pool) instead of whole designs; one geometry forward per case")
+    p.add_argument("--designs_per_step", type=int, default=2, help="load_linear: whole designs (all rows) per step")
     p.add_argument("--load_pos_features", type=int, default=1,
                    help="1: every tile also gets its row offset from the loaded row and the loaded row (tile_in_dim 4)")
     p.add_argument("--val_designs", type=int, default=200)
@@ -409,10 +602,19 @@ def main():
     st = {k: v.to(dev) for k, v in st.items()}
     bt = Batcher(static, st, dev)
 
-    model_kwargs = dict(node_in_dim=6, edge_in_dim=4, hidden_dim=args.hidden_dim, tile_in_dim=4 if args.load_pos_features else 2,
-                        num_pos_nodes=static.N, coarse_dim=args.coarse_dim, cnn_depth=args.cnn_depth,
-                        node_out_dim=6)
-    model = HierarchicalGNNCNN(**model_kwargs, use_checkpoint=bool(args.use_checkpoint)).to(dev)
+    if args.arch == "load_linear":
+        assert args.mirror_aug == 0, "--mirror_aug is per (design, row) case; not wired for load_linear"
+        model_kwargs = dict(arch="load_linear", node_in_dim=5, edge_in_dim=4, hidden_dim=args.hidden_dim,
+                            tile_in_dim=1, num_pos_nodes=static.N, coarse_dim=args.coarse_dim,
+                            cnn_depth=args.cnn_depth, lin_dim=args.lin_dim, lin_layers=args.lin_layers,
+                            gate_bound=args.gate_bound, full_readout=bool(args.full_readout),
+                            lin_act=bool(args.lin_act), tile_gate_bound=args.tile_gate_bound,
+                            geo_spectral_norm=bool(args.geo_spectral_norm), thick_power=args.thick_power)
+    else:
+        model_kwargs = dict(node_in_dim=6, edge_in_dim=4, hidden_dim=args.hidden_dim,
+                            tile_in_dim=4 if args.load_pos_features else 2, num_pos_nodes=static.N,
+                            coarse_dim=args.coarse_dim, cnn_depth=args.cnn_depth, node_out_dim=6)
+    model = build_model(model_kwargs, use_checkpoint=bool(args.use_checkpoint)).to(dev)
     model.set_tile_grid(static.NX, static.NY, 1)
     print(f"[model] {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M parameters", flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -457,51 +659,112 @@ def main():
                   f"rows 2-8 {u['uniform/ccos_mid_mean']:+.3f} (control ~+0.90); mirror rows 2-8 {u['uniform/mirror_mid_mean']:+.3f}; "
                   f"KS err max {u['uniform/ks_rel_max']:.1%}; per row {u['uniform/ccos_rows']}", flush=True)
         print(f"[val] epoch {epoch} step {step} ({time.time() - t_v:.0f} s):\n" + fmt_val(v), flush=True)
+        if getattr(model, "thick_log_n", None) is not None:
+            print("  thickness power n per stress component: "
+                  + " ".join(f"{x:.3f}" for x in model.thick_log_n.detach().exp().tolist()), flush=True)
         log.write(json.dumps({"step": step, "epoch": epoch, "val": v}) + "\n"); log.flush()
         return v
 
     mirror = (args.mirror_aug, *mirror_maps(static), static.NY) if args.mirror_aug > 0 else None
+    assert args.case_clip == 0 or args.case_batching or args.arch != "load_linear", "--case_clip needs case batches"
+    guard = RollbackGuard(args.rollback_k) if args.rollback_k > 0 else None
+    case_hist = collections.deque(maxlen=400)          # ~100 steps of per-case gradient norms
     model.train()
     for epoch in range(start_epoch, args.epochs):
         t_ep, ep_loss, ep_n, t_log = time.time(), 0.0, 0, time.time()
-        run = {"loss": 0.0, "value": 0.0, "sob": 0.0, "r": 0.0, "n": 0}
-        for t_b, lw_b, S_b, dS_b, rows_b in case_batches(train_loader, rows, args.graphs_per_step,
-                                                          args.mix_pool, rng, mirror):
-            B = len(rows_b)
+        run = {"loss": 0.0, "value": 0.0, "sob": 0.0, "r": 0.0, "gnorm": 0.0, "gmax": 0.0, "cmed": 0.0, "capped": 0.0,
+               "n": 0}
+        if args.arch == "load_linear" and not args.case_batching:
+            batches = ((t_b, lw_b, S_b, dS_b, None) for t_b, lw_b, S_b, dS_b in
+                       design_batches(train_loader, args.designs_per_step))
+        else:
+            batches = case_batches(train_loader, rows, args.graphs_per_step, args.mix_pool, rng, mirror)
+        for t_b, lw_b, S_b, dS_b, rows_b in batches:
+            B = t_b.size(0)
             lr = args.lr * lr_scale * min(1.0, (step + 1) / args.warmup_steps)
             for g in opt.param_groups:
                 g["lr"] = lr
             t = t_b.to(dev).requires_grad_(True)
             S_t = S_b.to(dev, non_blocking=True)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bool(args.amp)):
-                S_p = bt.forward(model, t, lw_b.to(dev, non_blocking=True), rows_b)
+                lw = lw_b.to(dev, non_blocking=True)
+                S_p = bt.forward_rows(model, t, lw) if rows_b is None else bt.forward(model, t, lw, rows_b)
             value = (((S_p - S_t) / st["y_std"]) ** 2).mean()
             loss, sob, rmean = value, torch.zeros((), device=dev), 0.0
+            per_case = (((S_p - S_t) / st["y_std"]) ** 2).flatten(1).mean(1) if args.case_clip > 0 else None
             if args.sob_weight > 0:
                 dirs = [torch.randn(B, static.K, device=dev) for _ in range(args.sob_dirs)]
-                dS = dS_b.to(dev, non_blocking=True).float()                     # (B,K,N,6)
+                dS = dS_b.to(dev, non_blocking=True)                             # (B,[C,]K,N,6) f16
                 for v, Jv in zip(dirs, directional(S_p, t, dirs)):
-                    r = rel_err(Jv, torch.einsum("bk,bknc->bnc", v, dS), args.sob_node_power)
+                    if rows_b is None:          # load_linear: every row of each design, one direction per design
+                        Jt = torch.stack([torch.einsum("k,cknx->cnx", v[b], dS[b].float()) for b in range(B)])
+                        Jv, Jt = Jv.flatten(0, 1), Jt.flatten(0, 1)
+                    else:
+                        Jt = torch.einsum("bk,bknc->bnc", v, dS.float())
+                    r = rel_err(Jv, Jt, args.sob_node_power)
                     sob = sob + (r / (1 + r / 2)).mean() / args.sob_dirs
+                    if per_case is not None:
+                        per_case = per_case + args.sob_weight * (r / (1 + r / 2)) / args.sob_dirs
                     rmean += float(r.detach().mean()) / args.sob_dirs
                 loss = value + args.sob_weight * sob
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            split = None
+            if (step + 1) % 100 == 0 and args.sob_weight > 0:
+                # the logging step: backward each loss term separately for the split
+                # below, then sum, so the update is the same as loss.backward()
+                value.backward(retain_graph=True)
+                gv = {n: p_.grad.clone() for n, p_ in model.named_parameters() if p_.grad is not None}
+                opt.zero_grad(set_to_none=True)
+                (args.sob_weight * sob).backward(retain_graph=per_case is not None)
+                split = grad_split(model, gv)
+                for n, p_ in model.named_parameters():
+                    if n in gv:
+                        p_.grad = gv[n] if p_.grad is None else p_.grad + gv[n]
+            if per_case is not None:            # replaces the plain sum (the split above is still pre-cap)
+                opt.zero_grad(set_to_none=True)
+                cn, cs = case_clipped_backward(model, per_case, case_hist, args.case_clip, step >= args.warmup_steps)
+                run["cmed"] += float(np.median(cn)); run["capped"] += float(np.mean(np.array(cs) < 0.5))
+            elif split is None:
+                loss.backward()
+            gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0))
             opt.step()
             step += 1
             lv = float(loss)
             ep_loss += lv; ep_n += 1
-            for k, x in (("loss", lv), ("value", float(value)), ("sob", float(sob)), ("r", rmean)):
+            for k, x in (("loss", lv), ("value", float(value)), ("sob", float(sob)), ("r", rmean), ("gnorm", gnorm)):
                 run[k] += x
+            run["gmax"] = max(run["gmax"], gnorm)
+            if guard is not None:
+                if step % guard.every == 0 and step >= args.warmup_steps and float(np.mean(guard.recent or [0])) < 2 * float(
+                        np.median(guard.hist or [float("inf")])):
+                    guard.snapshot(step, model, opt)
+                if guard.check(gnorm, step, step >= args.warmup_steps):
+                    m200, base = float(np.mean(guard.recent)), float(np.median(guard.hist))
+                    step0 = guard.restore(model, opt)
+                    lr_scale *= 0.5
+                    ep_loss, ep_n = 0.0, 0          # the epoch loss (plateau rule) counts only post-rollback steps
+                    print(f"[rollback] step {step}: 200-step mean grad {m200:.2f} > {args.rollback_k:g} x healthy median "
+                          f"{base:.2f}; restored the step-{step0} snapshot, lr x0.5 -> {args.lr * lr_scale:.2e} "
+                          f"(rollback #{guard.count})", flush=True)
+                    log.write(json.dumps({"step": step, "rollback_to": step0, "grad_mean": m200, "grad_base": base,
+                                          "lr_scale": lr_scale}) + "\n"); log.flush()
             run["n"] += 1
             if step % 100 == 0:
                 dt, n = time.time() - t_log, run["n"]
                 print(f"[train] epoch {epoch} step {step} loss {run['loss'] / n:.4f} (value {run['value'] / n:.4f}, "
-                      f"sob {run['sob'] / n:.4f}, dS-dir rel {run['r'] / n:.3f}) lr {lr:.2e} {n / dt:.2f} steps/s "
+                      f"sob {run['sob'] / n:.4f}, dS-dir rel {run['r'] / n:.3f}) lr {lr:.2e} "
+                      f"grad {run['gnorm'] / n:.2f} (max {run['gmax']:.1f}) "
+                      + (f"case-grad median {run['cmed'] / n:.2f}, {100 * run['capped'] / n:.1f}% cut >2x "
+                         if args.case_clip > 0 else "") + f"{n / dt:.2f} steps/s "
                       f"mem {torch.cuda.max_memory_allocated() / 1e9:.1f} GB", flush=True)
-                log.write(json.dumps({"step": step, "epoch": epoch, **{k: run[k] / n for k in ("loss", "value", "sob", "r")},
-                                      "lr": lr}) + "\n"); log.flush()
+                rec = {"step": step, "epoch": epoch, **{k: run[k] / n for k in ("loss", "value", "sob", "r", "gnorm", "cmed",
+                                                                                   "capped")},
+                       "gmax": run["gmax"], "lr": lr}
+                if split is not None:
+                    print("  grad split (pre-clip, this step): " + ", ".join(f"{k} {v:.2f}" for k, v in split.items()),
+                          flush=True)
+                    rec["grad_split"] = split
+                log.write(json.dumps(rec) + "\n"); log.flush()
                 t_log, run = time.time(), {k: 0.0 for k in run} | {"n": 0}
             if args.max_steps and step >= args.max_steps:
                 run_val(epoch)

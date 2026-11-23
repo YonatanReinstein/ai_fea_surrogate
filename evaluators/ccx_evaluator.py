@@ -429,45 +429,19 @@ class CCXEvaluator(BaseEvaluator):
             sa.solve()
             stress_mpa = sa.ks(self.stress_ks_rho_mpa) / 1e6
             NX, NY, NZ = self.tile_grid()
-            # STRESS_KS_NORMALIZE=max: report the TRUE peak of the KS-counted
-            # nodes and scale the KS gradient by c = peak / KS (Le et al.
-            # 2010's normalized stress measure, c taken at the current design).
-            # Raw KS with rho 0.25/MPa over ~77k nodes sits up to
-            # ln(N)/rho ~ 45 MPa above the peak when many nodes are near it
-            # (gen 39 of cross4_mid_nbhd02_r15: KS 98.9 vs peak 81.8), so the
-            # yield constraint was really "peak + crowding bonus". Subtracting
-            # ln(N)/rho instead would err the other way (up to 45 MPa below a
-            # single sharp peak). The gradient keeps KS's smooth direction.
-            #
-            # STRESS_KS_NORMALIZE=smooth: c follows peak / KS only slowly,
-            # c <- c + STRESS_KS_C_RATE (default 0.2) * (peak / KS - c), and
-            # the constraint is c * KS -- smooth in the design, unlike the
-            # peak itself. With "max", c jumps to each design's own ratio,
-            # and along a step c rose 0.837 -> 0.873 as the stress
-            # concentrated, doubling the linear model's miss (MMA run gen 23:
-            # +7.7 MPa on the peak vs +4.0 on KS). The reported value then
-            # tracks the true peak to within c's lag; the log prints both.
-            ks_scale = 1.0
-            mode = os.environ.get("STRESS_KS_NORMALIZE")
-            if mode in ("max", "smooth"):
-                import numpy as _np
-                _, _vm = sa.nodal_stress()
-                _vm = _vm.detach().numpy()
-                if sa.ks_mask is not None:
-                    _vm = _vm[_np.asarray(sa.ks_mask, dtype=bool)]
-                peak_mpa = float(_vm.max()) / 1e6
-                if mode == "max":
-                    ks_scale = peak_mpa / stress_mpa
-                else:
-                    ratio = peak_mpa / stress_mpa
-                    c_prev = getattr(self, "_ks_c", None)
-                    rate = float(os.environ.get("STRESS_KS_C_RATE", "0.2"))
-                    self._ks_c = ratio if c_prev is None else c_prev + rate * (ratio - c_prev)
-                    ks_scale = self._ks_c
-                    print(f"[ccx ks smooth] KS {stress_mpa:.2f} peak {peak_mpa:.2f} MPa, "
-                          f"c {ks_scale:.4f} (peak/KS {ratio:.4f}) -> constraint {ks_scale * stress_mpa:.2f}",
-                          flush=True)
-                stress_mpa = ks_scale * stress_mpa
+            # The constraint is the raw KS (rho per MPa) -- an upper bound on the
+            # peak (sits ~17 MPa above it at rho 0.25 on cross4) with exactly the
+            # gradient computed below. The STRESS_KS_NORMALIZE=max/smooth
+            # rescaling c = peak/KS was removed 2026-10-22: the constraint
+            # then hinged on the nodal peak, which the surrogates predict far
+            # worse off-trajectory than KS. The peak is still logged.
+            import numpy as _np
+            _, _vm = sa.nodal_stress()
+            _vm = _vm.detach().numpy()
+            if sa.ks_mask is not None:
+                _vm = _vm[_np.asarray(sa.ks_mask, dtype=bool)]
+            self.last_peak_mpa = float(_vm.max()) / 1e6
+            print(f"[ccx] KS {stress_mpa:.2f} MPa, peak {self.last_peak_mpa:.2f} MPa", flush=True)
             def _stiffness_term(dG):
                 """Add each tile's stiffness-penalty term, sum over its elements
                 of d KS / d s_e * ds/dt (sa.gE from the gradient pass), in dG's
@@ -499,19 +473,13 @@ class CCXEvaluator(BaseEvaluator):
             if colored:
                 v, s_, y, dV, dG = self._colored_tile_gradient(sa, D_tile, elements0, cad, stress_mpa)
                 dG = _stiffness_term(dG)
-                return v, s_, y, dV, {k: g * ks_scale for k, g in dG.items()}
+                return v, s_, y, dV, dG
             dKS_dt = sa.tile_gradient(dX_dt, elem_to_tile, self.dims_keys,
                                       NX, NY, NZ,
                                       rho_mpa=self.stress_ks_rho_mpa)
             yld = self.material_properties["yield_strength"]
             dG_dx = {k: (v / 1e6) / yld for k, v in dKS_dt.items()}
             dG_dx = _stiffness_term(dG_dx)
-            # STRESS_KS_NORMALIZE: the value is ks_scale * KS, so the gradient
-            # must be scaled the same way -- this path returned the unscaled
-            # KS gradient (only the colored path scaled it), a value/gradient
-            # mismatch of c = peak/KS ~ 0.6-0.9 on every hollow_cube run with
-            # STRESS_KS_NORMALIZE=max or smooth.
-            dG_dx = {k: g * ks_scale for k, g in dG_dx.items()}
             volume = cad.get_volume()
             dV_dt = hollow_tube_volume_sensitivity(
                 [dims[k] for k in self.dims_keys], volume)

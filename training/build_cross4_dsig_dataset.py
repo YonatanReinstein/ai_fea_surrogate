@@ -231,6 +231,11 @@ def solve_design(dims, bc, rows, F, rho_mpa, workers=10, need_ds=True):
     out["dks"] = np.einsum("cnk,cjnk->cj", gS, dS)
     out["_D_tile"] = D_tile
     out["_sa"] = sa
+    # displacement view of the same solve (not saved by main): u, du/dt and the
+    # part of dS/dt from the mesh moving at fixed u -- dS = R du + _dS_geo
+    out["_U"] = Uc
+    out["_dU"] = dU.T.reshape(C, K, N, 3)
+    out["_dS_geo"] = dS_part / cnt[None, None, :, None] / 1e6
     return out, shared
 
 

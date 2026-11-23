@@ -641,6 +641,8 @@ def main():
                 raise RuntimeError(f"[trainer] rank weights diverged: {[float(c) for c in cks]}")
         later = []
         used = list(pend)
+        _t_start = time.time()
+        _tl = []                        # per-label (t_spool, t_claim, t_solved, t_done)
 
         # build on-policy samples: rebuild the graph for each labelled design.
         # The labeller's ccx mesh is a different pipeline from the GNN graph, so
@@ -650,6 +652,8 @@ def main():
         _jobs = []; _ready = []
         for f in pend:
             z = np.load(f, allow_pickle=True)
+            if "t_done" in z.files:
+                _tl.append(tuple(float(z[k]) for k in ("t_spool", "t_claim", "t_solved", "t_done")))
             names = [str(n) for n in z["free_names"]]
             dims = {n: float(v) for n, v in zip(names, z["x"])}
             gkeys = [k for k in z.files if k.startswith("graph__")]
@@ -814,6 +818,15 @@ def main():
             _vnote = (f" | on-traj val cosine {vcos:+.4f} bias {100*vbias:+.2f}% (n={len(val_set)})"
                       if vcos == vcos else "")
             _bnote = f" | pool {len(_pool)}" if a.traj_buffer else ""
+            if _tl:
+                # where a bundle's time went, wall clock: spooled -> claimed by a
+                # labeller (queue) -> solved -> graph built -> trainer picked it up
+                # (after the LAST label of the bundle) -> published
+                T = np.array(_tl)
+                _bnote += (f" | pipe: spool->all labelled {T[:,3].max()-T[:,0].min():.1f}s "
+                           f"(queue max {np.nanmax(T[:,1]-T[:,0]):.1f}s, solve max {np.max(T[:,2]-T[:,1]):.1f}s, "
+                           f"graph max {np.max(T[:,3]-T[:,2]):.1f}s), labelled->trainer {_t_start-T[:,3].max():.1f}s, "
+                           f"trainer {time.time()-_t_start:.1f}s")
             print(f"[trainer] update {n_upd}: {len(onp)} designs, cosine {cos_now:+.4f} "
                   f"(base {base_cos:+.4f}), stress bias {100*bias_now:+.2f}% "
                   f"(base {100*base_bias:+.2f}%){ema_note}{_vnote}{_bnote} -- published "

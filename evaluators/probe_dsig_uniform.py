@@ -16,8 +16,7 @@ import torch
 
 from evaluators.probe_dsig_rows import ccos, cos, wrong
 from training.dsig_data import DsigStatic, available_designs, design_path
-from training.train_dsig import Batcher
-from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
+from training.train_dsig import Batcher, build_model
 
 
 def main():
@@ -61,7 +60,7 @@ def main():
     for path in args.ckpt.split(","):
         ck = torch.load(path, map_location="cpu", weights_only=False)
         s.ref_coords = ck["ref_coords"]
-        model = HierarchicalGNNCNN(**ck["model_kwargs"]).to(dev)
+        model = build_model(ck["model_kwargs"]).to(dev)
         model.set_tile_grid(NX, NY, 1)
         model.float()
         model.load_state_dict(ck["model"])

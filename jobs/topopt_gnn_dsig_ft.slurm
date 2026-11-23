@@ -19,7 +19,7 @@
 # Physics and optimizer recipe = the ccx reference runs
 # cross4_freeload_row{0,5,10}_tmin003_F5e7_m442_mma (jobs/topopt_ccx_baseline.slurm):
 # pyramid tile_nodes load 5e7 N on FEA_LOAD_ROW, no load pad, mesh 4,4,2, avg
-# legs, KS rho 0.25 over non-pad nodes, max normalization, MMA move 0.08, t0 0.2,
+# legs, KS rho 0.25 over non-pad nodes (raw KS <= yield), MMA move 0.08, t0 0.2,
 # tile floor 0.03. DSIG_LOAD_WEIGHTS / DSIG_COMBINE pass through for combinations.
 #   CKPT=... RUN_NAME=... sbatch jobs/topopt_gnn_dsig_ft.slurm
 cd "$SLURM_SUBMIT_DIR"
@@ -33,7 +33,7 @@ export CROSS4_LEG_RULE=avg CROSS4_FIXED_END_RADIUS=0 FEA_LOAD_MODE=tile_nodes FE
 export CROSS4_PAD_THICKNESS=0.1 CROSS4_LOAD_PAD_THICKNESS=0 FEA_MESH_RES=4,4,2
 export FEA_LOAD_N=${FEA_LOAD_N:-5e7} FEA_LOAD_ROW=${FEA_LOAD_ROW:-5} TOPOPT_T_MIN=${T_MIN:-0.03}
 export TOPOPT_KS_EXCLUDE=pad TOPOPT_UPDATE=mma TOPOPT_MMA_ASY_INIT=0.1 TOPOPT_TILE_JACOBIAN=colored
-export STRESS_KS_NORMALIZE=${STRESS_KS_NORMALIZE:-max} STRESS_KS_RHO_MPA=${RHO:-0.25}
+export STRESS_KS_RHO_MPA=${RHO:-0.25}
 export DSIG_FT=${FT:-1} DSIG_FT_EVERY=${FT_EVERY:-1} DSIG_FT_SAMPLES=${FT_SAMPLES:-4} DSIG_FT_JITTER=${FT_JITTER:-0.03}
 export DSIG_FT_STEPS=${FT_STEPS:-20} DSIG_FT_BATCH=${FT_BATCH:-4} DSIG_FT_LR=${FT_LR:-5e-5}
 export DSIG_FT_REPLAY_FRAC=${FT_REPLAY_FRAC:-0.5} DSIG_FT_BUFFER=${FT_BUFFER:-40}

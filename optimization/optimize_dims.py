@@ -208,6 +208,12 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
             gradient_func=gradient_func,
             generations=generations,
             reference_gradient=getattr(evaluator, "reference_gradient", None),
+            # TOPOPT_SCREENSHOT_STRESS=surrogate: colour screenshots with the
+            # surrogate's nodal stress (no ccx re-solve); TOPOPT_SCREENSHOT_GRAD=0
+            # skips the per-tile gradient panel
+            screenshot_stress=(getattr(evaluator, "node_von_mises")
+                               if os.environ.get("TOPOPT_SCREENSHOT_STRESS") == "surrogate" else None),
+            screenshot_grad=os.environ.get("TOPOPT_SCREENSHOT_GRAD", "1") != "0",
             geometry=geometry_name,
             move_limit=move_limit,
             oc_eta=oc_eta,

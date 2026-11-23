@@ -29,6 +29,13 @@ dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 mod = importlib.import_module(f"data.{a.geometry}.boundary_conditions")
 soff = 0 if getattr(mod, "fixed_dims", lambda: {})() else 3
 ds = load_dataset(a.dataset)
+# dataset_builder / build_tile_load_dataset workers drop edge_index/tile_idx
+# (identical for every sample); re-attach them from graph.pt like the trainer
+if getattr(ds[0], "edge_index", None) is None or getattr(ds[0], "tile_idx", None) is None:
+    import os
+    _g = torch.load(os.path.join(os.path.dirname(a.dataset), "graph.pt"), weights_only=False)
+    for _s in ds:
+        _s.edge_index, _s.tile_idx = _g["edge_index"].long(), _g["tile_idx"].view(-1).long()
 s0 = ds[0]
 NX, NY, NZ = int(s0.tile_NX), int(s0.tile_NY), int(s0.tile_NZ)
 K = NX * NY * NZ
@@ -47,7 +54,17 @@ def field(model, stats):
         t_leaf = s.dims[0, soff:soff + K].float().to(dev)[perm].view(-1, 1).clone().requires_grad_(True)
         bidx, tidx = bidx.to(dev), tidx.to(dev)
         ns = t_leaf.view(1, K)[bidx, tidx].unsqueeze(1)
-        x = x.float().to(dev); x[:, 3:6] = x[:, 3:6] / 1e6
+        x = x.float().to(dev)
+        tile_in = t_leaf
+        if getattr(model, "tile_load_input", False):
+            # tile-load model: same inputs as gnn_training._preprocess -- no
+            # node force columns, [Fx, Fy, Fz] / scale on the sample's load tile
+            x = torch.cat([x[:, :3], x[:, 6:]], dim=1)
+            load = torch.zeros(K, 3, device=dev)
+            load[int(s.load_tile)] = s.load_force.view(3).float().to(dev) / model.tile_load_scale_n
+            tile_in = torch.cat([t_leaf, load], dim=1)
+        else:
+            x[:, 3:6] = x[:, 3:6] / 1e6
         xn = (torch.cat([x, ns], dim=1) - x_mean) / x_std
         # Positional node embedding. Training attaches node_id = arange(N)
         # to every sample (gnn_training._preprocess) and the evaluator does
@@ -61,7 +78,9 @@ def field(model, stats):
             nid = torch.arange(x.shape[0], dtype=torch.long)
         gp, _ = model(xn, ei.to(dev), (ea.float().to(dev) - e_mean) / e_std, bidx,
                       tile_idx=tidx, tile_NX=tNX, tile_NY=tNY, tile_NZ=tNZ,
-                      tile_x=t_leaf, num_graphs=1,
+                      tile_x=tile_in, num_graphs=1,
+                      ks_mask=(s.ks_mask.to(dev) if getattr(model, "ks_exclude", None) and hasattr(s, "ks_mask")
+                               else None),
                       node_id=nid.to(dev) if nid is not None else None)
         gpm = (gp * nt_std + nt_mean).clamp_min(LOG_STRESS_EPS)
         d = torch.autograd.grad(gpm.sum(), t_leaf)[0].view(-1)

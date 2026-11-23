@@ -116,7 +116,8 @@ class DsigOnlineFT:
         self.pool = ProcessPoolExecutor(max_workers=self.samples,
                                         mp_context=__import__("multiprocessing").get_context("spawn"))
         self.base_hold = self._holdout()
-        print(f"[DsigFT] base hold-out: KS rel {self.base_hold[0]:.4f}, dKS cos {self.base_hold[1]:+.3f} (medians)",
+        print(f"[DsigFT] base hold-out: KS rel {self.base_hold[0]:.4f}, dKS cos {self.base_hold[1]:+.3f}, "
+              f"|dKS| ratio {self.base_hold[2]:.3f} (medians)",
               flush=True)
 
     # ------------------------------------------------------------------
@@ -148,10 +149,11 @@ class DsigOnlineFT:
         return t, lw, torch.stack([c["S"] for c in cases]).to(dev), [c["row"] for c in cases]
 
     def _holdout(self):
-        """(median KS rel error, median dKS/dt cosine) on the hold-out cases."""
+        """(median KS rel error, median dKS/dt cosine, median |dKS/dt| ratio
+        surrogate / exact) on the hold-out cases."""
         ev, dev = self.ev, self.ev.device
         ev.model.eval()
-        kr, cs = [], []
+        kr, cs, nr = [], [], []
         for c in self.holdout:
             t, lw, _, rows = self._stack([c], dev)
             t.requires_grad_(True)
@@ -161,7 +163,8 @@ class DsigOnlineFT:
             g, gt = g[0].double().cpu(), c["dks"].double()
             kr.append(abs(float(ks) / c["ks"] - 1))
             cs.append(float(g @ gt / (g.norm() * gt.norm() + 1e-30)))
-        return float(np.median(kr)), float(np.median(cs))
+            nr.append(float(g.norm() / (gt.norm() + 1e-30)))
+        return float(np.median(kr)), float(np.median(cs)), float(np.median(nr))
 
     def _traj_err(self, x, lab):
         """Surrogate vs exact, for the run's own combination of the labelled rows."""
@@ -176,7 +179,8 @@ class DsigOnlineFT:
         gt = torch.einsum("bnc,bknc->k", gS, dS).cpu().numpy()
         cos = float(g @ gt / (np.linalg.norm(g) * np.linalg.norm(gt) + 1e-30))
         wrong = np.abs(gt)[np.sign(g) != np.sign(gt)].sum() / np.abs(gt).sum()
-        return G, float(Gt), float(peak), cos, float(wrong)
+        ratio = float(np.linalg.norm(g) / (np.linalg.norm(gt) + 1e-30))
+        return G, float(Gt), float(peak), cos, float(wrong), ratio
 
     def _loss(self, cases):
         ev, dev, st = self.ev, self.ev.device, self.ev.st
@@ -254,7 +258,9 @@ class DsigOnlineFT:
         print(f"[DsigFT] update {self.updates} (call {self.calls}): exact KS {pre[1]:.2f} MPa (peak {pre[2]:.2f}); "
               f"before: KS {pre[0]:.2f} ({pre[0] / pre[1] - 1:+.1%}), dG cos {pre[3]:+.3f}, wrong-way {pre[4]:.1%}; "
               f"after: KS {post[0]:.2f} ({post[0] / post[1] - 1:+.1%}), cos {post[3]:+.3f}; loss {np.mean(losses):.4f}; "
-              f"hold-out KS rel {hold[0]:.4f} cos {hold[1]:+.3f} (base {self.base_hold[0]:.4f} / {self.base_hold[1]:+.3f})"
+              f"|dG| ratio before {pre[5]:.3f} after {post[5]:.3f}; "
+              f"hold-out KS rel {hold[0]:.4f} cos {hold[1]:+.3f} |dKS| ratio {hold[2]:.3f} "
+              f"(base {self.base_hold[0]:.4f} / {self.base_hold[1]:+.3f} / {self.base_hold[2]:.3f})"
               f" -> {'ACCEPTED' if ok else 'DISCARDED'}; {self.accepted}/{self.updates} kept; label {t_lab:.0f}s "
               f"(slowest solve {max(l['secs'] for l in labels):.0f}s), total {time.time() - t0:.0f}s", flush=True)
 

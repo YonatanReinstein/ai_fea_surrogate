@@ -163,6 +163,7 @@ def main():
             continue
         idle_since = None
 
+        t_claim = time.time()
         z = np.load(path, allow_pickle=True)
         names = [str(n) for n in z["free_names"]]
         dims = {n: float(v) for n, v in zip(names, z["x"])}
@@ -189,6 +190,10 @@ def main():
         np.savez_compressed(tmp, free_names=np.array(names), x=z["x"], dg_ccx=dg,
                  ccx_stress=stress, ccx_volume=vol, yield_strength=yld,
                  label_seconds=dt,
+                 # pipeline timing (wall clock): spooled by the optimiser ->
+                 # claimed here -> solved -> graph built -> written
+                 t_spool=float(z["t_spool"]) if "t_spool" in z.files else np.nan,
+                 t_claim=t_claim, t_solved=t0 + dt, t_done=time.time(),
                  surrogate_dg=z["dg_raw"] if "dg_raw" in z.files else np.zeros(0),
                  surrogate_stress=z["s0"] if "s0" in z.files else np.nan,
                  gen=z["gen"] if "gen" in z.files else -1, **graph)

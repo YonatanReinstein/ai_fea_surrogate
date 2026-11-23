@@ -46,8 +46,7 @@ class GNNDsigEvaluator(BaseEvaluator):
                  mesh_threads=8, jacobian_workers=None):
         super().__init__(geometry_name)
         from training.dsig_data import DsigStatic
-        from training.train_dsig import Batcher
-        from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
+        from training.train_dsig import Batcher, build_model
         self.geometry = geometry_name
         self.ckpt_path = ckpt_path or os.environ.get("DSIG_CKPT")
         self.dataset_dir = dataset_dir or os.environ.get("DSIG_DATA", "data/cross4_11x11/dataset_dsig_2500_tmin003")
@@ -63,7 +62,7 @@ class GNNDsigEvaluator(BaseEvaluator):
         self.dims_keys = list(json.load(open(f"data/{geometry_name}/CAD_model/dims.json")))
 
         ck = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
-        self.model = HierarchicalGNNCNN(**ck["model_kwargs"]).to(dev)
+        self.model = build_model(ck["model_kwargs"]).to(dev)
         self.model.set_tile_grid(self.NX, self.NY, self.NZ)
         self.model.float()            # importing core.fem_adjoint makes float64 the default dtype
         self.model.load_state_dict(ck["model"])
@@ -150,11 +149,44 @@ class GNNDsigEvaluator(BaseEvaluator):
         rows = [s.rows[k] for k in self.used]
         lw = torch.as_tensor(np.stack([s.load_weights(X, r) for r in rows]), dtype=torch.float32, device=dev)
         t = torch.tensor([dims[k] for k in self.dims_keys], dtype=torch.float32, device=dev, requires_grad=True)
-        S = self.bt.forward(self.model, t.expand(len(rows), -1), lw, rows).double() * self.F_scale
+        if getattr(self.model, "load_linear", False):     # every row from one geometry forward
+            S = self.bt.forward_rows(self.model, t[None], lw[None])[0].double() * self.F_scale
+        else:
+            S = self.bt.forward(self.model, t.expand(len(rows), -1), lw, rows).double() * self.F_scale
         w = torch.as_tensor(self.weights[self.used], dtype=torch.float64, device=dev)
         G, peak = self._combine(S, w)
         g, = torch.autograd.grad(G, t)
         return float(G), float(peak), g.double().cpu().numpy()
+
+    @torch.no_grad()
+    def node_von_mises(self, dims, node_ids, X):
+        """Surrogate nodal von Mises (MPa) at X (N,3), node_ids in the same order,
+        for screenshots that skip the ccx solve. Combines the used rows the same
+        way _combine does: superpose -> von Mises of the weighted sum, else the
+        per-node max over the weighted cases."""
+        dims = {k: float(dims[k]) for k in self.dims_keys}
+        order = np.argsort(np.asarray(node_ids))
+        ids = np.asarray(node_ids)[order]
+        m = np.load(os.path.join(self.dataset_dir, "mesh.npz"))
+        assert np.array_equal(ids, m["node_ids"]), "screenshot mesh node ids differ from the surrogate's"
+        Xs = np.asarray(X, dtype=np.float64)[order]
+        dev, s = self.device, self.static
+        rows = [s.rows[k] for k in self.used]
+        lw = torch.as_tensor(np.stack([s.load_weights(Xs, r) for r in rows]), dtype=torch.float32, device=dev)
+        t = torch.tensor([dims[k] for k in self.dims_keys], dtype=torch.float32, device=dev)
+        if getattr(self.model, "load_linear", False):
+            S = self.bt.forward_rows(self.model, t[None], lw[None])[0].double() * self.F_scale
+        else:
+            S = self.bt.forward(self.model, t.expand(len(rows), -1), lw, rows).double() * self.F_scale
+        w = torch.as_tensor(self.weights[self.used], dtype=torch.float64, device=dev)
+        if self.combine == "superpose":
+            vm = von_mises(torch.einsum("b,bnk->nk", w, S))
+        else:
+            vm = torch.stack([von_mises(w[b] * S[b]) for b in range(len(w))]).max(0).values
+        vm_sorted = vm.cpu().numpy()
+        out = np.empty_like(vm_sorted)
+        out[order] = vm_sorted                      # back to the caller's node order
+        return out
 
     def compute_topopt_gradient(self, dims: dict):
         from core.fem_adjoint import _geom
@@ -163,20 +195,7 @@ class GNNDsigEvaluator(BaseEvaluator):
             self.ft.maybe_update(dims)
         Xnp, ids, D_tile = self._mesh(dims)
         G, peak, gt = self.predict(dims, Xnp)
-        # STRESS_KS_NORMALIZE as in CCXEvaluator: "max" reports the peak and
-        # scales the KS gradient by c = peak/KS; "smooth" lets c follow
-        # peak/KS at STRESS_KS_C_RATE per call and reports c * KS.
-        scale = 1.0
-        mode = os.environ.get("STRESS_KS_NORMALIZE")
-        if mode == "max":
-            scale = peak / G
-        elif mode == "smooth":
-            ratio = peak / G
-            c_prev = getattr(self, "_ks_c", None)
-            rate = float(os.environ.get("STRESS_KS_C_RATE", "0.2"))
-            self._ks_c = ratio if c_prev is None else c_prev + rate * (ratio - c_prev)
-            scale = self._ks_c
-        value_mpa = scale * G
+        # the constraint is the raw KS, as in CCXEvaluator; the peak is only logged
         # volume = sum of hex Gauss-point detJ (unit weights), chained through dX/dt
         Xv = torch.tensor(Xnp, dtype=torch.float64, requires_grad=True)
         _, detJ = _geom(Xv[torch.as_tensor(self.static.elements)])
@@ -184,15 +203,14 @@ class GNNDsigEvaluator(BaseEvaluator):
         vol.backward()
         gV = Xv.grad.numpy()
         row = {n: i for i, n in enumerate(ids)}
-        dG = {k: scale * float(gt[i]) / self.yld for i, k in enumerate(self.dims_keys)}
+        dG = {k: float(gt[i]) / self.yld for i, k in enumerate(self.dims_keys)}
         dV = {k: sum(float(gV[row[n]] @ np.asarray(v)) for n, v in D_tile.get(k, {}).items())
               for k in self.dims_keys}
-        print(f"[GNNDsig] KS {G:.2f} MPa, peak {peak:.2f} MPa, c {scale:.4f} -> constraint {value_mpa:.2f} MPa, "
-              f"volume {float(vol):.3f}", flush=True)
+        print(f"[GNNDsig] KS {G:.2f} MPa, peak {peak:.2f} MPa, volume {float(vol):.3f}", flush=True)
         self._calls += 1
         if self.exact_every and (self._calls - 1) % self.exact_every == 0:
             self._exact_check(dims, G, gt)
-        return float(vol), value_mpa, self.yld, dV, dG
+        return float(vol), G, self.yld, dV, dG
 
     # ------------------------------------------------------------------
     def exact(self, dims):
@@ -217,8 +235,8 @@ class GNNDsigEvaluator(BaseEvaluator):
         return res
 
     def reference_gradient(self, dims):
-        """Exact dG at dims, same units as compute_topopt_gradient's (no KS
-        normalization), for the topopt gradient heatmap's side-by-side panel."""
+        """Exact dG at dims, same units as compute_topopt_gradient's, for the
+        topopt gradient heatmap's side-by-side panel."""
         g = self.exact(dims)[2]
         return {k: float(g[i]) / self.yld for i, k in enumerate(self.dims_keys)}
 

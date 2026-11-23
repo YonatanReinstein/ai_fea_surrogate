@@ -33,9 +33,15 @@ def ks_pool(node_pred, batch, num_graphs, node_target_mean, node_target_std, rho
 
 
 class EdgeAttrConv(MessagePassing):
-    def __init__(self, hidden_dim, edge_dim):
+    # norm_mode: PyG's MLP "layer_norm" is torch_geometric's LayerNorm, whose
+    # default mode="graph" -- called without a batch vector it normalizes with
+    # ONE mean/std over every edge of every graph in the batch, so a graph's
+    # output depends on the others it is batched with (~1% on the dsig model).
+    # "node" is the standard per-edge LayerNorm; "graph" kept for old checkpoints.
+    def __init__(self, hidden_dim, edge_dim, norm_mode="graph"):
         super().__init__(aggr="mean")
-        self.mlp = MLP([2 * hidden_dim + edge_dim, hidden_dim, hidden_dim], norm="layer_norm")
+        self.mlp = MLP([2 * hidden_dim + edge_dim, hidden_dim, hidden_dim], norm="layer_norm",
+                       norm_kwargs={"mode": norm_mode})
 
     def forward(self, x, edge_index, edge_attr):
         return self.propagate(edge_index, x=x, edge_attr=edge_attr)
@@ -50,10 +56,11 @@ class BipartiteEdgeAttrConv(MessagePassing):
     features are projected to the target width before the message MLP, so
     the MLP itself -- and the target update -- live entirely at dst_dim;
     src_dim is never upsampled beyond this one projection."""
-    def __init__(self, src_dim, dst_dim, edge_dim):
+    def __init__(self, src_dim, dst_dim, edge_dim, norm_mode="graph"):
         super().__init__(aggr="mean")
         self.src_proj = nn.Linear(src_dim, dst_dim)
-        self.mlp = MLP([2 * dst_dim + edge_dim, dst_dim, dst_dim], norm="layer_norm")
+        self.mlp = MLP([2 * dst_dim + edge_dim, dst_dim, dst_dim], norm="layer_norm",
+                       norm_kwargs={"mode": norm_mode})        # see EdgeAttrConv
 
     def forward(self, x_src, x_dst, edge_index, edge_attr):
         return self.propagate(edge_index, x=(x_src, x_dst), edge_attr=edge_attr,

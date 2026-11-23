@@ -81,7 +81,8 @@ class TopologyOptimizer:
                  tile_move_min=0.05, update="oc", mma_asy_init=0.5, mma_asy_incr=1.2,
                  mma_asy_decr=0.7, mma_low_min=None,
                  stagnation_gens=0, init_thickness=None, stop_at_gen=None,
-                 screenshot_heatmap=True, screenshot_every=1, reference_gradient=None):
+                 screenshot_heatmap=True, screenshot_every=1, reference_gradient=None,
+                 screenshot_stress=None, screenshot_grad=True):
         if gradient_func is None:
             raise ValueError("TopologyOptimizer needs a gradient_func (ccx adjoint/axis or a "
                              "surrogate); the finite-difference sweep was removed (commit 7bf07d9 has it)")
@@ -164,6 +165,11 @@ class TopologyOptimizer:
         # costs more than the gradient call; render every Nth generation.
         self.screenshot_heatmap = screenshot_heatmap
         self.screenshot_every = max(1, screenshot_every)
+        # Optional (dims, node_ids, coords) -> nodal von Mises MPa: colours the
+        # screenshot from the surrogate instead of a ccx re-solve. screenshot_grad
+        # =False skips the _grad.png panel (its solver column is an exact solve).
+        self.screenshot_stress = screenshot_stress
+        self.screenshot_grad = screenshot_grad
 
         self.dim_names = list(dims_dict)
         self.free_names = [n for n in self.dim_names if dims_dict[n]["max"] > dims_dict[n]["min"]]
@@ -697,12 +703,14 @@ class TopologyOptimizer:
                 path = f"{self.screenshot_dir}/topopt_gen_{gen:03d}"
                 try:
                     screenshot(geometry=self.geometry, dims=dims, save_path=f"{path}.png",
-                               banner=f"[TOPOPT gen {gen:03d}] vol: {v0:.4e}, stress: {s0:.4e}",
-                               heatmap=self.screenshot_heatmap)
+                               banner=f"[TOPOPT gen {gen:03d}] vol: {v0:.4e}, stress: {s0:.4e}"
+                                      + (" (surrogate stress field)" if self.screenshot_stress else ""),
+                               heatmap=self.screenshot_heatmap, stress_fn=self.screenshot_stress)
                 except Exception as e:
                     print(f"[TOPOPT] screenshot failed: {e}", flush=True)
                 try:
-                    self._save_gradient_heatmap(gen, dg_x, x_phys, f"{path}_grad.png", dims)
+                    if self.screenshot_grad:
+                        self._save_gradient_heatmap(gen, dg_x, x_phys, f"{path}_grad.png", dims)
                 except Exception as e:
                     print(f"[TOPOPT] gradient heatmap failed: {e}", flush=True)
                 t_shot = perf_counter() - t

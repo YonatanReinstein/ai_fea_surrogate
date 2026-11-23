@@ -23,8 +23,7 @@ import torch
 from scipy.spatial import cKDTree
 
 from training.dsig_data import DsigStatic, design_path
-from training.train_dsig import Batcher
-from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
+from training.train_dsig import Batcher, build_model
 
 
 def cos(a, b):
@@ -49,7 +48,7 @@ def main():
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     s = DsigStatic(args.data)
     s.ref_coords = ck["ref_coords"]
-    model = HierarchicalGNNCNN(**ck["model_kwargs"]).to(dev)
+    model = build_model(ck["model_kwargs"]).to(dev)
     model.set_tile_grid(s.NX, s.NY, 1)
     model.float()
     model.load_state_dict(ck["model"])

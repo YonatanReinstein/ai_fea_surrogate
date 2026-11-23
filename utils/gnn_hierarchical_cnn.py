@@ -81,8 +81,12 @@ class HierarchicalGNNCNN(nn.Module):
                  use_checkpoint=False, checkpoint_fine_only=False,
                  num_pos_nodes=0, dropout=0.0, node_target_mean=0.0, node_target_std=1.0,
                  stress_ks_rho_mpa=0.15, coarse_dim=None, cnn_depth=3,
-                 predict_node_grad=False, node_out_dim=1):
+                 predict_node_grad=False, node_out_dim=1, norm_mode="graph"):
         super().__init__()
+        # norm_mode "node": per-edge LayerNorm in the message MLPs, so each graph's
+        # output is independent of the batch; "graph" (the PyG default every
+        # earlier checkpoint was trained with) pools one mean/std over the whole
+        # batch -- see utils.gnn_surrogate.EdgeAttrConv.
         # node_out_dim: per-node outputs. 1 = von Mises stress, pooled to the
         # graph KS by ks_pool (every checkpoint before 2026-10-13). >1 (the
         # multi-load surrogate: displacement 3 + stress tensor 6) returns the
@@ -137,11 +141,11 @@ class HierarchicalGNNCNN(nn.Module):
 
         # Fine mesh (real<->real): one pass right after encoding (paired with
         # the encode bridge below), one final pass right after decoding.
-        self.fine_convs = nn.ModuleList([EdgeAttrConv(hidden_dim, edge_in_dim) for _ in range(2)])
+        self.fine_convs = nn.ModuleList([EdgeAttrConv(hidden_dim, edge_in_dim, norm_mode) for _ in range(2)])
         # Fine/coarse bridges -- the only two places a dimension projection
         # happens, same as HierarchicalGNNMP.
-        self.encode_conv = BipartiteEdgeAttrConv(hidden_dim, coarse_dim, edge_in_dim)  # real -> tile
-        self.decode_conv = BipartiteEdgeAttrConv(coarse_dim, hidden_dim, edge_in_dim)  # tile -> real
+        self.encode_conv = BipartiteEdgeAttrConv(hidden_dim, coarse_dim, edge_in_dim, norm_mode)  # real -> tile
+        self.decode_conv = BipartiteEdgeAttrConv(coarse_dim, hidden_dim, edge_in_dim, norm_mode)  # tile -> real
 
         # Level 1 — tile virtual nodes (native coarse_dim)
         self.tile_emb            = nn.Parameter(torch.zeros(coarse_dim))
@@ -216,7 +220,7 @@ class HierarchicalGNNCNN(nn.Module):
 
     def forward(self, x, edge_index, edge_attr, batch,
                 tile_idx=None, tile_NX=None, tile_NY=None, tile_NZ=None, tile_x=None,
-                num_graphs=None, node_id=None, return_node_grad=False, ks_mask=None):
+                num_graphs=None, node_id=None, return_node_grad=False, ks_mask=None, return_tile_h=False):
         N = x.size(0)
         if num_graphs is None:
             num_graphs = int(batch.max().item()) + 1 if N > 0 else 0
@@ -313,4 +317,9 @@ class HierarchicalGNNCNN(nn.Module):
                 "return_node_grad=True but the model was built with "
                 "predict_node_grad=False -- no grad_head exists")
             return graph_pred, node_pred, self.grad_head(h)
+        if return_tile_h:
+            # post-U-Net tile features (num_graphs*K, coarse_dim), tile_idx order;
+            # the load-linear surrogate gates its own tile stream with them
+            assert tile_idx is not None, "return_tile_h needs the tile grid path"
+            return graph_pred, node_pred, tile_h
         return graph_pred, node_pred
