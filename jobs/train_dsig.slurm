@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=train_dsig
-#SBATCH --output=%x_%j.log
-#SBATCH --error=%x_%j.log
+#SBATCH --output=logs/%x_%j.log
+#SBATCH --error=logs/%x_%j.log
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=128G
 #SBATCH --time=72:00:00

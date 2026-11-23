@@ -1,7 +1,7 @@
 """Exact shape adjoint for the KS-pooled von Mises stress: every per-tile
 sensitivity from ONE matrix factorization, at any tile count.
 
-WHY THIS EXISTS. ccx's *SENSITIVITY is already O(1) in tile count (3 solves),
+WHY THIS EXISTS. CalculiX's *SENSITIVITY is already O(1) in tile count (3 solves),
 but it builds d(K_e)/d(x) by FINITE-DIFFERENCING the element stiffness with a
 step of one element edge length -- the classic "semi-analytical" method. That
 differencing carries an error proportional to the element's rigid-body motion
@@ -15,7 +15,7 @@ evaluators/tile_gradient_map.py). On the 48-tile grid the same code gets
 Here d(K_e)/d(x) is not differenced at all. K_e(x) is written as a torch
 expression over the element's own node coordinates and reverse-mode
 autodiff supplies the derivative to machine precision, so the error term that
-breaks the ccx route cannot arise.
+breaks the CalculiX route cannot arise.
 
 THE ADJOINT. For KS = KS(u(X), X) with K(X) u = f:
 
@@ -32,33 +32,33 @@ is one batched backward pass over the elements; @KS/@X|_u and (@KS/@u)^T come
 from the same expression graph that computes KS.
 
 Per-tile values follow by the chain rule with the geometric Jacobian
-dX/dt from core.geometric_jacobian, exactly as the ccx route does -- that
+dX/dt from core.geometric_jacobian, exactly as the CalculiX route does -- that
 half was audited and is exact (of hollow_cube's 40320 moving nodes, none is
 shared between tiles, and a single-tile bump reproduces dX/dt to 1.00x).
 
-ELEMENT. C3D8I -- ccx's own, to 1.7e-5% -- with 2x2x2 Gauss. Wilson's three
+ELEMENT. C3D8I -- CalculiX's own, to 1.7e-5% -- with 2x2x2 Gauss. Wilson's three
 incompatible modes are added and statically condensed out, and autodiff
 differentiates straight through the 9x9 condensation, which is exactly what
-ccx's semi-analytical route cannot do and why *SENSITIVITY has to fall back to
+CalculiX's semi-analytical route cannot do and why *SENSITIVITY has to fall back to
 plain C3D8 for its gradient.
 
-Getting C3D8I to actually BE ccx's C3D8I turns on one detail with no
+Getting C3D8I to actually BE CalculiX's C3D8I turns on one detail with no
 principled answer, only an empirical one: how the incompatible modes are
-mapped to physical coordinates. ccx uses the Jacobian at the ELEMENT CENTRE
-and applies NO detJ0/detJ scaling. That was pinned by running ccx itself on a
+mapped to physical coordinates. CalculiX uses the Jacobian at the ELEMENT CENTRE
+and applies NO detJ0/detJ scaling. That was pinned by running CalculiX itself on a
 tapered, sheared, single-element-thick cantilever -- a shape on which the
 candidates separate hugely (C3D8 is 79% soft) where a regular parallelepiped
 would have shown nothing, J being constant there so every variant collapses
 onto the same matrix. Over nine distortions the centre-Jacobian-unscaled form
-tracks ccx to <2e-5%, while adding the detJ0/detJ factor (the Taylor form this
+tracks CalculiX to <2e-5%, while adding the detJ0/detJ factor (the Taylor form this
 file used to carry) costs up to 2.3% and mapping at the Gauss point instead
 (classic Wilson) up to 75%.
 
 This matters far more than a percent or two of element accuracy, because the
-error it removes is DESIGN-DEPENDENT. Plain C3D8 agreed with ccx to +0.3% at
+error it removes is DESIGN-DEPENDENT. Plain C3D8 agreed with CalculiX to +0.3% at
 hollow_cube's uniform t=0.30 start -- which is why every earlier validation of
 this file passed -- and drifted to reading 32% LOW by the time topopt job
-53474 had thinned the walls (adjoint 76 MPa against ccx's 100.4). A constant
+53474 had thinned the walls (adjoint 76 MPa against CalculiX's 100.4). A constant
 offset can be calibrated out; a drifting one cannot, and in 53474 it moved the
 constraint under the optimizer for 30 generations and then left it parked ~12%
 heavier than the true feasible frontier.
@@ -169,7 +169,7 @@ def element_stiffness(coords, E, nu, incompatible=True):
     solves use, and the reason plain C3D8 under-predicts peak stress here.
     Pass False only to reproduce a plain-C3D8 reference; it is not the
     element the rest of the pipeline runs on. See _bubble_B for the mapping
-    that makes this ccx's C3D8I rather than a lookalike.
+    that makes this CalculiX's C3D8I rather than a lookalike.
     """
     D = _elastic(E, nu).to(coords)
     B, detJ = _geom(coords)
@@ -221,7 +221,7 @@ def _bubble_B(coords):
     """Strain-displacement block of Wilson's three incompatible modes,
     (M,P,6,9), mapped with the Jacobian at the ELEMENT CENTRE and with NO
     detJ0/detJ scaling. That combination is not a matter of taste: it is the
-    one CalculiX implements, pinned by running ccx itself on a tapered and
+    one CalculiX implements, pinned by running CalculiX itself on a tapered and
     sheared single-element-thick cantilever (see the module header). Adding
     the detJ0/detJ factor -- the Taylor form this used to carry -- costs up to
     2.3% of tip deflection, and mapping with the Gauss-point Jacobian instead
@@ -241,8 +241,8 @@ class ShapeAdjoint:
     """Linear elastic solve + the exact d(ks_stress)/d(node coordinate), from
     one factorization.
 
-    Reproduces the boundary conditions Mesh._ccx_base_deck writes, so the
-    forward answer is comparable with the ccx path it is meant to replace:
+    Reproduces the boundary conditions the old CalculiX deck wrote (git fed57d9), so the
+    forward answer is comparable with the CalculiX path it is meant to replace:
     anchored nodes fully fixed, and the loaded nodes tied into ONE rigid body
     (translation + rotation) carrying the resultant force, which is
     CalculiX's *RIGID BODY and MAPDL's CERIG pilot.
@@ -287,7 +287,7 @@ class ShapeAdjoint:
         fixed = {self.index[n] for n in anchored_ids}
         # rigid_tie=False loads each node directly instead of through the
         # pilot -- not the production model, but the configuration in which
-        # this solver can be compared against a ccx deck one difference at a
+        # this solver can be compared against a CalculiX deck one difference at a
         # time.
         slave = ([self.index[n] for n in force_nodes if self.index[n] not in fixed]
                  if rigid_tie else [])
@@ -483,51 +483,6 @@ class ShapeAdjoint:
                    else Ws.grad.detach().numpy().copy())
         return gX_explicit + self.X.grad
 
-    def tile_gradient(self, dX_dt, elem_to_tile, tile_keys, NX, NY, NZ,
-                      rho_mpa=0.15):
-        """dims key -> d(ks_stress)/d(thickness), chaining the nodal gradient
-        with the geometric Jacobian exactly as the ccx route does.
-
-        rho_mpa MUST be the same sharpness the caller reported ks() at.
-        This defaulted to gradient()'s own 0.15 while the evaluator passed
-        its --stress_ks_rho_mpa to ks() only, so any run that changed rho
-        silently optimized one functional's value against a different
-        functional's gradient."""
-        from .tile_sensitivity import node_to_tile_map, tile_index_to_dims_key
-        g = self.gradient(rho_mpa).numpy()
-        elements = {e: [self.ids[i] for i in self.conn[k]]
-                    for k, e in enumerate(self.eids)}
-        n2t = node_to_tile_map(elements, elem_to_tile)
-        out = {k: 0.0 for k in tile_keys}
-        moved = {k: 0 for k in tile_keys}
-        for nid, dx in dX_dt.items():
-            t = n2t.get(nid)
-            if t is None:
-                continue
-            gi = g[self.index[nid]]
-            key = tile_index_to_dims_key(t, NX, NY, NZ, tile_keys)
-            out[key] += float(gi[0] * dx[0] + gi[1] * dx[1] + gi[2] * dx[2])
-            if max(abs(v) for v in dx) > 1e-9:
-                moved[key] += 1
-
-        # A tile none of whose nodes MOVE with its own design variable gets a
-        # contraction of exactly 0.0 -- not a small sensitivity, a structurally
-        # absent one. That is not a rounding artifact and it must never be
-        # returned quietly: OC reads dG=0 as B = -dG/(lambda dV) = 0 and sets
-        # x_new = x * B**eta = 0, so the tile is clipped to its FLOOR on the
-        # very next generation. hollow_cube shipped exactly this trap --
-        # model_lin.c clamps at HOLLOW_CUBE_MAX_THICKNESS 0.48 while dims.json
-        # allowed 0.49, so any tile OC pushed to the cap (the support corners
-        # first, having the strongest gradient) froze geometrically and then
-        # collapsed to 0.01. Fail loudly instead.
-        dead = [k for k, c in moved.items() if c == 0]
-        if dead:
-            raise AssertionError(
-                f"{len(dead)} tiles have no node that moves with their own "
-                f"thickness (e.g. {dead[:6]}) -- their sensitivity is "
-                "structurally zero, not small. Check the design variable "
-                "bounds against the CAD model's own clamps.")
-        return out
 
     def assert_tie_is_fixed(self, dX_dt, tol=1e-9):
         """The rigid tie is held constant through the derivative; that is only
@@ -611,7 +566,7 @@ class _SPDFactor:
 
 def _vm(S):
     """von Mises from the Voigt stress tensor (..., 6) in CalculiX's component
-    order -- the same expression utils.frd_parser applies to ccx's own output."""
+    order -- the same expression utils.frd_parser applies to CalculiX's own output."""
     sxx, syy, szz, sxy, sxz, syz = (S[..., i] for i in range(6))
     return torch.sqrt(0.5 * ((sxx - syy) ** 2 + (syy - szz) ** 2 + (szz - sxx) ** 2
                              + 6 * (sxy ** 2 + syz ** 2 + sxz ** 2)) + 1e-30)

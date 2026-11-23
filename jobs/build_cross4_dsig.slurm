@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=10G
 #SBATCH --time=12:00:00
-#SBATCH --output=logs_dsig/build_%A_%a.log
+#SBATCH --output=logs/build_cross4_dsig_%A_%a.log
 #
 # cross4_11x11 stress-sensitivity dataset (datasets/build_cross4_dsig_dataset.py):
 # 2500 designs (20% field / 40% high-contrast field / 40% two-level), 11 load

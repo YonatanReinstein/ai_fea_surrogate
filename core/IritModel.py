@@ -5,7 +5,6 @@ import os
 import subprocess
 import json
 from utils.read_inp import read_inp
-from utils.hex20 import hex8_to_hex20, quadratic_requested
 from pathlib import Path
 import platform
 
@@ -85,32 +84,8 @@ class IritModelBase(abc.ABC):
         )
         
 
-        #subprocess.run([
-        #    "powershell",
-        #    "-ExecutionPolicy", "Bypass",
-        #    "-File", f"{workspace_dir}/utils/itd_inp_converter.ps1",
-        #    "-U", str(U),
-        #    "-V", str(V),
-        #    "-W", str(W)
-        #], cwd=self.tmp_dir, check=True) 
         nodes, elements, elem_to_tile = read_inp(f"{self.tmp_dir}/model.inp")
-        # irit2inp only emits 8-node bricks. FEA_ELEMENT_TYPE=C3D20[R] asks
-        # for a second-order mesh, which is built here by adding the 12
-        # edge-midpoint nodes to every element -- see utils/hex20.py. Element
-        # ids and their first eight nodes are preserved, so elem_to_tile and
-        # every caller keyed on it are unaffected.
-        if quadratic_requested():
-            nodes, elements = hex8_to_hex20(nodes, elements)
         return nodes, elements, elem_to_tile
-
-    def get_dim_list(self) -> list:
-        dim_list = []
-        for key, value in self.dims_template.items():
-            if isinstance(value, dict) and "default" in value:
-                dim_list.append(value["default"])
-            else:
-                dim_list.append(value)
-        return dim_list
 
     def __del__(self):
         if self._debug:
@@ -119,21 +94,6 @@ class IritModelBase(abc.ABC):
     
 
 
-class IritModel(IritModelBase):    
-    def __import__script__(self, irt_script_path: str):
-        shutil.copy(irt_script_path, self.tmp_dir)
-
-    def __exec__script__(self):
-        self.__set_irit_dims__()
-        workspace_dir = os.getcwd()
-        subprocess.run([
-            "powershell",
-            "-ExecutionPolicy", "Bypass",
-            "-File", f"{workspace_dir}/utils/irit_script_execution.ps1",
-            "-irt_model_path", "model.irt",
-        ], cwd=self.tmp_dir, check=True)
-    
-    
 class IritCModel(IritModelBase):
     def __import__script__(self, irt_script_path: str):
         outline_path = irt_script_path.parent / "outline.itd"

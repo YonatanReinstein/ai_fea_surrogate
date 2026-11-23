@@ -57,9 +57,55 @@ import time
 import numpy as np
 import torch
 
-from datasets.build_cross4_multiload_dataset import batched_nodal_stress, dir_size_gb
-
 GEOMETRY = "cross4_11x11"
+
+
+def dir_size_gb(path):
+    tot = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                tot += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return tot / 1e9
+
+
+def batched_nodal_stress(sa, U):
+    """Nodal stress tensors (C,N,6) for C displacement fields U (C,N,3) at once
+    -- ShapeAdjoint.nodal_stress batched over load cases: each element's B,
+    detJ and incompatible-mode condensation (Kaa^-1 Kua^T) are built ONCE and
+    applied to every case (stress is linear in u), instead of per case."""
+    from core.fem_adjoint import _elastic, _geom, _bubble_B, _btdb, gauss_to_node
+    C = U.shape[0]
+    Ut = torch.as_tensor(np.ascontiguousarray(U.reshape(C, -1)))
+    acc = torch.zeros(C, sa.N, 6)
+    cnt = torch.zeros(sa.N)
+    mult = sa.e_scale if sa.stress_scale is None else sa.stress_scale
+    with torch.no_grad():
+        for a in range(0, len(sa.conn), sa.chunk):
+            blk = sa.conn[a:a + sa.chunk]
+            coords = sa.X[blk]
+            D = _elastic(sa.young, sa.poisson).to(coords)
+            B, detJ = _geom(coords)
+            ue = Ut[:, sa._dof(blk)]                                    # (C,m,24)
+            eps = torch.einsum("mplj,cmj->cmpl", B, ue)
+            if sa.incompatible:
+                Ba = _bubble_B(coords)
+                Kua = _btdb(B, D, Ba, detJ)
+                Kaa = _btdb(Ba, D, Ba, detJ)
+                M = torch.linalg.solve(Kaa, Kua.transpose(1, 2))       # Kaa^-1 Kua^T (m,9,24)
+                ae = -torch.einsum("maj,cmj->cma", M, ue)
+                eps = eps + torch.einsum("mpla,cma->cmpl", Ba, ae)
+            sig = torch.einsum("kl,cmpl->cmpk", D, eps)
+            sn = torch.einsum("np,cmpk->cmnk", gauss_to_node().to(coords), sig)
+            sn = sn * torch.as_tensor(mult[a:a + sa.chunk])[None, :, None, None]
+            flat = torch.as_tensor(blk.reshape(-1))
+            acc.index_add_(1, flat, sn.reshape(C, -1, 6))
+            cnt.index_add_(0, flat, torch.ones(len(flat)))
+    return acc / cnt[None, :, None].clamp(min=1)
+
+
 REQUIRED_ENV = {"FEA_LOAD_MODE": "tile_nodes", "FEA_LOAD_WEIGHT": "pyramid",
                 "CROSS4_LOAD_PAD_THICKNESS": "0"}
 
@@ -76,7 +122,7 @@ def load_spec(bc, row, F):
 def sample_mix(n, seed, frac=(0.2, 0.4, 0.4), amp=(0.05, 0.5), amp_hc=(0.5, 2.0), sigma_hc=(1.0, 4.0), t_min=None):
     """n designs from three samplers, kinds shuffled over the indices (so any
     prefix of the list has the same mix):
-      field      datasets.build_tile_load_dataset.sample_designs' correlated
+      field      datasets.design_sampling.sample_designs' correlated
                  field (sigma 1-12, amplitude amp): near-uniform designs
       field_hc   the same field with short correlation (sigma_hc) and large
                  amplitude (amp_hc): strong contrast over the full range
@@ -84,8 +130,8 @@ def sample_mix(n, seed, frac=(0.2, 0.4, 0.4), amp=(0.05, 0.5), amp_hc=(0.5, 2.0)
     Each family's anchor volume is drawn uniform in volume, as in sample_designs.
     t_min raises dims.json's thickness floor for all three."""
     from scipy.stats import qmc
-    from datasets.build_tile_load_dataset import sample_designs, volume_at
-    from datasets.dataset_builder import _build_or_load_volume_inverse, _sample_correlated_field
+    from datasets.design_sampling import (sample_designs, volume_at,
+                                          _build_or_load_volume_inverse, _sample_correlated_field)
     bc = importlib.import_module(f"data.{GEOMETRY}.boundary_conditions")
     NX, NY, NZ = bc.tile_grid()
     keys = [f"d{i + 1}" for i in range(NX * NY * NZ)]

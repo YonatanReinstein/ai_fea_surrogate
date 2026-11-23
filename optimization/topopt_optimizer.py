@@ -13,7 +13,7 @@ class TopologyOptimizer:
     """Optimality-criteria (OC) optimizer over per-tile thicknesses.
 
     Problem: minimize volume V(x) subject to G(x) = stress/yield - 1 <= 0 and
-    lo <= x <= hi, with exact sensitivities from `gradient_func` (the ccx
+    lo <= x <= hi, with exact sensitivities from `gradient_func` (the fem
     shape adjoint or a surrogate's autodiff):
 
         gradient_func(dims) -> (volume, stress, yield, dV_dx: dict, dG_dx: dict)
@@ -36,7 +36,7 @@ class TopologyOptimizer:
 
     This replaces a version (commit 7bf07d9) built when the gradients were
     finite differences or an unreliable surrogate: trust sets that throttled
-    "noisy" tiles to 10% of a step, rolling ccx calibration, gradient
+    "noisy" tiles to 10% of a step, rolling solver calibration, gradient
     magnitude calibration, surrogate-reload re-anchoring, the online-learning
     label spool, the FD sweep, a density/projection mode and three sharpening
     modes. With exact gradients those mostly froze tiles that had real signal.
@@ -70,7 +70,7 @@ class TopologyOptimizer:
     20 generations with the loaded tile's OC ratio > 1 the whole time.
     """
 
-    def __init__(self, fitness_func, dims_dict, gradient_func, generations=200,
+    def __init__(self, dims_dict, gradient_func, generations=200,
                  geometry="hollow_cube", move_limit=0.2, oc_eta=0.5,
                  filter_target="none", filter_radius=1.5,
                  filter_radius_end=None, filter_decay_start=0, filter_decay_gens=0,
@@ -83,16 +83,12 @@ class TopologyOptimizer:
                  stagnation_gens=0, init_thickness=None, stop_at_gen=None,
                  screenshot_heatmap=True, screenshot_every=1, reference_gradient=None,
                  screenshot_stress=None, screenshot_grad=True):
-        if gradient_func is None:
-            raise ValueError("TopologyOptimizer needs a gradient_func (ccx adjoint/axis or a "
-                             "surrogate); the finite-difference sweep was removed (commit 7bf07d9 has it)")
         if sharpen not in ("none", "skeleton"):
             raise ValueError(f"sharpen {sharpen!r}: use none | skeleton")
         if sharpen != "none" and filter_target not in ("design", "density"):
             raise ValueError("sharpening needs filter_target='design' or 'density'")
         if filter_target not in ("none", "gradient", "design", "density"):
             raise ValueError(f"filter_target {filter_target!r}: use none | gradient | design | density")
-        self.fitness_func = fitness_func          # kept for interface parity; unused here
         self.gradient_func = gradient_func
         # Optional dims -> {dim: dG} from an exact solver (surrogate runs): drawn
         # next to the OC gradient in each screenshot's gradient heatmap.
@@ -161,12 +157,12 @@ class TopologyOptimizer:
         self.g_backoff = g_backoff
         self.stagnation_gens = int(stagnation_gens)
         self.init_thickness = init_thickness
-        # Each screenshot re-solves the design with ccx (heatmap) and usually
+        # Each screenshot re-solves the design with fem_adjoint (heatmap) and usually
         # costs more than the gradient call; render every Nth generation.
         self.screenshot_heatmap = screenshot_heatmap
         self.screenshot_every = max(1, screenshot_every)
         # Optional (dims, node_ids, coords) -> nodal von Mises MPa: colours the
-        # screenshot from the surrogate instead of a ccx re-solve. screenshot_grad
+        # screenshot from the surrogate instead of a fem re-solve. screenshot_grad
         # =False skips the _grad.png panel (its solver column is an exact solve).
         self.screenshot_stress = screenshot_stress
         self.screenshot_grad = screenshot_grad
@@ -499,7 +495,7 @@ class TopologyOptimizer:
         img = lambda v: np.asarray(v, dtype=float)[perm].reshape(NZ, NY, NX)[NZ // 2]
         fields = [("surrogate dG/dx used by OC" if ref is not None else "dG/dx used by OC", dg)]
         if ref is not None:
-            fields.append(("solver (ccx adjoint) dG/dx", ref))
+            fields.append(("solver (fem adjoint) dG/dx", ref))
         fig, axes = plt.subplots(len(fields) + 1, 1, figsize=(13, 3.2 * (len(fields) + 1)))
         for ax, (name, v) in zip(axes, fields):
             lim = float(np.percentile(np.abs(v), 98)) or float(np.abs(v).max()) or 1.0

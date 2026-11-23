@@ -31,7 +31,7 @@ def mesh_resolution() -> tuple[int]:
     # an inherited env var is. Each tile is a hollow tube whose wall is
     # subdivided (U-1) x (V-1) x (W-1), so (3,3,3) puts only TWO elements
     # through the wall -- fine for the forward stress, but the axis/adjoint
-    # shape sensitivity needs >= 5 (see Mesh.solve_ccx_axis_gradient).
+    # shape sensitivity needs >= 5 (git fed57d9, Mesh.solve_ccx_axis_gradient).
     v = os.environ.get("FEA_MESH_RES")
     if v:
         u, vv, w = (int(t) for t in v.split(","))

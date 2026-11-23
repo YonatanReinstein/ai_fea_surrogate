@@ -7,7 +7,7 @@ from core.node import Node
 #
 # WHY THIS EXISTS. hollow_cube is a 40 x 21 x 1 part on a 40x21x1 grid = 840
 # tiles, which at mesh_resolution (3,3,3) is 48 249 nodes / 26 880 elements and
-# costs ~35-46 s per ccx adjoint. This part is 121 tiles of the same 1x1x1 size,
+# costs ~35-46 s per fem adjoint. This part is 121 tiles of the same 1x1x1 size,
 # so the mesh is ~1/7 as large and the adjoint -- one scipy splu factorization,
 # which dominates -- drops to a few seconds.
 #
@@ -60,8 +60,8 @@ def load_row() -> int:
     """Tile row (0 = bottom .. NY-1 = top) of the free-end face that carries
     the load. Default the middle row, the production load. FEA_LOAD_ROW
     overrides it -- an env var, like FEA_MESH_RES, because force_pattern runs
-    inside worker processes. GNNEvaluator reads the same variable for a
-    tile-load model's load tile, so the surrogate and the ccx reference /
+    inside worker processes. GNNDsigEvaluator reads the same variable for
+    the row it predicts, so the surrogate and the fem reference /
     screenshots load the same tile."""
     rows = load_rows()
     # callers of load_row() assume ONE loaded tile (load_tile/load_nbhd KS
@@ -100,7 +100,7 @@ def mesh_resolution() -> tuple[int]:
     # ProcessPoolExecutor workers (force_pattern normalises the load by it),
     # where a parent monkeypatch would not be visible but an inherited env var
     # is. Default (4,4,2) since 2026-10-14 (was (3,3,3), hollow_cube's
-    # default and what the ccx adjoint was validated at); each tile wall gets
+    # default and what the fem adjoint was validated at); each tile wall gets
     # (U-1)x(V-1)x(W-1) elements, and depth resolution barely matters here
     # (the stress is in-plane).
     v = os.environ.get("FEA_MESH_RES")

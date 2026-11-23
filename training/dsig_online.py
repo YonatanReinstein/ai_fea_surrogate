@@ -1,6 +1,6 @@
 """Synchronous on-trajectory fine-tuning of the superposing stress surrogate
-(training/train_dsig.py checkpoints) inside a topopt run, the dsig analogue of
-training/multiload_online.py.
+(training/train_dsig.py checkpoints) inside a topopt run (successor of the
+old training/multiload_online.py, git fed57d9).
 
 Every DSIG_FT_EVERY-th design the optimizer asks GNNDsigEvaluator about, before
 the surrogate evaluates it:

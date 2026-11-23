@@ -3,7 +3,7 @@
 loads of cross4_11x11.
 
 compute_topopt_gradient(dims) -> (volume, stress_MPa, yield, dV/dt, dG/dt), the
-same contract as CCXEvaluator.
+same contract as FEMEvaluator.
 
 The model predicts, per load row k, the nodal stress tensor S_k(t) as a
 function of the tile thicknesses t only. Rows with a nonzero weight run as one
@@ -13,7 +13,7 @@ batched forward pass, and stress is linear in the load, so:
     DSIG_COMBINE=envelope             each row is its own load case, scaled by
         w_k: G = KS over the per-case KS values (same rho), i.e. the worst case
 DSIG_LOAD_WEIGHTS=w0,...,w10 sets the weights; without it FEA_LOAD_ROW must name
-a single row (one-hot), which makes this directly comparable with a ccx run at
+a single row (one-hot), which makes this directly comparable with a fem run at
 that row. Stress is then scaled by FEA_LOAD_N / the dataset's load_N.
 KS runs over every node except the anchored pad, rho = stress_ks_rho_mpa,
 exactly as the training labels.
@@ -36,7 +36,7 @@ import os
 import numpy as np
 import torch
 
-from training.train_multiload import von_mises
+from training.dsig_data import von_mises
 
 from .base_evaluator import BaseEvaluator
 
@@ -87,7 +87,7 @@ class GNNDsigEvaluator(BaseEvaluator):
         else:
             rows = bc.load_rows()
             assert len(rows) == 1, (f"FEA_LOAD_ROW={rows}: several rows are ONE pyramid over the combined "
-                                    "region in ccx, not a superposition -- set DSIG_LOAD_WEIGHTS instead")
+                                    "region in the fem solve, not a superposition -- set DSIG_LOAD_WEIGHTS instead")
             w = np.zeros(C); w[rows[0]] = 1.0
         self.weights = w
         self.used = [k for k in range(C) if w[k] != 0.0]
@@ -161,7 +161,7 @@ class GNNDsigEvaluator(BaseEvaluator):
     @torch.no_grad()
     def node_von_mises(self, dims, node_ids, X):
         """Surrogate nodal von Mises (MPa) at X (N,3), node_ids in the same order,
-        for screenshots that skip the ccx solve. Combines the used rows the same
+        for screenshots that skip the fem solve. Combines the used rows the same
         way _combine does: superpose -> von Mises of the weighted sum, else the
         per-node max over the weighted cases."""
         dims = {k: float(dims[k]) for k in self.dims_keys}
@@ -195,7 +195,7 @@ class GNNDsigEvaluator(BaseEvaluator):
             self.ft.maybe_update(dims)
         Xnp, ids, D_tile = self._mesh(dims)
         G, peak, gt = self.predict(dims, Xnp)
-        # the constraint is the raw KS, as in CCXEvaluator; the peak is only logged
+        # the constraint is the raw KS, as in FEMEvaluator; the peak is only logged
         # volume = sum of hex Gauss-point detJ (unit weights), chained through dX/dt
         Xv = torch.tensor(Xnp, dtype=torch.float64, requires_grad=True)
         _, detJ = _geom(Xv[torch.as_tensor(self.static.elements)])

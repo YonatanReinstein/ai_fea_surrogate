@@ -26,7 +26,17 @@ import numpy as np
 import torch
 
 from core.tile_sensitivity import dims_key_order_permutation
-from training.multiload_data import HEX_EDGES
+
+# the 12 edges of an 8-node hex, as local node-index pairs
+HEX_EDGES = ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
+             (0, 4), (1, 5), (2, 6), (3, 7))
+
+
+def von_mises(S):
+    """von Mises from Voigt (..., 6) stress (sxx, syy, szz, sxy, sxz, syz)."""
+    sxx, syy, szz, sxy, sxz, syz = (S[..., i] for i in range(6))
+    return torch.sqrt(0.5 * ((sxx - syy) ** 2 + (syy - szz) ** 2 + (szz - sxx) ** 2)
+                      + 3.0 * (sxy ** 2 + sxz ** 2 + syz ** 2) + 1e-12)
 
 
 class DsigStatic:
@@ -144,7 +154,7 @@ def mirror_maps(static):
     ix, iy = np.meshgrid(np.arange(NX), np.arange(NY), indexing="ij")
     tmir = (ix * NY + (NY - 1 - iy)).reshape(-1)
     path = sorted(glob.glob(os.path.join(static.root, "exact_uniform_*.npz")))
-    assert path, "mirror_maps needs a uniform design's mesh: run analysis/probe_dsig_uniform.py once"
+    assert path, "mirror_maps needs a uniform design's mesh: recover analysis/probe_dsig_uniform.py from git history (fed57d9) and run it once"
     X = np.load(path[0])["coords"]
     d, nmir = cKDTree(X).query(X * np.array([1.0, -1.0, 1.0]) + np.array([0.0, NY * static.ty, 0.0]))
     assert d.max() < 1e-6 and len(np.unique(nmir)) == static.N, "uniform mesh is not mirror-symmetric"

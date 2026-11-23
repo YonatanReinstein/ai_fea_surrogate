@@ -1,4 +1,0 @@
-{
-    "width": {"default": 3.0, "min": 1.0, "max": 10.0},
-    "height": {"default": 4.0, "min": 1.0, "max": 10.0}
-}

@@ -38,7 +38,6 @@ import argparse
 import collections
 import copy
 import json
-import math
 import os
 import random
 import time
@@ -48,7 +47,7 @@ import torch
 
 from training.dsig_data import (DsigStatic, DesignDataset, available_designs, design_ks, design_path,
                                 mirror_case, mirror_maps)
-from training.train_multiload import von_mises
+from training.dsig_data import von_mises
 from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
 from utils.gnn_load_linear import LoadLinearGNNCNN
 
