@@ -95,6 +95,12 @@ def run_optimization(geometry_name, arch="mlp", pop_size=30, generations=40, scr
         t_min = float(os.environ["TOPOPT_T_MIN"])
         dims_dict = {k: (dict(v, min=t_min) if v["max"] > v["min"] else v) for k, v in dims_dict.items()}
         print(f"[optimize_dims] tile floor lowered to {t_min} (TOPOPT_T_MIN)", flush=True)
+    # TOPOPT_T_MAX: lower every free tile's ceiling the same way (optimizer only).
+    if os.environ.get("TOPOPT_T_MAX"):
+        t_max = float(os.environ["TOPOPT_T_MAX"])
+        dims_dict = {k: (dict(v, max=t_max, default=min(v["default"], t_max)) if v["max"] > v["min"] else v)
+                     for k, v in dims_dict.items()}
+        print(f"[optimize_dims] tile ceiling lowered to {t_max} (TOPOPT_T_MAX)", flush=True)
 
     if optimizer == "cma":
         from .cma_optimizer import CMAOptimizer

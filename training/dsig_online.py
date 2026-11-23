@@ -93,6 +93,8 @@ class DsigOnlineFT:
         self.hi = np.array([dj[k]["max"] for k in ev.dims_keys])
         if os.environ.get("TOPOPT_T_MIN"):
             self.lo = np.maximum(self.lo, float(os.environ["TOPOPT_T_MIN"]))
+        if os.environ.get("TOPOPT_T_MAX"):
+            self.hi = np.minimum(self.hi, float(os.environ["TOPOPT_T_MAX"]))
         ck = torch.load(ev.ckpt_path, map_location="cpu", weights_only=False)
         self.sob_weight = float(ck["args"]["sob_weight"])
         self.sob_dirs = int(ck["args"]["sob_dirs"])
