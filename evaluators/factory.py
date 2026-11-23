@@ -14,10 +14,6 @@ def get_evaluator(geometry_name, arch="mlp", screenshots: bool = False, processe
         return GNNEvaluator(geometry_name, screenshots=screenshots, processes=processes, batch_size=batch_size,
                              heatmap_base_only=heatmap_base_only, ckpt_path=gnn_ckpt_path,
                              stress_ks_rho_mpa=stress_ks_rho_mpa)
-    elif arch == "gnn_multiload":
-        from .gnn_multiload_evaluator import GNNMultiLoadEvaluator
-        return GNNMultiLoadEvaluator(geometry_name, ckpt_path=gnn_ckpt_path,
-                                     stress_ks_rho_mpa=stress_ks_rho_mpa, mesh_threads=mesh_threads)
     elif arch == "gnn_dsig":
         from .gnn_dsig_evaluator import GNNDsigEvaluator
         return GNNDsigEvaluator(geometry_name, ckpt_path=gnn_ckpt_path,
