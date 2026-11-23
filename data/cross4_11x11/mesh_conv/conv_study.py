@@ -2,7 +2,7 @@
 
 For each design and each mesh resolution (U,V,W per IRIT piece), solve all 22
 dataset load cases on one factorization (same physics as
-training.build_cross4_multiload_dataset.solve_design) and save:
+datasets.build_cross4_multiload_dataset.solve_design) and save:
   per case: max_vm, max_vm_excl (loaded tile excluded), ks (rho .25/MPa),
             per-tile max von Mises (121), location of the global max
   x = 0 face: node coords + nodal stress (for field comparison vs a reference)
@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.getcwd())
-from training.build_cross4_multiload_dataset import load_spec, batched_nodal_stress, DIRS, GEOMETRY
+from datasets.build_cross4_multiload_dataset import load_spec, batched_nodal_stress, DIRS, GEOMETRY
 
 
 def solve_res(m, res, bc, cases, F, rho_mpa=0.25):

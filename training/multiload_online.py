@@ -52,7 +52,7 @@ def _label_one(args):
     """Worker: exact stress for one design, one case. Runs in a fresh process."""
     dims, row, direction, F, threads = args
     torch.set_num_threads(threads)
-    from training.build_cross4_multiload_dataset import solve_design
+    from datasets.build_cross4_multiload_dataset import solve_design
     bc = importlib.import_module("data.cross4_11x11.boundary_conditions")
     t0 = time.time()
     s, _ = solve_design(dims, bc, [(row, direction)], F, 0.25)

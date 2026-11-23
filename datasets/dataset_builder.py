@@ -5,7 +5,7 @@ from scipy.interpolate import PchipInterpolator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
-from training import dataset_io
+from datasets import dataset_io
 print("Starting dataset_builder.py", flush=True)
 import socket
 print(f"Running on hostname: {socket.gethostname()}", flush=True)
@@ -694,7 +694,7 @@ def build_dataset(
 
     if engine == "ccx":
         # Sharded format: never load the full historical dataset into RAM here
-        # (see training/dataset_io.py) -- just a one-time migration of any
+        # (see datasets/dataset_io.py) -- just a one-time migration of any
         # pre-existing single-file dataset.pt. No metadata.json is read or
         # written on this path (see _write_checkpoint).
         migrated = dataset_io.migrate_legacy_dataset(dataset_dir)
@@ -956,7 +956,7 @@ def build_dataset(
 
         # Only the current, not-yet-flushed shard lives in RAM. Once a shard
         # hits shard_size it's saved to its own file and dropped (see
-        # training/dataset_io.py) -- the historical dataset is never held
+        # datasets/dataset_io.py) -- the historical dataset is never held
         # resident here, so RAM stays bounded regardless of num_samples.
         current_shard = []
         shard_start = completed

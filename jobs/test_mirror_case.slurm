@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=probe_dsig_unif
+#SBATCH --job-name=test_mirror
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=48G
 #SBATCH --time=1:00:00
@@ -14,4 +14,4 @@ export PATH="$PWD/irit/bin:$PATH" IRIT_PATH="$PWD/irit/bin/" IRIT_TMP=/tmp/irit_
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONUNBUFFERED=1
 export CROSS4_LEG_RULE=avg CROSS4_FIXED_END_RADIUS=0 FEA_LOAD_MODE=tile_nodes FEA_LOAD_WEIGHT=pyramid
 export CROSS4_PAD_THICKNESS=0.1 CROSS4_LOAD_PAD_THICKNESS=0 FEA_MESH_RES=4,4,2 FEA_LOAD_N=5e7
-python -m evaluators.probe_dsig_uniform --ckpt "$CKPT" --t "${T:-0.2}"
+python -m tests.test_mirror_case

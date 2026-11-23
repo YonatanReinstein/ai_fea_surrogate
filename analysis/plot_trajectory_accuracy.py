@@ -9,7 +9,7 @@ Control for the gradient panel: the cosine of a CONSTANT predictor, gen 0's
 ccx dG reused at every generation. The surrogate's cosine only means something
 where it beats that line (see feedback_dg_metrics_need_a_control).
 
-    python -m optimization.plot_trajectory_accuracy --labels onpolicy/RUN/labels \
+    python -m analysis.plot_trajectory_accuracy --labels onpolicy/RUN/labels \
         --out optimization/artifacts_RUN/trajectory_accuracy.png
 """
 import argparse

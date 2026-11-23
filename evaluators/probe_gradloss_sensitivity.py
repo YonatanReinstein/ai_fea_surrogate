@@ -21,7 +21,7 @@ import importlib
 import torch
 from torch_geometric.data import Batch
 
-from training.dataset_io import load_dataset
+from datasets.dataset_io import load_dataset
 from training.gnn_training import gnn_input_fn, LOG_STRESS_EPS
 from utils.gnn_surrogate import GNN, HierarchicalGNN
 from utils.gnn_hierarchical_mp import HierarchicalGNNMP

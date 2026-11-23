@@ -43,7 +43,7 @@ Layout of --output_dir:
 K follows dims.json key order (d1..dK); tile index of key d{k+1} is NOT k --
 use core.tile_sensitivity.tile_index_to_dims_key.
 
-    python -m training.build_cross4_dsig_dataset --output_dir DIR --num_designs 2500 --claim
+    python -m datasets.build_cross4_dsig_dataset --output_dir DIR --num_designs 2500 --claim
 """
 import argparse
 import hashlib
@@ -57,7 +57,7 @@ import time
 import numpy as np
 import torch
 
-from training.build_cross4_multiload_dataset import batched_nodal_stress, dir_size_gb
+from datasets.build_cross4_multiload_dataset import batched_nodal_stress, dir_size_gb
 
 GEOMETRY = "cross4_11x11"
 REQUIRED_ENV = {"FEA_LOAD_MODE": "tile_nodes", "FEA_LOAD_WEIGHT": "pyramid",
@@ -76,7 +76,7 @@ def load_spec(bc, row, F):
 def sample_mix(n, seed, frac=(0.2, 0.4, 0.4), amp=(0.05, 0.5), amp_hc=(0.5, 2.0), sigma_hc=(1.0, 4.0), t_min=None):
     """n designs from three samplers, kinds shuffled over the indices (so any
     prefix of the list has the same mix):
-      field      training.build_tile_load_dataset.sample_designs' correlated
+      field      datasets.build_tile_load_dataset.sample_designs' correlated
                  field (sigma 1-12, amplitude amp): near-uniform designs
       field_hc   the same field with short correlation (sigma_hc) and large
                  amplitude (amp_hc): strong contrast over the full range
@@ -84,8 +84,8 @@ def sample_mix(n, seed, frac=(0.2, 0.4, 0.4), amp=(0.05, 0.5), amp_hc=(0.5, 2.0)
     Each family's anchor volume is drawn uniform in volume, as in sample_designs.
     t_min raises dims.json's thickness floor for all three."""
     from scipy.stats import qmc
-    from training.build_tile_load_dataset import sample_designs, volume_at
-    from training.dataset_builder import _build_or_load_volume_inverse, _sample_correlated_field
+    from datasets.build_tile_load_dataset import sample_designs, volume_at
+    from datasets.dataset_builder import _build_or_load_volume_inverse, _sample_correlated_field
     bc = importlib.import_module(f"data.{GEOMETRY}.boundary_conditions")
     NX, NY, NZ = bc.tile_grid()
     keys = [f"d{i + 1}" for i in range(NX * NY * NZ)]

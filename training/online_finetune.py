@@ -149,7 +149,7 @@ def main():
     from evaluators.gnn_evaluator import GNNEvaluator, _run_sample_worker
     from evaluators.probe_gradloss_sensitivity import load_model
     from training.gnn_training import gnn_input_fn
-    from training.dataset_io import load_dataset
+    from datasets.dataset_io import load_dataset
     from core.tile_sensitivity import dims_key_order_permutation
     import importlib
     bc = importlib.import_module(f"data.{a.geometry}.boundary_conditions")

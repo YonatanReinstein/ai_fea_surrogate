@@ -40,7 +40,7 @@ max_stress and grad_dks_dx follow it, node_stress is the full field, and
 ks_stress_all keeps the all-node KS. Anything that computes KS from a model or
 a solve for these samples must apply the same mask.
 
-    python -m training.build_tile_load_dataset --geometry hollow_cube_11x11 \
+    python -m datasets.build_tile_load_dataset --geometry hollow_cube_11x11 \
         --num_geometries 100 --output_dir data/hollow_cube_11x11/dataset_tileload_pilot
 """
 import argparse
@@ -67,7 +67,7 @@ def sample_designs(geometry, n, seed, two_level_frac, amp_range, t_min=None):
     members-on-background two-level designs. t_min raises dims.json's floor
     (and the anchor volume's lower end with it)."""
     from scipy.stats import qmc
-    from training.dataset_builder import (_build_or_load_volume_inverse,
+    from datasets.dataset_builder import (_build_or_load_volume_inverse,
                                           _sample_correlated_field, _sample_two_level)
     base = f"data/{geometry}"
     tmpl = json.load(open(f"{base}/CAD_model/dims.json"))
@@ -343,7 +343,7 @@ def main():
     cfg = {"geometry": args.geometry, "rho_mpa": args.stress_ks_rho_mpa, "ks_exclude": args.ks_exclude,
            "mesh_threads": args.mesh_threads, "graph_path": graph_src}
 
-    from training import dataset_io
+    from datasets import dataset_io
     t0 = time.time()
     results, stats_all, n_written, failures = {}, [], 0, []
     next_idx = 0

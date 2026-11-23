@@ -12,7 +12,7 @@ from torch_geometric.utils import scatter
 from utils.gnn_surrogate import GNN, HierarchicalGNN
 from utils.gnn_hierarchical_mp import HierarchicalGNNMP
 from utils.gnn_hierarchical_cnn import HierarchicalGNNCNN
-from training.dataset_io import load_dataset, load_shard, shard_paths
+from datasets.dataset_io import load_dataset, load_shard, shard_paths
 from core.tile_sensitivity import dims_key_order_permutation
 
 
@@ -311,7 +311,7 @@ def train_gnn_model(
                 f"edge_attr has {sample.edge_attr.shape[0]} edges but graph.pt has {_graph_edge_index.shape[1]}")
             sample.edge_index = _graph_edge_index
             sample.tile_idx = _graph_tile_idx
-        # Tile-load samples (training/build_tile_load_dataset.py) carry the
+        # Tile-load samples (datasets/build_tile_load_dataset.py) carry the
         # load as a TILE input instead: drop the per-node force columns here,
         # and the load goes into tile_x below. Older single-load datasets keep
         # the node force feature, converted to MN.
@@ -656,7 +656,7 @@ def train_gnn_model(
 
     # ----------------------------------------------------
     # Gradient-matching dataset (optional) -- ground-truth per-tile FD
-    # sensitivity labels from training/dataset_builder.py's --grad_mode
+    # sensitivity labels from datasets/dataset_builder.py's --grad_mode
     # (base ccx run + N single-tile-perturbed reruns, FD'd against the real
     # solver). Kept in its own dataset/DataLoader, never merged into
     # train_set/val_set: PyG's Batch collation decides which attrs to batch
@@ -724,7 +724,7 @@ def train_gnn_model(
                 _preprocess(sample)
         assert grad_dataset and hasattr(grad_dataset[0], "grad_tile_idx"), (
             f"{grad_dataset_path} has no grad_tile_idx/grad_dks_dx samples -- build it with "
-            f"training/dataset_builder.py --grad_mode true (or jobs/build_grad_dataset_hollow_cube.slurm)"
+            f"datasets/dataset_builder.py --grad_mode true (or jobs/build_grad_dataset_hollow_cube.slurm)"
         )
         grad_M = int(grad_dataset[0].grad_tile_idx.shape[0])
         K_tiles = int(grad_dataset[0].tile_NX) * int(grad_dataset[0].tile_NY) * int(grad_dataset[0].tile_NZ)
@@ -1184,7 +1184,7 @@ def train_gnn_model(
                 # Gradient-matching (Sobolev) loss: penalize the surrogate's
                 # own autodiff sensitivity d(ks_stress)/d(tile thickness) for
                 # deviating from the ground-truth FD sensitivity computed on
-                # the real solver (see training/dataset_builder.py's
+                # the real solver (see datasets/dataset_builder.py's
                 # --grad_mode). Folded into the SAME combined `loss` below,
                 # backed by a single outer loss.backward() call -- this
                 # "inner autograd.grad(create_graph=True), then one outer
@@ -1665,7 +1665,7 @@ if __name__ == "__main__":
     parser.add_argument("--stress_ks_rho_mpa", default=0.15, type=float,
                         help="KS aggregation sharpness (1/MPa) for the graph target/prediction. "
                              "Must match the rho the dataset's ks_stress was built with "
-                             "(see training/dataset_builder.py --stress_ks_rho_mpa).")
+                             "(see datasets/dataset_builder.py --stress_ks_rho_mpa).")
     parser.add_argument("--use_compile", type=_bool, default=True,
                         help="Wrap the model in torch.compile (fuses the gather/cat/elementwise "
                              "ops around each EdgeAttrConv). No-op on CPU. Pass false to disable "
@@ -1705,10 +1705,10 @@ if __name__ == "__main__":
                              "shards (4,100 samples), which memorised by ~epoch 5.")
     parser.add_argument("--grad_dataset_path", default=None, type=str,
                         help="Path to a gradient-matching dataset built with "
-                             "training/dataset_builder.py --grad_mode true, e.g. "
+                             "datasets/dataset_builder.py --grad_mode true, e.g. "
                              "data/hollow_cube/dataset_grad/dataset.pt (nominal filename -- "
                              "actual sharded data lives under .../dataset_grad/shards/, same "
-                             "convention as --dataset, see training/dataset_io.py). Adds a "
+                             "convention as --dataset, see datasets/dataset_io.py). Adds a "
                              "Sobolev-style loss term "
                              "that matches the surrogate's own autodiff sensitivity "
                              "d(ks_stress)/d(tile thickness) against ground-truth FD sensitivities "

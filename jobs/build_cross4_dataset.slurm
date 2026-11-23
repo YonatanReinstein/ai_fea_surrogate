@@ -9,7 +9,7 @@
 #SBATCH --output=%x_%j.log
 #SBATCH --error=%x_%j.log
 #
-# cross4_11x11 dataset (training/build_cross4_dataset.py): every design solved
+# cross4_11x11 dataset (datasets/build_cross4_dataset.py): every design solved
 # with the load on each free-end tile row, on the cross4 topopt pipeline
 # (pads, rule rounding, C3D8I adjoint, exact per-tile dKS/dt). One process per
 # core, ~2 GB each. Resumable: resubmit with the same OUT and SEED and finished
@@ -49,7 +49,7 @@ echo "FEA_LOAD_N=$FEA_LOAD_N FEA_MESH_RES=$FEA_MESH_RES pads $CROSS4_PAD_THICKNE
 SCREEN_ROW="${SCREEN_ROW:-5}"
 SCREEN_MAX_KS="${SCREEN_MAX_KS:-300}"
 build() {
-    python -u -m training.build_cross4_dataset \
+    python -u -m datasets.build_cross4_dataset \
         --num_geometries "${NUM_GEOMETRIES}" \
         --workers "${WORKERS}" \
         --seed "${SEED}" \

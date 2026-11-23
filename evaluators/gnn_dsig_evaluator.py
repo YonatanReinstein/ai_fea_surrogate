@@ -24,7 +24,7 @@ its tile Jacobian are still built every call, for the exact volume and dV/dt
 (and the pyramid load weights, which the labels hold fixed).
 
 DSIG_EXACT_CHECK_EVERY=N: every Nth design is also solved exactly
-(training.build_cross4_dsig_dataset.solve_design: S and dS/dt of every used
+(datasets.build_cross4_dsig_dataset.solve_design: S and dS/dt of every used
 row, then the same combination), and the true G and gradient cosine are
 printed next to the surrogate's. Needs the dataset's env (FEA_LOAD_MODE=
 tile_nodes, FEA_LOAD_WEIGHT=pyramid, CROSS4_LOAD_PAD_THICKNESS=0).
@@ -219,7 +219,7 @@ class GNNDsigEvaluator(BaseEvaluator):
         key = tuple(float(dims[k]) for k in self.dims_keys)
         if self._exact_last is not None and self._exact_last[0] == key:
             return self._exact_last[1]
-        from training.build_cross4_dsig_dataset import solve_design
+        from datasets.build_cross4_dsig_dataset import solve_design
         rows = [self.static.rows[k] for k in self.used]
         out, _ = solve_design(dict(zip(self.dims_keys, key)), self.bc, rows, float(self.static.cfg["load_N"]),
                               self.rho, workers=self.jacobian_workers)

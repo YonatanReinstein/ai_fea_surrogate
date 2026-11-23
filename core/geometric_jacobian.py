@@ -174,7 +174,7 @@ def compute_tile_jacobian_colored(
     # is meshed here (it is also the CAD model whose volume the caller reads).
     # workers <= 1 meshes everything in this process: for callers that are
     # themselves pool workers (daemonic processes cannot start a pool), e.g.
-    # training/build_cross4_dataset.py.
+    # datasets/build_cross4_dataset.py.
     if workers <= 1:
         nodes0, elements0, e2t = nominal.create_mesh(U=U, V=V, W=W)
         results = [_mesh_worker((irt_script_path, j[2], U, V, W, fixed_dims, mesh_threads, model_cls))

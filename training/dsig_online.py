@@ -51,7 +51,7 @@ def _label_one(args):
     """Worker: exact S, dS for one design and the used rows. Fresh process."""
     dims, rows, F, rho, threads, jac_workers = args
     torch.set_num_threads(threads)
-    from training.build_cross4_dsig_dataset import solve_design
+    from datasets.build_cross4_dsig_dataset import solve_design
     bc = importlib.import_module("data.cross4_11x11.boundary_conditions")
     t0 = time.time()
     s, _ = solve_design(dims, bc, rows, F, rho, workers=jac_workers)

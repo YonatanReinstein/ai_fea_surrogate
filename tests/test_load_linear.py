@@ -2,7 +2,7 @@
 (superposition and homogeneity, for every row and random loads) at random
 weights with non-trivial geometry gates, and dS/dt flows through the geometry.
 
-    python -m jobs.tests.test_load_linear
+    python -m tests.test_load_linear
 """
 import json
 import os

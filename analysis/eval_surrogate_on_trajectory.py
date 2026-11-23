@@ -3,7 +3,7 @@ the ccx-driven reference), against the exact values that run recorded: KS
 (history s0), dKS/dt (history dg_raw x yield) and the nodal peak (the run's
 "[ccx] KS .., peak .." log lines). Writes an npz for plot_trajectory_report.py.
 
-    python jobs/tests/eval_surrogate_on_trajectory.py RUN_ART RUN_LOG OUT.npz EVERY name=ckpt [name=ckpt ...]
+    python analysis/eval_surrogate_on_trajectory.py RUN_ART RUN_LOG OUT.npz EVERY name=ckpt [name=ckpt ...]
 """
 import glob, os, re, sys
 import numpy as np

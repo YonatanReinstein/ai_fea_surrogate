@@ -11,7 +11,7 @@ the same for every case, so each design is factorized once and the cases are
 back-solves (core.fem_adjoint.ShapeAdjoint, rigid_tie=False; it reproduces
 ccx's C3D8I).
 
-Designs: training.build_tile_load_dataset.sample_designs (scrambled Sobol,
+Designs: datasets.build_tile_load_dataset.sample_designs (scrambled Sobol,
 correlated random fields), two_level_frac 0 -- correlated fields only.
 
 Layout of --output_dir:
@@ -45,7 +45,7 @@ Designs already written are skipped, so any worker can be restarted. Each worker
 stops when the output directory exceeds --max_gb or free space drops below
 --min_free_gb.
 
-    python -m training.build_cross4_multiload_dataset --output_dir DIR \
+    python -m datasets.build_cross4_multiload_dataset --output_dir DIR \
         --num_designs 5000 --worker 0 --num_workers 12
 Environment (set by the job script): CROSS4_LEG_RULE=avg FEA_LOAD_MODE=tile_nodes
 CROSS4_PAD_THICKNESS=0.1 CROSS4_LOAD_PAD_THICKNESS=0 FEA_MESH_RES=6,6,4 FEA_LOAD_N=1e7
@@ -218,7 +218,7 @@ def main():
     F = float(os.environ.get("FEA_LOAD_N") or 5e7)
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS") or 8))
 
-    from training.build_tile_load_dataset import sample_designs
+    from datasets.build_tile_load_dataset import sample_designs
     amp = tuple(float(v) for v in args.amplitude_range.split(","))
     designs, kinds = sample_designs(GEOMETRY, args.num_designs, args.seed, 0.0, amp)
     keys = [f"d{i + 1}" for i in range(NX * NY * NZ)]

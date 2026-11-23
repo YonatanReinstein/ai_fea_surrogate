@@ -20,9 +20,9 @@ sleep 2
 ps -eo user,cmd | grep torch_shm_manager | grep -v grep | wc -l
 
 echo "--- killing any leftover dataset_builder processes owned by ryonatan ---"
-pkill -u ryonatan -f training.dataset_builder -9
+pkill -u ryonatan -f datasets.dataset_builder -9
 sleep 2
-ps -eo user,cmd | grep training.dataset_builder | grep -v grep | wc -l
+ps -eo user,cmd | grep datasets.dataset_builder | grep -v grep | wc -l
 
 echo "--- removing ryonatan-owned files in /dev/shm ---"
 find /dev/shm -maxdepth 1 -user ryonatan -delete

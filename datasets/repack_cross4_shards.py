@@ -9,7 +9,7 @@ atomically (tmp + rename) and samples already in the slim format are left
 alone, so the script is safe to rerun and to run while the builder appends new
 (already slim) shards.
 
-    python -m training.repack_cross4_shards data/cross4_11x11/dataset_rows_30000 --workers 8
+    python -m datasets.repack_cross4_shards data/cross4_11x11/dataset_rows_30000 --workers 8
 """
 import argparse
 import glob
@@ -23,7 +23,7 @@ import torch
 
 def add_static_to_graphs(out):
     """x_static for every graph_row file that lacks it, from one old-format sample."""
-    from training import dataset_io
+    from datasets import dataset_io
     missing = {int(os.path.basename(p)[9:-3]) for p in glob.glob(f"{out}/graph_row*.pt")
                if "x_static" not in torch.load(p, weights_only=False)}
     for f in sorted(glob.glob(f"{out}/shards/*.pt")):
@@ -45,7 +45,7 @@ def add_static_to_graphs(out):
 
 def repack(job):
     path, statics = job
-    from training import dataset_io
+    from datasets import dataset_io
     torch.set_num_threads(1)
     samples = dataset_io.load_shard(path)
     if all("x" not in s for s in samples):

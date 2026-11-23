@@ -16,7 +16,7 @@ def _ks_excluded_node_ids(model_path, elements, elem_to_tile, nodes=None):
 
       load_tile  every node of the loaded tile's elements -- the free-end tile
                  in the geometry's load row (boundary_conditions.load_row(),
-                 middle by default), as in training/build_tile_load_dataset.py:
+                 middle by default), as in datasets/build_tile_load_dataset.py:
                  the stress there is the load introduction, not the
                  structure's, and the design cannot reduce it.
       load_nbhd  the loaded tile and every tile touching it, 3x3 block (use with

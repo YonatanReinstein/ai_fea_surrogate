@@ -1,5 +1,5 @@
 """Data access for the cross4 stress-sensitivity dataset
-(training/build_cross4_dsig_dataset.py): per design, the nodal stress tensor S
+(datasets/build_cross4_dsig_dataset.py): per design, the nodal stress tensor S
 of each of the 11 free-end tile loads and its exact derivative dS/dt with
 respect to every tile thickness.
 
@@ -144,7 +144,7 @@ def mirror_maps(static):
     ix, iy = np.meshgrid(np.arange(NX), np.arange(NY), indexing="ij")
     tmir = (ix * NY + (NY - 1 - iy)).reshape(-1)
     path = sorted(glob.glob(os.path.join(static.root, "exact_uniform_*.npz")))
-    assert path, "mirror_maps needs a uniform design's mesh: run evaluators/probe_dsig_uniform.py once"
+    assert path, "mirror_maps needs a uniform design's mesh: run analysis/probe_dsig_uniform.py once"
     X = np.load(path[0])["coords"]
     d, nmir = cKDTree(X).query(X * np.array([1.0, -1.0, 1.0]) + np.array([0.0, NY * static.ty, 0.0]))
     assert d.max() < 1e-6 and len(np.unique(nmir)) == static.N, "uniform mesh is not mirror-symmetric"

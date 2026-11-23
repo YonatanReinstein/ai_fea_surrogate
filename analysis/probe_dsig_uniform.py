@@ -5,7 +5,7 @@ symmetry error of both (a uniform design is mirror-symmetric, so the row-r
 gradient must equal the mirrored row-(NY-1-r) gradient). Also reports how far
 the uniform design sits from the dataset's designs.
 
-    python -m evaluators.probe_dsig_uniform --ckpt ... --t 0.2
+    python -m analysis.probe_dsig_uniform --ckpt ... --t 0.2
 """
 import argparse
 import importlib
@@ -14,7 +14,7 @@ import json
 import numpy as np
 import torch
 
-from evaluators.probe_dsig_rows import ccos, cos, wrong
+from analysis.probe_dsig_rows import ccos, cos, wrong
 from training.dsig_data import DsigStatic, available_designs, design_path
 from training.train_dsig import Batcher, build_model
 
@@ -43,7 +43,7 @@ def main():
           f"dataset per-design std of t: median {np.median(T.std(1)):.3f}", flush=True)
 
     # exact
-    from training.build_cross4_dsig_dataset import solve_design
+    from datasets.build_cross4_dsig_dataset import solve_design
     bc = importlib.import_module("data.cross4_11x11.boundary_conditions")
     keys = list(json.load(open("data/cross4_11x11/CAD_model/dims.json")))
     import os

@@ -11,4 +11,4 @@
 cd "$SLURM_SUBMIT_DIR"
 source env/bin/activate
 export PYTHONUNBUFFERED=1
-python -m evaluators.probe_dsig_rows --ckpt "${CKPT:-training/runs/cross4_dsig_sobolev_v1/epoch_026.pt}"
+python -m analysis.probe_dsig_rows --ckpt "${CKPT:-training/runs/cross4_dsig_sobolev_v1/epoch_026.pt}"

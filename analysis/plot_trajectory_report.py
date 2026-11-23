@@ -1,7 +1,7 @@
 """Merged trajectory accuracy report: a ccx-driven reference run and a
 surrogate (dsig, online FT) run of the same problem, raw-KS constraint.
 
-    python jobs/tests/plot_trajectory_report.py SUR_LOG SUR_ART CCX_LOG CCX_ART ON_CCX.npz OUT.png [title]
+    python analysis/plot_trajectory_report.py SUR_LOG SUR_ART CCX_LOG CCX_ART ON_CCX.npz OUT.png [title]
 
 ON_CCX.npz comes from eval_surrogate_on_trajectory.py (surrogate checkpoints
 scored on the ccx run's designs against its exact values).

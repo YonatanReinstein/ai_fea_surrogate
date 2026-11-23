@@ -14,7 +14,7 @@ def main():
     root = "data/cross4_11x11/dataset_dsig_2500_tmin003"
     s = DsigStatic(root)
     tmir, nmir = mirror_maps(s)
-    from training.build_cross4_dsig_dataset import solve_design
+    from datasets.build_cross4_dsig_dataset import solve_design
     bc = importlib.import_module("data.cross4_11x11.boundary_conditions")
     keys = list(json.load(open("data/cross4_11x11/CAD_model/dims.json")))
     rows = [1, 3, 7, 9]

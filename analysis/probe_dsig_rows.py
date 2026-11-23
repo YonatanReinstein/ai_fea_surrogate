@@ -13,7 +13,7 @@ on how far it breaks that: centered cosine between the two predictions.
 Mirrored coordinates come from reflecting the design's own nodes and matching
 them to the reference mesh (nearest node).
 
-    python -m evaluators.probe_dsig_rows --ckpt training/runs/cross4_dsig_sobolev_v1/epoch_026.pt
+    python -m analysis.probe_dsig_rows --ckpt training/runs/cross4_dsig_sobolev_v1/epoch_026.pt
 """
 import argparse
 import json

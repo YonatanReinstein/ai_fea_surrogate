@@ -1,7 +1,7 @@
 """cross4_11x11 dataset: every sampled design solved with the load on EACH
 free-end tile row, on exactly the pipeline the cross4 topopt runs use.
 
-Unlike hollow_cube's tile-load dataset (training/build_tile_load_dataset.py),
+Unlike hollow_cube's tile-load dataset (datasets/build_tile_load_dataset.py),
 the loads cannot share a factorization here: the load pad and its fixed-width
 flare sit on the loaded tile only (model_lin.c reads FEA_LOAD_ROW), so every
 (design, load row) pair is its own CAD model, mesh and solve. Each task is:
@@ -56,7 +56,7 @@ restart with the same --output_dir and --seed.
 
     FEA_LOAD_N=5e6 FEA_MESH_RES=6,6,4 CROSS4_PAD_THICKNESS=0.1 \\
     CROSS4_LOAD_PAD_THICKNESS=0.1 TOPOPT_KS_EXCLUDE=pad \\
-    python -m training.build_cross4_dataset --num_geometries 10 --workers 8 \\
+    python -m datasets.build_cross4_dataset --num_geometries 10 --workers 8 \\
         --output_dir data/cross4_11x11/dataset_smoke
 """
 import argparse
@@ -253,8 +253,8 @@ def main():
     if os.environ.get("FEA_LOAD_ROW"):
         sys.exit("unset FEA_LOAD_ROW: the builder sets it per task")
 
-    from training import dataset_io
-    from training.build_tile_load_dataset import sample_designs
+    from datasets import dataset_io
+    from datasets.build_tile_load_dataset import sample_designs
 
     out = args.output_dir
     os.makedirs(os.path.join(out, "shards"), exist_ok=True)

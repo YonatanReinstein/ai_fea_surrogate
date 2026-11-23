@@ -1,5 +1,5 @@
 """Sobolev training of the hierarchical CNN surrogate on the cross4
-stress-sensitivity dataset (training/build_cross4_dsig_dataset.py).
+stress-sensitivity dataset (datasets/build_cross4_dsig_dataset.py).
 
 Predicts the nodal stress tensor (6) of one (design, load row) at a time, as a
 function of the tile thicknesses t only (training.dsig_data). Because stress

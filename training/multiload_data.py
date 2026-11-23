@@ -1,5 +1,5 @@
 """Data access for the multi-load cross4 dataset
-(training/build_cross4_multiload_dataset.py): one design file serves all its
+(datasets/build_cross4_multiload_dataset.py): one design file serves all its
 load cases, and each case's per-node load is rebuilt from (row, direction).
 
 A sample is one (design, load case). Inputs per node:
