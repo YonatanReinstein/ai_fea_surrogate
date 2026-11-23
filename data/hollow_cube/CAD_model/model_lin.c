@@ -12,6 +12,7 @@
 * Adapted for a hollow-cube tile (open along Z)                              *
 *****************************************************************************/
 
+#include <stdlib.h>
 #include "inc_irit/irit_sm.h"
 #include "inc_irit/iritprsr.h"
 #include "inc_irit/allocate.h"
@@ -157,17 +158,188 @@ static void RotateAboutCenter(CagdRType x, CagdRType y, CagdRType z,
 *   IritPrsrObjectStruct *: A LIST object holding the four wall trivariates,
 *                           or NULL on bad input.
 *****************************************************************************/
+/*****************************************************************************
+* DESCRIPTION:
+*   Rotate every control point of TV by k * 90 degrees about the tile centre *
+*   (x, y) -> (1 - y, x), as RotateAboutCenter does for points.  Works on    *
+*   rational control points too (homogeneous: X' = w - Y, Y' = X).           *
+*****************************************************************************/
+static void RotateTVAboutCenter(IritTrivTVStruct *TV, int k)
+{
+    int i, j,
+        n = TV -> ULength * TV -> VLength * TV -> WLength;
+    CagdRType *W = TV -> Points[0],
+        *X = TV -> Points[1],
+        *Y = TV -> Points[2];
+
+    for (j = 0; j < k; j++)
+        for (i = 0; i < n; i++) {
+            CagdRType w = W != NULL ? W[i] : 1.0,
+                nx = w - Y[i],
+                ny = X[i];
+
+            X[i] = nx;
+            Y[i] = ny;
+        }
+}
+
+/*****************************************************************************
+* DESCRIPTION:
+*   Inner edge of the Y-min wall of a tile whose void has corners rounded
+*   with radius r, as the graph y = f(x), x in [a, 1 - a]:
+*     arc around (t + r, t + r) for x < t + r, the straight side y = t, and
+*     the mirrored arc for x > 1 - t - r;  a = t + r (1 - 1 / sqrt 2) is
+*     where the arc meets the tile diagonal.  r = 0 gives the sharp edge.
+*****************************************************************************/
+static CagdRType InnerEdgeY(CagdRType x, CagdRType t, CagdRType r)
+{
+    CagdRType c, d;
+
+    if (x > 0.5)
+        x = 1.0 - x;                                     /* Symmetric. */
+    c = t + r;
+    if (r <= 0.0 || x >= c)
+        return t;
+    d = c - x;
+    return c - sqrt(IRIT_MAX(r * r - d * d, 0.0));
+}
+
+/*****************************************************************************
+* DESCRIPTION:
+*   The Y-min wall (before rotation by k * 90 degrees) of a tile whose void
+*   has rounded corners of radius r, as THREE trivariates side by side.
+*   Each is ruled between a third of the straight outer edge, x in
+*   [i/3, (i+1)/3], and the matching third of the inner edge's own extent,
+*   x in [a + i (1 - 2a)/3, a + (i+1)(1 - 2a)/3], then extruded along Z.
+*   Both cuts are at fixed fractions, so
+*     - every tile's outer faces carry the same node layout whatever its t
+*       and r (meshes conform across tiles), and
+*     - each outer third faces the inner third right above it, so the
+*       rulings stay near-perpendicular to the wall for ANY radius, r = 0
+*       included (cutting the inner edge at the arc ends instead folded the
+*       elements of thin walls with small radii).
+*   Each inner third is one cubic Bezier: end points on the exact edge
+*   (InnerEdgeY), the two inner control points a least-squares fit to 41
+*   samples of it, so neighbouring thirds meet exactly and the diagonal
+*   ends sit at (a, a) / (1 - a, a) where the rotated walls expect them.
+*   U runs outer -> inner, V along the wall, W along Z, as in the box walls.
+*****************************************************************************/
+static IritTrivTVStruct *RoundedWall(CagdRType t, CagdRType r, int k)
+{
+    int i, j, m;
+    CagdRType a = t + r * (1.0 - 1.0 / sqrt(2.0)),
+        Span = (1.0 - 2.0 * a) / 3.0;
+    IritTrivTVStruct *First = NULL, *Last = NULL;
+
+    for (i = 0; i < 3; i++) {
+        CagdRType xi0 = a + i * Span, xi1 = a + (i + 1) * Span,
+            xo0 = i / 3.0, xo1 = (i + 1) / 3.0,
+            P0[2], P3[2], A11 = 0.0, A12 = 0.0, A22 = 0.0, R1[2] = { 0, 0 },
+            R2[2] = { 0, 0 }, Det, Q1[2], Q2[2];
+        IritCagdCrvStruct *Inner = IritCagdBzrCrvNew(4, IRIT_CAGD_PT_E3_TYPE),
+            *Outer = IritCagdBzrCrvNew(4, IRIT_CAGD_PT_E3_TYPE);
+        IritCagdSrfStruct *Srf, *Srf2;
+        IritCagdVecStruct Dir;
+        IritTrivTVStruct *TV;
+
+        P0[0] = xi0; P0[1] = InnerEdgeY(xi0, t, r);
+        P3[0] = xi1; P3[1] = InnerEdgeY(xi1, t, r);
+        /* Least squares for the two free control points, samples at     */
+        /* uniform u <-> uniform x (the edge is a graph over x).           */
+        for (m = 0; m <= 40; m++) {
+            CagdRType u = m / 40.0,
+                b0 = (1 - u) * (1 - u) * (1 - u), b1 = 3 * u * (1 - u) * (1 - u),
+                b2 = 3 * u * u * (1 - u), b3 = u * u * u,
+                X = xi0 + u * (xi1 - xi0), S[2];
+
+            S[0] = X - b0 * P0[0] - b3 * P3[0];
+            S[1] = InnerEdgeY(X, t, r) - b0 * P0[1] - b3 * P3[1];
+            A11 += b1 * b1; A12 += b1 * b2; A22 += b2 * b2;
+            for (j = 0; j < 2; j++) {
+                R1[j] += b1 * S[j];
+                R2[j] += b2 * S[j];
+            }
+        }
+        Det = A11 * A22 - A12 * A12;
+        for (j = 0; j < 2; j++) {
+            Q1[j] = (A22 * R1[j] - A12 * R2[j]) / Det;
+            Q2[j] = (A11 * R2[j] - A12 * R1[j]) / Det;
+        }
+        Inner -> Points[1][0] = P0[0]; Inner -> Points[2][0] = P0[1];
+        Inner -> Points[1][1] = Q1[0]; Inner -> Points[2][1] = Q1[1];
+        Inner -> Points[1][2] = Q2[0]; Inner -> Points[2][2] = Q2[1];
+        Inner -> Points[1][3] = P3[0]; Inner -> Points[2][3] = P3[1];
+        for (m = 0; m < 4; m++) {
+            Inner -> Points[3][m] = 0.0;
+            Outer -> Points[1][m] = xo0 + (xo1 - xo0) * m / 3.0;
+            Outer -> Points[2][m] = 0.0;
+            Outer -> Points[3][m] = 0.0;
+        }
+
+        Srf = IritCagdRuledSrf(Outer, Inner, 2, 2);   /* u along, v outer -> inner */
+        Srf2 = IritCagdSrfReverse2(Srf);               /* u outer -> inner, v along */
+        Dir.Vec[0] = 0.0; Dir.Vec[1] = 0.0; Dir.Vec[2] = 1.0;
+        TV = IritTrivExtrudeTV(Srf2, &Dir);
+        IritCagdSrfFree(Srf);
+        IritCagdSrfFree(Srf2);
+        IritCagdCrvFree(Inner);
+        IritCagdCrvFree(Outer);
+        RotateTVAboutCenter(TV, k);
+        TV -> Pnext = NULL;
+        if (First == NULL)
+            First = TV;
+        else
+            Last -> Pnext = TV;
+        Last = TV;
+    }
+    return First;
+}
+
 static IritPrsrObjectStruct *BuildHollowCubeTile(CagdRType t)
 {
     int k;
     IritTrivTVStruct *Walls[4];
     IritPrsrObjectStruct *RetObj, *PObj;
     CagdPType P000, P001, P010, P011, P100, P101, P110, P111;
+    /* HOLLOW_CUBE_CORNER_FRAC: round the void's corners with radius        */
+    /*   r = frac * (0.5 - t) * (1 - exp(-(t - tmin) / w)),                  */
+    /* a fraction of the void's half-width (frac 1 = a circular void),      */
+    /* faded smoothly to ~0 at the floor tmin so a floor tile is a bare     */
+    /* thin tube (no corner material the optimizer cannot remove).          */
+    /* w = HOLLOW_CUBE_CORNER_RAMP (default 0.05), tmin =                   */
+    /* HOLLOW_CUBE_CORNER_TMIN (default 0.01, dims.json's floor).  Every  */
+    /* tile meshes in the same layout (3 pieces per wall, RoundedWall)      */
+    /* whatever its t and r, r = 0 included.  Unset or 0: the original     */
+    /* sharp-cornered box walls.                                            */
+    const char *FracStr = getenv("HOLLOW_CUBE_CORNER_FRAC"),
+        *RampStr = getenv("HOLLOW_CUBE_CORNER_RAMP"),
+        *TMinStr = getenv("HOLLOW_CUBE_CORNER_TMIN");
+    CagdRType Frac = FracStr != NULL && FracStr[0] != 0 ? atof(FracStr) : 0.0,
+        Ramp = RampStr != NULL && RampStr[0] != 0 ? atof(RampStr) : 0.05,
+        TMin = TMinStr != NULL && TMinStr[0] != 0 ? atof(TMinStr) : 0.01;
 
     if (t <= 0.0 || t > 0.5)
         return NULL;
     if (t > HOLLOW_CUBE_MAX_THICKNESS)   /* Avoid the degenerate t = 0.5 cell. */
         t = HOLLOW_CUBE_MAX_THICKNESS;
+
+    if (Frac > 0.0) {
+        CagdRType Fade = Ramp > 0.0 ? 1.0 - exp(-IRIT_MAX(t - TMin, 0.0) / Ramp) : 1.0,
+            r = IRIT_MIN(Frac, 1.0) * (0.5 - t) * Fade;
+        IritTrivTVStruct *All = NULL, *Tail = NULL, *W;
+
+        for (k = 0; k < 4; k++) {               /* 3 trivariates per wall */
+            W = RoundedWall(t, r, k);
+            if (All == NULL)
+                All = W;
+            else
+                Tail -> Pnext = W;
+            for (Tail = W; Tail -> Pnext != NULL; Tail = Tail -> Pnext);
+        }
+        RetObj = IritPrsrGenLISTObject(PObj = IritPrsrGenTRIVARObject(All));
+        IritMiscAttrIDSetObjectRGBColor(PObj, 255, 0, 0);
+        return RetObj;
+    }
 
     /* Base trapezoid (the Y-min wall), then its 90-degree rotations.  The    */
     /* U = 0 (P0xx) edge spans the outer boundary corners (0,0)-(1,0); the    */
